@@ -283,6 +283,8 @@ async function executeReply(event, context) {
         });
       }
     } else {
+      const code = typeof error?.code === "string" && /^[A-Z0-9_]{1,40}$/.test(error.code) ? error.code : "UNKNOWN";
+      log(`Codex run for ${thread.id} failed (${code}).`);
       failedRuns.record(thread.id, { body: String(reply.body || ""), images, replyId: event.replyId, claimed: event.claimed, queuedAt: event.queuedAt });
       markClaimedJobState(event.replyId, "failed");
       await publishFailure(thread, error);

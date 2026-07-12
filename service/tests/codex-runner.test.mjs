@@ -42,6 +42,7 @@ console.log(JSON.stringify({type:"turn.completed"}));
       "--config",
       'model_reasoning_effort="high"',
     ]);
+    assert.equal(JSON.parse(readFileSync(`${capture}.args`, "utf8")).includes("--skip-git-repo-check"), true);
     assert.equal(result.body, "A clean answer.");
     assert.deepEqual(result.generatedImages, [image]);
     assert.deepEqual(phases, ["Starting work.", "Finishing the response."]);

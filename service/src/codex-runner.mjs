@@ -55,7 +55,7 @@ export class CodexRunner {
     if (typeof reasoningEffort === "string" && /^[a-z][a-z0-9_-]{0,31}$/i.test(reasoningEffort)) {
       args.push("--config", `model_reasoning_effort=${JSON.stringify(reasoningEffort)}`);
     }
-    args.push("resume", "--json", "--output-last-message", outputFile);
+    args.push("resume", "--skip-git-repo-check", "--json", "--output-last-message", outputFile);
     for (const image of images) args.push("--image", image);
     args.push(thread.id, "-");
     const child = spawn(this.codexPath, args, {
@@ -108,7 +108,14 @@ export class CodexRunner {
     if (cancelled) return { status: "cancelled", body: "" };
     if (exit.code !== 0) {
       const busy = /already.*(running|locked)|session.*lock|thread.*busy/i.test(stderr);
-      throw Object.assign(new Error(busy ? "Thread is busy." : "Codex could not complete the request."), { code: busy ? "BUSY" : "CODEX_FAILED" });
+      const code = busy
+        ? "BUSY"
+        : /not inside a trusted directory|skip-git-repo-check/i.test(stderr)
+          ? "GIT_CHECK_FAILED"
+          : /not logged in|authentication|unauthorized|status\s*401/i.test(stderr)
+            ? "AUTH_REQUIRED"
+            : "CODEX_FAILED";
+      throw Object.assign(new Error(busy ? "Thread is busy." : "Codex could not complete the request."), { code });
     }
     return { status: "completed", body: body || "Codex completed without a text response.", generatedImages: [...generatedImages] };
   }
