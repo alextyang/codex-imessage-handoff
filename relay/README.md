@@ -108,7 +108,7 @@ Then redeploy with `pnpm run deploy` and update the Sendblue webhook URL to the 
   live messages are gated by recent user activity and deduplicated with opaque,
   content-free delivery IDs.
 - `POST /threads/:threadId`: registers or re-enables a Codex thread.
-- `POST /threads/:threadId/status`: forwards Codex output, progress updates, and generated images to iMessage without storing the outbound content.
+- `POST /threads/:threadId/status`: forwards Codex output, typing/progress state, and generated images to iMessage without storing the outbound content.
 - `GET /threads/:threadId/events`: WebSocket delivery events backed by the relay Durable Object.
 - `POST /threads/:threadId/replies/:replyId/claim`: claims one reply or media group.
 - `GET /threads/:threadId`: returns thread routing metadata.
@@ -120,6 +120,31 @@ All non-webhook thread APIs use `Authorization: Bearer <token>`. When a user pai
 The hosted relay also applies lightweight abuse caps: anonymous install-token creation and authenticated thread routes are rate-limited in memory by the relay Durable Object, legacy per-thread registration is capped at 25 enabled threads, persistent-service catalogs are capped at 500 canonical tasks, generated images are limited to 5 per status request, and each generated image must be 10 MB or smaller after base64 decoding.
 
 The relay stores the minimum data needed to route messages. Cloudflare D1 is still required for routing metadata such as thread state, pairing state, the paired phone's last inbound timestamp, opaque completion/live-delivery IDs and multipart counters, phone bindings, and ordered menu task IDs, but message content and directory previews are never stored there. Inbound message content is held only in the Durable Object's in-memory buffer until the connected service immediately claims it into private local state, then scrubbed. Outbound Codex replies, live commentary, and on-demand directory previews are forwarded to Sendblue and are not stored by the relay. The Durable Object also uses heartbeat-backed, debounced connection transitions for Mac online/offline notices; those notices use the same 24-hour inbound-activity gate as proactive task completions and live mirroring.
+
+## Message Presentation (v0.3.7)
+
+The Worker is the final presentation boundary. It preserves literal Markdown
+markers in Sendblue message bodies and uses a minimal grammar with no universal
+header, line rule, or active-task footer:
+
+- projects and tasks receive pseudo-random, deterministic object emoji seeded
+  from their normalized name and canonical start date;
+- directories use project headings, keycap task numbers, live status/recency,
+  turn counts, and the latest user-message preview;
+- switching sends one `Opened  🧪 **Task name**` acknowledgement followed by a
+  compact command row;
+- the selected task's live assistant output and final response are delivered as
+  content only, while mirrored local user messages use `👤`;
+- `/turn` and `/history` use `👤` and `☁️` role blocks separated by blank lines;
+- completion or notice content from another task is prefixed once with that
+  task's emoji and bold Markdown title; and
+- structured progress maintains the Sendblue typing indicator without sending
+  a progress bubble.
+
+Semantic messages are delivered as separate bubbles. Only an individual body
+that exceeds the provider limit is split, and those parts use the minimal
+`(1/N)` marker. Retry state retains only opaque delivery IDs and multipart
+counters, never message content.
 
 Cloudflare persisted logging is disabled for this Worker in `wrangler.jsonc`. Message bodies are never placed in URLs, and relay warnings intentionally avoid logging Sendblue response payloads because provider error payloads could echo message content.
 

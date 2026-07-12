@@ -2,6 +2,8 @@
 
 ## Product and implementation plan
 
+The current presentation contract is the minimal v0.3.7 message grammar.
+
 This alternate version replaces the skill and per-thread Stop hooks with one
 user-level local service. It preserves the current Cloudflare relay, Sendblue
 account, phone number, webhook, install token, and pairing.
@@ -40,22 +42,30 @@ The resulting user turn and assistant answer remain normal, clean Codex history.
 Navigation, typing, progress, context labels, menus, delivery, and errors are
 service behavior. The model is never asked to implement the transport UI.
 
-### Every outbound message has a clear source
+### Every outbound message has a clear source with minimal chrome
 
 The user must be able to distinguish three message classes immediately:
 
-- **Thread output** — content produced by a specific Codex thread.
-- **Service state** — connection, switching, queueing, cancellation, or errors.
+- **Active-thread conversation** — the mirrored user message or visible Codex
+  content in the currently selected task.
+- **Background or service state** — a result from another task, a connection
+  transition, queueing, cancellation, or an actionable error.
 - **Menus** — choices or short command help that require user input.
 
-The distinction is made by a compact semantic header generated outside the
-model. Unicode structure and a small symbol vocabulary improve scanning without
-pretending that plain text is rich text. Every symbol is paired with a word, and
-words stay in normal Unicode letters rather than faux mathematical bold.
+This distinction does not require a repeated masthead or active-task footer.
+The selected task is established once by its `Opened` acknowledgement. After
+that, active-thread assistant commentary and final output are content only.
+Mirrored local user messages use `👤`; transcript views use `👤` and `☁️`.
+Background thread content names its source once before the body. Service state
+uses a short plain sentence with a targeted state symbol when useful.
 
-Every task receives one stable object emoji derived deterministically from its
-canonical thread ID. The emoji is identity, not state: it follows the task
-through menus, switches, live updates, results, and background completions.
+Every real project and task receives one pseudo-random, deterministic object
+emoji derived from its normalized name and canonical start date. A task uses its
+thread creation date. A project uses the earliest known creation date among all
+of its catalog tasks, not only tasks visible in the current 48-hour menu. The
+emoji is identity, not state, and separate project/task namespaces avoid
+coupling the two palettes. The synthetic `Other tasks` group has no project
+emoji.
 
 ### Quiet by default
 
@@ -63,361 +73,229 @@ through menus, switches, live updates, results, and background completions.
   ordinary turns.
 - Show commands only when requested or when the user needs to make a choice.
 - Do not append general help text to normal thread responses.
-- Append the compact active-context footer to every outbound part so a user can
-  always tell where the next ordinary message will go.
+- Do not append a universal header, line rule, or active-context footer.
 - Do not announce internal reconnects, catalog syncs, retries, or process IDs.
-- Send progress only for materially long work and only when state has changed.
+- Use structured progress to maintain native typing; do not emit progress
+  bubbles.
 - Keep failures actionable and specific.
 
 ### Plain-text first
 
-Formatting must remain readable in iMessage and SMS fallback. It cannot depend
-on Markdown rendering, custom fonts, reactions, carousels, or link previews.
-Rich media can enhance a result but cannot be required to understand or control
-the service.
+Formatting must remain readable in iMessage and SMS fallback. Literal Markdown
+markers such as `**Project**` are preserved in the Sendblue body. They provide a
+clear plain-text hierarchy now and may render as styling in a future client, but
+the interface cannot depend on rendering, custom fonts, reactions, carousels,
+or link previews. Rich media can enhance a result but cannot be required to
+understand or control the service.
 
 ## Conversation language
 
-### Header grammar
+### General grammar
 
-Use one consistent natural-case masthead. The leading symbol conveys category
-at a glance, while the following words preserve the meaning in every client:
+- Do not add a universal header, footer, timestamp, line rule, or help block.
+- Use Markdown bold only for selected/source identities and menu hierarchy.
+- Use object emoji only as deterministic project/task identity.
+- Use `◷`, `○`, and `▲` only where a state needs to be scanned in a list or a
+  short service notice.
+- Deliver semantic sections as separate messages. Only split a semantic message
+  when it exceeds the provider limit; those parts use the minimal `(1/N)`
+  marker and never repeat surrounding chrome.
+- Presentation text is produced outside Codex history.
+
+### Help
 
 ```text
-✓ CODEX · Result
-◆ CODEX · Threads
-↪ CODEX · Context Switched
-◷ CODEX · Pending
-▲ CODEX · Needs Attention
+**Browse**
+/threads · Tasks by project
+/refresh · Refresh the task list
+/search (query) · Find a task
+/projects · Browse all projects
+
+**Active task**
+/thread · Status and latest response
+/turn · Show current or last turn
+/history (length) · Completed turn history
+/reasoning (level/none) · View or change reasoning
+/cancel · Stop iMessage-started work in current thread
 ```
 
-Use symbols deliberately: `✓` completed or connected, `◆` neutral views, `↪`
-context changes, `●` active work, `◷` pending work, `○` idle, `▲` attention,
-and `×` cancellation or disconnection. Never show a symbol without its text
-label. Keep actual words in natural case; do not substitute mathematical
-alphanumeric glyphs to simulate bold.
-
-Headers are rendered by the presentation layer after model execution. They are
-never stored in Codex conversation history.
-
-Every task reference starts with its stable generated object emoji. The footer
-is the only restrained rule and always names the selected destination:
+### Thread directory
 
 ```text
-────────────
-⌁ Active context
-Music crawler › 🧭 Fix album metadata
-```
+▾  ⚙️ **iMessage handoff** · 2 tasks
 
-Use `Now active` after an intentional switch and `Active context unchanged`
-for notifications about connectivity or a different task. If nothing is
-selected, render `⌁ No active task · /threads` instead.
+**Selected**
+1️⃣  🧪 **Polish message formatting**
+   ◷ Working for 4m
+   “Show a full example set of every message type.”
 
-### Thread output
+2️⃣  ✏️ Fix duplicate fork history
+   ◷ Working for 8m · 2 queued
+   “Prevent inherited history from replaying.”
 
-```text
-↪ CODEX · Context Switched
+▾ **Other tasks** · 1 task
 
-🧭 Fix album metadata
-Music crawler
+3️⃣  🧲 Compare messaging providers
+   ○ 3h ago · 50 turns
+   “Which provider supports richer iMessage interactions?”
 
-New messages now go to this task.
-
-Commands
-/thread · /threads
-
-────────────
-⌁ Now active
-Music crawler › 🧭 Fix album metadata
-```
-
-The result view uses the same identity:
-
-```text
-✓ CODEX · Result
-
-🧭 Fix album metadata
-Music crawler
-
-The scraper now retries failed artist pages and all 42 tests pass.
-
-────────────
-⌁ Active context
-Music crawler › 🧭 Fix album metadata
-```
-
-The assistant body is otherwise unchanged except for surrounding-whitespace
-normalization and message-length splitting. Plain-text hierarchy is transport
-chrome and is never injected into the Codex task.
-
-If a response requires multiple bubbles, every part repeats both its part count
-and its context footer:
-
-```text
-✓ CODEX · Result · 2/3
-
-…continued response…
-
-────────────
-⌁ Active context
-Music crawler › 🧭 Fix album metadata
-```
-
-Live mirroring stays conversational instead of repeating a full masthead on
-every update. The speaker, phase, and provenance remain explicit:
-
-```text
-You · Mirrored from Mac · now
-
-Please rerun the tests after that change.
-
-────────────
-⌁ Active context
-Music crawler › 🧭 Fix album metadata
-```
-
-```text
-Codex · Update · now
-
-I found the failing assertion and I’m checking its callers.
-
-────────────
-⌁ Active context
-Music crawler › 🧭 Fix album metadata
-```
-
-A background completion names both the source task and the still-selected
-destination. It must not imply that completing another task changed context:
-
-```text
-✓ CODEX · Completed Elsewhere
-
-📦 Retry failed imports
-Music crawler
-✓ Completed · now
-
-All import checks pass.
-
-────────────
-⌁ Active context unchanged
-Music crawler › 🧭 Fix album metadata
-```
-
-### Thread menu
-
-```text
-◆ CODEX · Threads
-
-12 tasks · pending + activity in last 48h · updated now
-
-▾ Music crawler · 2 tasks
-
-1  🧭 Fix album metadata
-   ⌁ Active · ○ Idle · 5m ago
-   “Normalize the album dates.”
-
-2  📦 Retry failed imports
-   ● Working · for 2m
-   “Retry the failed artist imports.”
-
-▾ iMessage handoff · 1 task
-
-3  📐 Improve thread menu
-   ◷ Pending · waiting 1m
-   “Improve message hierarchy.”
-
-Recent projects
-
-4  ▸ Portfolio · 4 tasks
-   ○ Idle · 1h ago
-
-Reply
-Reply with a number to open.
-
-Commands
-/refresh · /projects · /search
-
-────────────
-⌁ Active context
-Music crawler › 🧭 Fix album metadata
+Reply with a number to open that thread. Add “1 (message)” to directly message the thread.
+“/projects” - See all projects
+“/search” - Show threads with specific text
 ```
 
 The menu is a stable snapshot. Its numbering must not reorder while the user is
 choosing. A snapshot expires after ten minutes; an expired selection asks the
-local service for a fresh menu rather than switching to the wrong thread.
+local service for a fresh menu rather than switching to the wrong task.
 
 Build the directory locally on demand. For each project, show every task with
 pending work first, then every remaining task whose actual latest rollout turn
 is within 48 hours. Omit projects without a qualifying task. Codex tasks listed
 in `projectless-thread-ids` share a final `Other tasks` section. Every task row
-shows a short, single-line preview of its newest user request. Send that preview
-transiently for delivery and persist only the ordered task IDs used by numeric
-selection.
+shows a short, single-line preview of its newest user request. Idle rows include
+live recency and the locally derived turn count; truncated history uses a lower
+bound such as `50+ turns`. Send previews transiently for delivery and persist
+only the ordered task IDs used by numeric selection.
 
-Do not show raw thread IDs, full filesystem paths, model names, or timestamps
-unless the user explicitly asks for diagnostic information.
+Additional recent projects may be shown collapsed with `▸` to expand reach
+without bloating the initial menu. `/projects` and `/search` use the same
+minimal heading, spacing, identity, status, and selection grammar.
 
-### Context switch
+Do not show raw thread IDs, full filesystem paths, model names, or absolute
+timestamps unless the user explicitly asks for diagnostic information.
+
+### Opening and active-thread conversation
+
+Opening a task sends exactly one acknowledgement:
 
 ```text
-◆ CODEX · Thread
-
-🧭 Fix album metadata
-Music crawler
-
-○ Idle · 5m ago · Reasoning: High
-
-Commands
-/request · /turn · /history · /reasoning
-
-You · 7m ago
-Please normalize the album metadata…
-
-Note · /request shows the full message.
-
-Codex · Result · 5m ago
-The complete final response from the last turn appears here.
-
-────────────
-⌁ Active context
-Music crawler › 🧭 Fix album metadata
+Opened  🧪 **Polish message formatting**
+/reasoning (level/none) · /turn · /history · /cancel
 ```
 
-The second line is a short project label only when it disambiguates the thread.
 Switching does not run Codex and does not generate a model response. It reads
-the selected rollout locally: idle tasks show the complete final response from
-the last turn; working tasks show the latest request and every user-visible
-assistant message produced in the current turn so far.
+the selected rollout locally. The opening acknowledgement is followed by the
+relevant transcript content as separate messages: idle tasks show the complete
+final response from the last turn; working tasks show the latest request and
+every user-visible assistant message produced in the current turn so far.
 
-If the user sends `2: run the tests` from an active menu, the service switches
-to item 2 and submits `run the tests` in one action. This shortcut is documented
-only in `/help` initially, not in every thread menu.
-
-### Connection and first use
-
-Existing paired users see one migration confirmation:
+`/thread` adds one compact status message before those transcript messages:
 
 ```text
-◆ CODEX · Connected
-
-iMessage is linked to Codex on Alex’s Mac.
-12 recent threads are available.
-
-Text /threads to choose one.
-
-────────────
-⌁ No active task · /threads
+🧪 **Polish message formatting**
+◷ Working for 4m · 2 queued
+Reasoning: high
 ```
 
-Fresh installs retain the current six-character pairing flow. After the code is
-accepted, the same `Connected` message is used. Pairing codes, relay URLs,
-tokens, hook details, and setup commands are not mixed into normal conversation.
-
-### Progress
-
-For normal work, send a read receipt and start the native typing indicator. No
-progress bubble is necessary.
-
-For longer work, the service may send:
+Once open, local user messages are mirrored as:
 
 ```text
-● CODEX · Still Working
-
-Running the test suite after updating the retry logic.
-
-────────────
-⌁ Active context
-Music crawler › 🧭 Fix album metadata
+👤 Please rerun the tests after that change.
 ```
 
-Progress policy:
-
-- start typing immediately after a reply is claimed;
-- refresh or stop typing according to Sendblue limits;
-- send no progress bubble during the first 30 seconds;
-- after 30 seconds, send an update only when a safe, observable phase changes;
-- rate-limit repeated phases and omit irrelevant intermediate steps;
-- never expose chain-of-thought, raw shell commands, secrets, URLs containing
-  tokens, or unredacted tool output;
-- `/status` may return the current safe phase immediately;
-- always stop typing on success, failure, cancellation, or process exit.
-
-Progress text is deterministic and generated from structured Codex JSONL event
-categories. It is not authored by a hidden model prompt.
-
-### Queue and busy state
+Visible assistant commentary and final responses contain only their content:
 
 ```text
-◷ CODEX · Pending
+I found the failing assertion.
 
-About
-🧭 Fix album metadata
-Music crawler
-
-Details
-This task is already running in Codex.
-Your message will start when it is available.
-
-────────────
-⌁ Active context
-Music crawler › 🧭 Fix album metadata
+I’m checking its callers now.
 ```
 
-Only send this when execution cannot begin promptly. Claim each notified relay
-reply immediately into the service's private durable queue before it waits for
-an execution slot. A user can inspect it with `/status` or remove it with
-`/cancel`.
+Consecutive assistant commentary in the same visible reasoning/update bucket is
+joined with blank lines. A user message, final answer, task boundary, or rollback
+ends the bucket. Hidden chain-of-thought, tool output, hooks, system/developer
+messages, and secrets are never mirrored.
 
-### Cancellation
+If the user sends `2 run the tests`, `2 (run the tests)`, or the legacy
+`2: run the tests` while a menu snapshot is active, the service switches and
+submits the message in one action. A bare number opens the item.
+
+When Codex moves the selected task into a locally created active fork, the
+service follows that descendant with a compare-and-swap that cannot overwrite a
+manual Messages selection. It sends one `Opened` acknowledgement and the
+current-turn snapshot, then continues the content-only live feed. Existing fork
+history is baselined, so inherited parent turns are not replayed.
+
+### Turn and history views
+
+`/turn` and `/history` send one long message containing only role-marked content,
+with three newlines between blocks:
 
 ```text
-× CODEX · Cancelled
+👤 Normalize all album fields.
 
-About
-🧭 Fix album metadata
-Music crawler
 
-Details
-The run stopped at your request.
+☁️ I updated the parser and started the tests.
 
-────────────
-⌁ Active context
-Music crawler › 🧭 Fix album metadata
+
+👤 Also preserve unknown fields.
+
+
+☁️ Done. All tests pass.
 ```
 
-If nothing is running:
+There is no transcript heading, timestamp, identity footer, or command list.
+
+### Background thread notifications
+
+A completion or notice from a task other than the selected task names its source
+once and does not imply a context switch:
 
 ```text
-▲ CODEX · Needs Attention
+✏️ **Fix duplicate fork history**
 
-Details
-There is no active Codex run to cancel.
-
-────────────
-⌁ Active context
-Music crawler › 🧭 Fix album metadata
+All tests pass.
 ```
 
-### Errors
+A selected-task completion contains only the result body. Existing task history
+is baselined silently on first start, and iMessage-started turns are deduplicated
+so the requested reply is never followed by a second completion notice.
 
-Errors use `Needs Attention`, a one-sentence explanation, and one next action.
+### Reasoning
+
+`/reasoning` renders a minimal selector:
 
 ```text
-▲ CODEX · Needs Attention
+**Reasoning**
+○ none
+○ low
+○ medium
+● high
+○ xhigh
 
-Details
-The selected task no longer exists on this Mac.
-
-Commands
-/threads · Choose another task
-
-────────────
-⌁ No active task · /threads
+/reasoning (level/none)
 ```
 
-Do not expose stack traces, HTTP codes, database terminology, Cloudflare
-details, or child-process output in normal messages. Diagnostics remain local
-and redacted.
+`/reasoning high` stores a private task-specific invocation override and replies
+`Reasoning set to **high**.`. `/reasoning none` removes that override and returns
+the task to its normal default. The available rows follow the task model's
+reported capabilities. This does not change global Codex configuration.
+
+### Connection, typing, and service notices
+
+For normal work, send a read receipt and maintain the native typing indicator.
+Structured progress updates typing state only and do not create chat bubbles.
+Always stop typing on success, failure, cancellation, or process exit.
+
+When the paired user has sent an inbound message within the previous 24 hours,
+debounced service presence transitions use only:
+
+```text
+● Codex is online.
+```
+
+```text
+○ Codex is offline. New messages will wait until it reconnects.
+```
+
+Inbound prompts, commands, menu choices, media, and pairing refresh this window;
+outbound notices do not.
+
+Queue, cancellation, and error notices are one or two actionable sentences with
+no universal wrapper. If the notice concerns another task, it uses the same
+source-title prefix as a background completion. Do not expose stack traces,
+HTTP codes, database terminology, Cloudflare details, child-process output, or
+raw progress data in normal messages.
 
 ### Commands
 
@@ -425,19 +303,19 @@ Commands use a `/` prefix so ordinary messages such as “status” or “thread
 still be sent naturally to Codex. Continue accepting the old bare `threads`
 command as a compatibility alias.
 
-Initial commands:
+Supported commands:
 
 ```text
 /threads          pending tasks plus turns from the last 48 hours
 /recent           compatibility alias for /threads
-/search words     find threads by title or project
+/search words     find tasks by title or project
 /projects         browse by project
 /refresh          rebuild the grouped directory
-/thread           selected task and current/last turn
+/thread           selected task status and latest response
 /request          complete latest user request
 /turn             complete current or last turn
 /history [count]  completed request/final-response history
-/reasoning [level] inspect or set the next iMessage turn's reasoning
+/reasoning [level|none] inspect, set, or clear the task reasoning override
 /status           alias for /thread
 /retry            retry the last failed iMessage request
 /dismiss          dismiss the oldest failed iMessage request
@@ -445,40 +323,8 @@ Initial commands:
 /help             command summary
 ```
 
-`/help` renders:
-
-```text
-◆ CODEX · Commands
-
-Browse
-/threads · Tasks by project
-/refresh · Refresh the task list
-/search words · Find a task
-/projects · Browse all projects
-
-Active task
-/thread · Status and latest response
-/request · Full latest request
-/turn · Current or last turn
-/history 3 · Completed turn history
-/reasoning · View or change reasoning
-
-Work
-/cancel · Stop iMessage-started work
-/retry · Retry the oldest failed request
-/dismiss · Clear the oldest failed request
-
-Menu replies
-In a thread menu, reply with a number to switch.
-You can also send “2: your message” to switch and continue.
-
-────────────
-⌁ Active context
-Music crawler › 🧭 Fix album metadata
-```
-
-Unknown `/commands` show a concise correction and this menu. Unknown ordinary
-text always goes to the selected Codex thread.
+Unknown `/commands` show a concise correction and the minimal help menu. Unknown
+ordinary text always goes to the selected Codex task.
 
 ## Interaction state machine
 
@@ -492,7 +338,7 @@ stateDiagram-v2
     Running --> Ready: result or failure
     Running --> Cancelling: /cancel
     Cancelling --> Ready: process stopped
-    Running --> Running: /thread, history controls, or bounded progress
+    Running --> Running: /thread, history controls, live mirror, or typing refresh
     Ready --> Pending: capacity or local desktop turn is busy
     Pending --> Running: task becomes available
     Pending --> Ready: /cancel
@@ -502,7 +348,8 @@ Important parsing rules:
 
 1. Slash commands are parsed before thread input.
 2. A bare number is a selection only while a valid menu snapshot exists.
-3. `<number>: <message>` is special only while that snapshot exists.
+3. `<number> <message>`, `<number> (<message>)`, and the legacy
+   `<number>: <message>` are special only while that snapshot exists.
 4. Otherwise, the complete text is passed unchanged to the selected thread.
 5. Service messages never enter Codex history.
 
@@ -581,11 +428,12 @@ type OutboundEvent =
 ```
 
 The relay renders the final Sendblue payload. This ensures pairing messages,
-menus, progress, and thread output use one grammar. Snapshot tests cover every
-message in both iMessage and SMS-safe form.
+menus, typing state, and thread output use one grammar. Snapshot tests cover
+every message in both iMessage and SMS-safe form, including literal Markdown
+preservation.
 
 Model output is data inside `thread.output`; it can never choose a service
-header or imitate a control message through transport metadata.
+identity line or imitate a control message through transport metadata.
 
 ### Relay protocol
 
@@ -631,8 +479,8 @@ stores routing and presentation metadata only.
 
 Add metadata tables for service installations, installation-level pairing, and
 stable menu snapshots. Extend thread rows with catalog visibility, project
-label, and last-seen timestamps. Preserve existing phone bindings so paired
-users do not re-pair.
+label, canonical creation time, and last-seen timestamps. Preserve existing
+phone bindings so paired users do not re-pair.
 
 ## Thread discovery
 
@@ -643,6 +491,9 @@ Catalog rules:
 
 - synchronize title, short project label, created/updated time, visibility, and
   archived state;
+- derive each task identity from normalized title plus canonical creation time,
+  and each project identity from normalized label plus the earliest creation
+  time among all known project tasks;
 - keep full paths and conversation previews out of D1; read previews locally
   only for an on-demand directory;
 - include all tasks with pending work, then turns from the last 48 hours;
@@ -721,10 +572,11 @@ and phone pairing remain unchanged.
 - Bound media size, count, type, and download time.
 - Never log prompt bodies, assistant bodies, tokens, media URLs, or raw JSONL
   tool payloads.
-- Rate-limit control messages and progress independently from final results.
+- Rate-limit control messages and typing refreshes independently from final
+  results.
 - A per-task reasoning override may be set for the next iMessage-started turn.
   It is private local service state and is passed as an invocation override;
-  Codex SQLite and global config are never edited.
+  `/reasoning none` removes it. Codex SQLite and global config are never edited.
 - Do not expose remote controls for model, sandbox, approval mode, project
   rules, task deletion, or task archival.
 - Preserve each thread's normal Codex configuration.
@@ -758,7 +610,7 @@ protocol/
 relay/
   src/
     worker.ts
-    db/migrations/0005_service_installations.sql
+    db/migrations/0005_persistent_service.sql … 0008_presentation_metadata.sql
 ```
 
 ## Implementation phases
@@ -767,7 +619,9 @@ relay/
 
 - Implement pure renderers for every message class in this document.
 - Add golden transcript tests for pairing, menus, switching, ordinary replies,
-  long replies, progress, queueing, cancellation, and errors.
+  long replies, live mirroring, queueing, cancellation, and errors.
+- Assert that no renderer adds the retired universal masthead, line rule, or
+  active-context footer and that literal Markdown reaches Sendblue unchanged.
 - Add parsing tests proving ordinary user text is never mistaken for a command
   outside a valid menu state.
 - Add a test proving the exact inbound user body—not a wrapped prompt—reaches
@@ -781,7 +635,8 @@ live relay or model.
 - Implement read-only catalog discovery.
 - Implement finite `codex exec resume --json` execution.
 - Implement leases, locks, attachments, cancellation, and redacted logs.
-- Map stable JSONL lifecycle events to safe progress phases.
+- Map stable JSONL lifecycle events to typing state and user-visible live
+  commentary buckets.
 - Run against a mocked installation event stream.
 
 Exit criterion: a mocked iMessage event creates one clean Codex user turn, one
@@ -800,8 +655,8 @@ outbound bubble matches a golden presentation fixture.
 ### Phase 3: end-to-end behavior
 
 - Connect the real local service and relay.
-- Implement read receipts, typing lifecycle, bounded progress, final output,
-  images, cancellation, offline recovery, and deduplication.
+- Implement read receipts, typing lifecycle, content-only live mirroring, final
+  output, images, cancellation, offline recovery, and deduplication.
 - Test desktop/local collision and queued remote work.
 
 Exit criterion: multiple threads can be used sequentially without a hook, and
@@ -836,11 +691,15 @@ Cloudflare configuration and without re-pairing.
 - Independently routable fork lineages with stable `Fork N` labels, plus
   stable labels for unrelated same-title sessions.
 - Stable menu snapshots and expired selections.
+- Deterministic project/task emoji from normalized name plus canonical start
+  date, including renamed and missing-date cases.
 - Slash commands versus identical ordinary words sent to Codex.
+- Bare, whitespace, parenthesized, and legacy-colon numeric menu submissions.
 - Raw multiline text with no synthetic prompt wrapper.
 - Text, image, grouped image, final text, and generated images.
 - Short task with typing only.
-- Long task with deterministic bounded progress.
+- Long task with continuous visible commentary and no progress bubble.
+- Consecutive assistant-message bucketing and user/final/fork boundaries.
 - Success, model failure, tool failure, cancellation, and process crash.
 - Service restart before lease, after lease, and after Codex completion.
 - Duplicate webhook delivery and WebSocket reconnect.
@@ -851,15 +710,17 @@ Cloudflare configuration and without re-pairing.
 - Desktop-local activity colliding with a remote request.
 - Archived, deleted, moved, and missing-directory threads.
 - Token reset, phone revocation, pause, uninstall, and rollback.
-- SMS-safe formatting and long-message splitting.
+- Literal Markdown preservation, SMS-readable formatting, semantic-message
+  separation, and minimal `(i/N)` long-message splitting.
 - Logs checked for prompt, response, token, media URL, and raw tool leakage.
 
 ## Early technical spikes
 
 1. Verify `codex exec resume --json <thread-id> -` updates a desktop-created
    thread and document lock/conflict behavior.
-2. Confirm which JSONL lifecycle events are stable enough for deterministic
-   progress without exposing reasoning or sensitive tool data.
+2. Confirm which JSONL lifecycle events are stable enough for content-only live
+   mirroring and typing without exposing hidden reasoning or sensitive tool
+   data.
 3. Verify generated-image discovery without scanning unrelated session files.
 4. Test desktop-local turns while a service-owned resume is running.
 5. Validate LaunchAgent PATH, Codex authentication, and `CODEX_HOME` inheritance
@@ -876,10 +737,14 @@ Cloudflare configuration and without re-pairing.
 - Existing install token and phone pairing migrate without re-pairing.
 - Thread menus, project browsing, search, switching, and commands are concise
   and visually consistent.
-- Every model response is labeled with its source thread outside Codex history.
-- Every service message is visibly distinct from model output.
+- Active-thread model output is content only; background output names its source
+  exactly once outside Codex history.
+- Service state is short and visibly distinct without universal boilerplate.
 - Short tasks use native typing and a final response without extra chatter.
-- Long tasks receive safe, deterministic, rate-limited progress.
+- Long tasks mirror user-visible commentary continuously while structured
+  progress maintains typing without extra bubbles.
+- Project/task identity emoji are deterministic from name plus start date, and
+  Markdown markers are preserved literally through Sendblue.
 - The exact user message reaches Codex without transport instructions.
 - Installation, pause, cancellation, revocation, uninstall, and rollback are
   tested.

@@ -73,6 +73,8 @@ test("history exposes exact completed output and every current commentary messag
   assert.equal(parsed.currentTurn.assistantMessages.length, 3, "response/event duplicates are collapsed");
   assert.equal(parsed.latestCompletedTurn.request, completedRequest);
   assert.equal(parsed.latestCompletedTurn.finalResponse, completedFinal);
+  assert.equal(parsed.turnCount, 2);
+  assert.equal(parsed.turnCountLowerBound, false);
 
   assert.equal(getThreadState(rollout).state, "running");
   assert.equal(getLatestRequest({ rolloutPath: rollout }), currentRequest);
@@ -112,6 +114,8 @@ test("bounded tail parsing tolerates a cut prefix and rollback removes reverted 
   assert.equal(parsed.completedTurns.length, 1);
   assert.equal(parsed.completedTurns[0].id, "turn-new");
   assert.equal(parsed.completedTurns[0].finalResponse, "New response");
+  assert.equal(parsed.turnCount, 1);
+  assert.equal(parsed.turnCountLowerBound, true);
 });
 
 test("automatic continuation starts retain the logical request and visible messages", () => {

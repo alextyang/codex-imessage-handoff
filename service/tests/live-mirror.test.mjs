@@ -233,7 +233,10 @@ test("retryable delivery holds the cursor and deterministic id, preserving stric
     },
   });
   assert.equal(first.retryable, 1);
-  assert.deepEqual(attempts.map((event) => event.body), ["First"]);
+  assert.deepEqual(attempts.map((event) => event.body), ["First\n\nSecond"]);
+  assert.doesNotMatch(readFileSync(item.stateFile, "utf8"), /First|Second/);
+
+  append(item.rolloutPath, commentary("Third, appended after the failed attempt"));
 
   mirror = new LiveMirror(item.stateFile);
   mirror.activate(item.thread);
@@ -253,9 +256,52 @@ test("retryable delivery holds the cursor and deterministic id, preserving stric
     },
   });
   assert.equal(attempts[0].deliveryId, attempts[2].deliveryId);
-  assert.deepEqual(attempts.map((event) => event.body), ["First", "First", "First", "Second"]);
+  assert.deepEqual(attempts.map((event) => event.body), [
+    "First\n\nSecond",
+    "First\n\nSecond",
+    "First\n\nSecond",
+    "Third, appended after the failed attempt",
+  ]);
   assert.equal(second.discarded, 1, "a nested terminal status is not shadowed by a top-level transient status");
   assert.equal(second.delivered, 1);
+});
+
+test("consecutive commentary is bucketed across private records and stops at visible boundaries", async () => {
+  const item = fixture("thread-buckets");
+  const mirror = new LiveMirror(item.stateFile);
+  mirror.activate(item.thread);
+  append(item.rolloutPath,
+    started("turn-one"),
+    commentary("First reasoning bucket"),
+    record("response_item", { type: "reasoning", summary: ["Private reasoning"] }),
+    commentary("Second reasoning bucket"),
+    response("assistant", "Completion owns this response", "final_answer"),
+    commentary("After final"),
+    user("A local user boundary"),
+    commentary("After user"),
+    record("event_msg", { type: "task_complete", turn_id: "turn-one" }),
+    started("turn-two"),
+    commentary("After turn boundary"));
+
+  const delivered = [];
+  const result = await mirror.reconcile(item.thread, {
+    deliver: async (event) => {
+      delivered.push(event);
+      return { sent: true };
+    },
+  });
+
+  assert.equal(result.delivered, 5);
+  assert.deepEqual(delivered.map(({ role, body, turnId }) => ({ role, body, turnId })), [
+    { role: "assistant", body: "First reasoning bucket\n\nSecond reasoning bucket", turnId: "turn-one" },
+    { role: "assistant", body: "After final", turnId: "turn-one" },
+    { role: "user", body: "A local user boundary", turnId: "turn-one" },
+    { role: "assistant", body: "After user", turnId: "turn-one" },
+    { role: "assistant", body: "After turn boundary", turnId: "turn-two" },
+  ]);
+  assert.equal(new Set(delivered.map((event) => event.deliveryId)).size, delivered.length);
+  const persisted = readFileSync(item.stateFile, "utf8");
+  assert.doesNotMatch(persisted, /reasoning bucket|Private reasoning|After final|After user/);
 });
 
 test("all specified terminal provider outcomes advance exactly once", async () => {
@@ -271,7 +317,11 @@ test("all specified terminal provider outcomes advance exactly once", async () =
     { code: "STALE_SELECTION" },
     { status: "NO_BINDING" },
   ];
-  append(item.rolloutPath, started("turn-terminal"), ...terminal.map((_, index) => commentary(`Message ${index}`)));
+  const messages = terminal.flatMap((_, index) => [
+    commentary(`Message ${index}`),
+    response("assistant", `Final boundary ${index}`, "final_answer"),
+  ]);
+  append(item.rolloutPath, started("turn-terminal"), ...messages);
   let calls = 0;
   const first = await mirror.reconcile(item.thread, { deliver: async () => terminal[calls++] });
   assert.equal(calls, terminal.length);

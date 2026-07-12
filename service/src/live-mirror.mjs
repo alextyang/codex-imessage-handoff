@@ -94,6 +94,25 @@ function normalizeActive(value) {
         : [];
     }).slice(-MAX_SUPPRESSIONS)
     : [];
+  const pendingValue = value.pendingGroup;
+  const pendingGroup = pendingValue
+    && typeof pendingValue === "object"
+    && !Array.isArray(pendingValue)
+    && Number.isSafeInteger(pendingValue.startOffset)
+    && pendingValue.startOffset === offset
+    && Number.isSafeInteger(pendingValue.endOffset)
+    && pendingValue.endOffset > pendingValue.startOffset
+    && typeof pendingValue.bodyHash === "string"
+    && /^[a-f0-9]{64}$/.test(pendingValue.bodyHash)
+    && typeof pendingValue.deliveryId === "string"
+    && /^[a-f0-9]{64}$/.test(pendingValue.deliveryId)
+    ? {
+      startOffset: pendingValue.startOffset,
+      endOffset: pendingValue.endOffset,
+      bodyHash: pendingValue.bodyHash,
+      deliveryId: pendingValue.deliveryId,
+    }
+    : null;
   return {
     threadId,
     path: path.resolve(filePath),
@@ -106,6 +125,7 @@ function normalizeActive(value) {
       : selectionId(),
     suppressions,
     discardingOversize: value.discardingOversize === true,
+    pendingGroup,
   };
 }
 
@@ -303,6 +323,31 @@ function canonicalMessage(record) {
   return null;
 }
 
+function isMessageBoundary(record) {
+  const payload = record?.payload;
+  if (record?.type === "event_msg") {
+    return payload?.type === "user_message"
+      || payload?.type === "task_started"
+      || payload?.type === "task_complete"
+      || payload?.type === "turn_aborted"
+      || payload?.type === "thread_rolled_back";
+  }
+  return record?.type === "response_item"
+    && payload?.type === "message"
+    && payload?.role === "assistant"
+    && payload?.phase === "final_answer";
+}
+
+function parseRecord(lineBytes) {
+  try {
+    let line = lineBytes.toString("utf8");
+    if (line.endsWith("\r")) line = line.slice(0, -1);
+    return line.trim() ? JSON.parse(line) : null;
+  } catch {
+    return null;
+  }
+}
+
 function terminalDelivery(result) {
   if (result?.sent === true || result?.notification?.sent === true) {
     return { terminal: true, outcome: "SENT" };
@@ -384,6 +429,7 @@ export class LiveMirror {
         selectionId: selectionId(),
         suppressions: [],
         discardingOversize: false,
+        pendingGroup: null,
       };
       this.selectionEpoch += 1;
       this.#save();
@@ -451,6 +497,7 @@ export class LiveMirror {
     active.selectionId = selectionId();
     active.suppressions = [];
     active.discardingOversize = false;
+    active.pendingGroup = null;
     this.selectionEpoch += 1;
     this.#save();
   }
@@ -485,7 +532,11 @@ export class LiveMirror {
       const selectedId = active.selectionId;
       const startOffset = active.offset;
       const available = opened.stat.size - startOffset;
-      const bytes = readBytes(opened.descriptor, startOffset, Math.min(this.maxReadBytes, available));
+      const pendingBytes = active.pendingGroup?.startOffset === startOffset
+        ? active.pendingGroup.endOffset - startOffset
+        : 0;
+      const readLimit = Math.min(MAX_READ_BYTES, Math.max(this.maxReadBytes, pendingBytes));
+      const bytes = readBytes(opened.descriptor, startOffset, Math.min(readLimit, available));
       if (!bytes.length) return result;
 
       let index = 0;
@@ -517,13 +568,17 @@ export class LiveMirror {
         index = newline + 1;
         result.processed += 1;
 
-        let record;
-        try {
-          let line = lineBytes.toString("utf8");
-          if (line.endsWith("\r")) line = line.slice(0, -1);
-          record = line.trim() ? JSON.parse(line) : null;
-        } catch {
-          record = null;
+        const record = parseRecord(lineBytes);
+
+        if (active.pendingGroup?.startOffset === lineStart
+          && canonicalMessage(record)?.role !== "assistant") {
+          // A retry must still begin with the commentary record whose hashed
+          // bucket metadata was persisted. If the same inode was rewritten,
+          // do not advance into or deliver the altered stream.
+          this.#baseline(details, opened);
+          result.baselined = 1;
+          result.reason = "REBASELINED";
+          return result;
         }
 
         if (!record || typeof record !== "object") {
@@ -542,7 +597,9 @@ export class LiveMirror {
           continue;
         }
         if (record.type === "event_msg"
-          && (payload?.type === "task_complete" || payload?.type === "turn_aborted")
+          && (payload?.type === "task_complete"
+            || payload?.type === "turn_aborted"
+            || payload?.type === "thread_rolled_back")
           && (!payload.turn_id || payload.turn_id === active.turnId)) {
           active.turnId = null;
           active.offset = nextOffset;
@@ -571,22 +628,80 @@ export class LiveMirror {
           }
         }
 
+        let deliveryBody = visible.body;
+        let deliveryEnd = nextOffset;
+        let deliveryIndex = index;
+        const pendingGroup = visible.role === "assistant" ? active.pendingGroup : null;
+        if (visible.role === "assistant") {
+          const bodies = [normalizedBody(visible.body)];
+          const pendingEnd = pendingGroup?.endOffset ?? null;
+          let scanIndex = index;
+
+          // Commentary is emitted in readable buckets. Private reasoning and
+          // other non-visible records may sit between commentary records, but
+          // user, final, turn, and selection boundaries always end the bucket.
+          while (scanIndex < bytes.length) {
+            const candidateNewline = bytes.indexOf(0x0a, scanIndex);
+            if (candidateNewline < 0) break;
+            const candidateEnd = startOffset + candidateNewline + 1;
+            if (pendingEnd !== null && candidateEnd > pendingEnd) break;
+            const candidate = parseRecord(bytes.subarray(scanIndex, candidateNewline));
+            if (isMessageBoundary(candidate)) break;
+            const candidateVisible = canonicalMessage(candidate);
+            if (candidateVisible?.role === "user") break;
+
+            scanIndex = candidateNewline + 1;
+            deliveryIndex = scanIndex;
+            deliveryEnd = candidateEnd;
+            result.processed += 1;
+            if (candidateVisible?.role === "assistant") {
+              bodies.push(normalizedBody(candidateVisible.body));
+            } else {
+              result.ignored += 1;
+            }
+            if (pendingEnd !== null && deliveryEnd === pendingEnd) break;
+          }
+          deliveryBody = bodies.join("\n\n");
+
+          if (pendingGroup && (deliveryEnd !== pendingGroup.endOffset
+            || bodyDigest(deliveryBody) !== pendingGroup.bodyHash)) {
+            // The same inode was modified underneath a pending delivery. A
+            // fresh EOF baseline is safer than sending altered content under
+            // an id that may already have reached the provider.
+            this.#baseline(details, opened);
+            result.baselined = 1;
+            result.reason = "REBASELINED";
+            return result;
+          }
+        }
+
         // Persist all preceding cursor/turn changes before making an external
         // call. A crash can then cause only a deterministic duplicate retry.
-        if (dirty) {
-          this.#save();
-          dirty = false;
-        }
-        const deliveryId = digest([
-          "live-mirror-v1",
+        let deliveryId = digest([
+          visible.role === "assistant" ? "live-mirror-v2-group" : "live-mirror-v1",
           active.threadId,
           active.device,
           active.inode,
           String(lineStart),
+          String(deliveryEnd),
           visible.role,
           visible.phase,
-          visible.body,
+          deliveryBody,
         ].join("\0"));
+        if (pendingGroup) deliveryId = pendingGroup.deliveryId;
+        if (visible.role === "assistant" && !pendingGroup) {
+          active.pendingGroup = {
+            startOffset: lineStart,
+            endOffset: deliveryEnd,
+            bodyHash: bodyDigest(deliveryBody),
+            deliveryId,
+          };
+          dirty = true;
+        }
+        if (dirty) {
+          this.#save();
+          dirty = false;
+        }
         const event = {
           deliveryId,
           threadId: active.threadId,
@@ -594,7 +709,7 @@ export class LiveMirror {
           turnId: active.turnId,
           role: visible.role,
           phase: visible.phase,
-          body: visible.body,
+          body: deliveryBody,
           createdAt: typeof record.timestamp === "string" ? record.timestamp : null,
         };
 
@@ -615,7 +730,9 @@ export class LiveMirror {
           return result;
         }
 
-        active.offset = nextOffset;
+        active.offset = deliveryEnd;
+        if (visible.role === "assistant") active.pendingGroup = null;
+        index = deliveryIndex;
         dirty = true;
         if (outcome.outcome === "SENT") result.delivered += 1;
         else result.discarded += 1;

@@ -5,7 +5,7 @@ import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
 import { readConfig } from "./config.mjs";
 import { listThreads } from "./thread-store.mjs";
-import { getThreadDetail, getLatestRequest, getTurn, getHistory } from "./thread-history.mjs";
+import { getThreadDetail, getLatestRequest, getTurn, getHistory, readThreadHistory } from "./thread-history.mjs";
 import { buildThreadDirectory } from "./thread-directory.mjs";
 import { getReasoningOverride, setReasoningOverride, listReasoningOptions } from "./thread-settings.mjs";
 import { RelayClient } from "./relay-client.mjs";
@@ -296,9 +296,16 @@ function threadLabel(thread) {
   return {
     id: thread.id,
     title: thread.title,
+    createdAt: thread.createdAt,
     projectKey: thread.projectKey,
     projectLabel: thread.projectLabel,
   };
+}
+
+function outboundReasoningOptions(options) {
+  return options.map((option) => option.value === "default"
+    ? { ...option, value: "none", label: "None (use task default)" }
+    : option);
 }
 
 function effectiveState(thread) {
@@ -354,6 +361,7 @@ async function synchronizeNow() {
       cwd: thread.projectLabel || "Codex",
       projectKey: thread.projectKey,
       projectLabel: thread.projectLabel,
+      projectStartedAt: thread.projectStartedAt,
       createdAt: thread.createdAt,
       updatedAt: thread.updatedAt,
       activityAt: state.status === "working" || state.status === "pending"
@@ -842,6 +850,8 @@ async function buildThreadDetailEvent(thread, options = {}) {
     activityAt: detail.activityAt || thread.activityAt,
     stateSince: state.stateSince,
     pendingCount: state.pendingCount,
+    turnCount: detail.turnCount,
+    turnCountLowerBound: detail.turnCountLowerBound,
     reasoningEffort: effectiveReasoning(thread),
     requestPreview: {
       body: requestPreview,
@@ -853,8 +863,8 @@ async function buildThreadDetailEvent(thread, options = {}) {
   };
 }
 
-async function publishThreadDetail(thread) {
-  await relay.outbound(await buildThreadDetailEvent(thread));
+async function publishThreadDetail(thread, options = {}) {
+  await relay.outbound(await buildThreadDetailEvent(thread, options));
 }
 
 function outboundTurn(turn) {
@@ -886,10 +896,7 @@ async function publishThreadDirectory(activeThreadId) {
   const planned = await buildThreadDirectory(threads, {
     activeThreadId,
     stateFor: effectiveState,
-    latestRequest: (thread) => {
-      const turn = getTurn(thread);
-      return { body: turn?.request || "", at: turn?.startedAt || thread.lastTurnAt };
-    },
+    historyFor: (thread) => readThreadHistory(thread),
   });
   await relay.outbound({ kind: "service.directory", directory: planned.directory });
 }
@@ -919,7 +926,7 @@ async function handleControl(event) {
     return;
   }
   if (command === "open" || command === "thread" || command === "status") {
-    await publishThreadDetail(thread);
+    await publishThreadDetail(thread, command === "open" ? {} : { reason: "status" });
     return;
   }
   if (command === "request" || command === "message") {
@@ -954,12 +961,13 @@ async function handleControl(event) {
   }
   if (command === "reasoning") {
     let options = listReasoningOptions(thread);
-    const requested = String(event.argument || "").trim().toLowerCase();
+    const requestedInput = String(event.argument || "").trim().toLowerCase();
+    const requested = requestedInput === "none" ? "default" : requestedInput;
     let current = effectiveReasoning(thread);
     let changed = false;
     if (requested) {
       if (!options.some((option) => option.value === requested)) {
-        await relay.outbound({ kind: "service.reasoning", thread: threadLabel(thread), current, options, invalid: requested });
+        await relay.outbound({ kind: "service.reasoning", thread: threadLabel(thread), current, options: outboundReasoningOptions(options), invalid: requestedInput });
         return;
       }
       setReasoningOverride(thread.id, requested);
@@ -973,7 +981,7 @@ async function handleControl(event) {
       kind: "service.reasoning",
       thread: threadLabel(thread),
       current,
-      options,
+      options: outboundReasoningOptions(options),
       changed,
       note: running ? "Applies to the next turn; the current turn is unchanged." : "Applies to the next iMessage-started turn.",
     });

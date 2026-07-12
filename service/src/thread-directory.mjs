@@ -58,10 +58,22 @@ export async function buildThreadDirectory(threads, options = {}) {
   const nowMs = dateMs(options.now) ?? Date.now();
   const cutoff = nowMs - RECENT_WINDOW_MS;
   const stateFor = options.stateFor;
+  const historyFor = typeof options.historyFor === "function" ? options.historyFor : null;
   const latestRequest = typeof options.latestRequest === "function" ? options.latestRequest : async () => "";
   const activeThreadId = String(options.activeThreadId || "");
   const seen = new Set();
   const eligible = [];
+  const projectStartedAtMs = new Map();
+
+  // Project identity is seeded from the project's true catalog lifetime, not
+  // just whichever recent rows survive the 48-hour directory filter.
+  for (const thread of threads || []) {
+    if (thread?.groupKind === "other" || !thread?.projectKey || !thread?.projectLabel) continue;
+    const createdAtMs = dateMs(thread.projectStartedAt) ?? dateMs(thread.createdAt);
+    if (createdAtMs === null) continue;
+    const key = String(thread.projectKey);
+    projectStartedAtMs.set(key, Math.min(projectStartedAtMs.get(key) ?? Number.POSITIVE_INFINITY, createdAtMs));
+  }
 
   for (const thread of threads || []) {
     const id = String(thread?.id || "");
@@ -72,7 +84,16 @@ export async function buildThreadDirectory(threads, options = {}) {
     const pending = state.status === "pending" || pendingCount > 0;
     const lastTurnMs = dateMs(thread.lastTurnAtMs) ?? dateMs(thread.lastTurnAt);
     if (!pending && (lastTurnMs === null || lastTurnMs < cutoff)) continue;
-    const rolloutRequest = requestCandidate(await latestRequest(thread), thread.lastTurnAt);
+    // Directory commands make one complete history read per visible thread and
+    // reuse it for both the preview and the turn count.
+    const history = historyFor ? await historyFor(thread) : null;
+    const historyTurn = history?.currentTurn || history?.latestTurn || null;
+    const rolloutRequest = requestCandidate(
+      historyFor
+        ? { body: historyTurn?.request || "", at: historyTurn?.startedAt || thread.lastTurnAt }
+        : await latestRequest(thread),
+      thread.lastTurnAt,
+    );
     const hasServiceRequest = state.latestRequest !== null && state.latestRequest !== undefined;
     const serviceRequest = hasServiceRequest
       ? requestCandidate({ body: state.latestRequest, at: state.latestRequestAt })
@@ -88,6 +109,8 @@ export async function buildThreadDirectory(threads, options = {}) {
       pending,
       pendingCount,
       preview: requestPreview(request),
+      turnCount: Math.max(0, Number(history?.turnCount ?? history?.turns?.length) || 0),
+      turnCountLowerBound: Boolean(history?.turnCountLowerBound ?? history?.truncated),
     });
   }
 
@@ -113,6 +136,9 @@ export async function buildThreadDirectory(threads, options = {}) {
   const renderedGroups = groups.map((group) => ({
     projectKey: group.projectKey,
     projectLabel: group.projectLabel,
+    ...(group.other || !projectStartedAtMs.has(group.projectKey)
+      ? {}
+      : { startedAt: new Date(projectStartedAtMs.get(group.projectKey)).toISOString() }),
     threadCount: group.rows.length,
     hiddenCount: 0,
     threads: group.rows.map((row) => {
@@ -121,12 +147,15 @@ export async function buildThreadDirectory(threads, options = {}) {
         id: row.thread.id,
         index: index++,
         title: row.thread.title,
+        createdAt: row.thread.createdAt || null,
         current: row.thread.id === activeThreadId,
         status: row.state.status,
         activityAt: row.thread.lastTurnAt,
         stateSince: row.state.stateSince,
         pendingCount: row.pendingCount,
         requestPreview: row.preview,
+        turnCount: row.turnCount,
+        turnCountLowerBound: row.turnCountLowerBound,
       };
     }),
   }));
@@ -139,8 +168,8 @@ export async function buildThreadDirectory(threads, options = {}) {
       groups: renderedGroups,
       collapsedProjects: [],
       note: eligible.length
-        ? "Reply with a number to open.\nUse “2: message” to open and send.\n\n/refresh · /search · /projects · /help"
-        : "/refresh · /search · /projects · /help",
+        ? "Reply with a number to open that thread. Add “1 (message)” to directly message the thread.\n“/projects” - See all projects\n“/search” - Show threads with specific text"
+        : "“/projects” - See all projects\n“/search” - Show threads with specific text",
     },
     references,
   };

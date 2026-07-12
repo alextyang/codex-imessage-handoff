@@ -1,5 +1,5 @@
 import { CODEX_CONTACT_IMAGE_BASE64 } from "./contact-card-image.ts";
-import { parseMenuSelection, parseSlashCommand, renderContextFooter, renderHelp, renderOutboundEvent, renderThreadDirectory, renderThreadMenu } from "../../protocol/presentation.ts";
+import { parseMenuSelection, parseSlashCommand, renderHelp, renderOutboundEvent, renderOutboundMessages, renderThreadDirectory, renderThreadMenu } from "../../protocol/presentation.ts";
 import type { OutboundEvent, MenuItem, ThreadLabel } from "../../protocol/presentation.ts";
 import type {
   Env,
@@ -126,6 +126,9 @@ interface CatalogThreadInput {
   reasoningEffort?: unknown;
   archived?: unknown;
   visible?: unknown;
+  turnCount?: unknown;
+  turnCountLowerBound?: unknown;
+  projectStartedAt?: unknown;
 }
 
 interface ServiceCatalogBody {
@@ -1108,6 +1111,14 @@ function catalogThread(value: unknown) {
   }
   const updatedAt = optionalLimitedString(value.updatedAt, "thread.updatedAt", 64) ?? nowIso();
   const activityAt = optionalLimitedString(value.activityAt, "thread.activityAt", 64) ?? updatedAt;
+  const explicitCreatedAt = optionalLimitedString(value.createdAt, "thread.createdAt", 64);
+  const rawTurnCount = value.turnCount;
+  const turnCount = rawTurnCount === undefined || rawTurnCount === null
+    ? null
+    : Number(rawTurnCount);
+  if (turnCount !== null && (!Number.isSafeInteger(turnCount) || turnCount < 0)) {
+    throw new Error("thread.turnCount must be a non-negative integer.");
+  }
   return {
     id: requireLimitedString(value.id, "thread.id", 160),
     title: optionalLimitedString(value.title, "thread.title", MAX_TITLE_LENGTH),
@@ -1116,14 +1127,18 @@ function catalogThread(value: unknown) {
     projectKey: optionalLimitedString(value.projectKey, "thread.projectKey", 160)
       ?? optionalLimitedString(value.projectLabel, "thread.projectLabel", 120)
       ?? "codex",
-    createdAt: optionalLimitedString(value.createdAt, "thread.createdAt", 64) ?? nowIso(),
+    createdAt: explicitCreatedAt ?? updatedAt,
+    createdAtExplicit: explicitCreatedAt !== null,
     updatedAt,
     activityAt,
     stateSince: optionalLimitedString(value.stateSince, "thread.stateSince", 64) ?? activityAt,
     status,
     reasoningEffort: optionalLimitedString(value.reasoningEffort, "thread.reasoningEffort", 40),
+    projectStartedAt: optionalLimitedString(value.projectStartedAt, "thread.projectStartedAt", 64),
     archived: value.archived === true ? 1 : 0,
     visible: value.visible === false ? 0 : 1,
+    turnCount,
+    turnCountLowerBound: value.turnCountLowerBound === true ? 1 : 0,
   };
 }
 
@@ -1158,18 +1173,24 @@ async function handleServiceCatalog(request: Request, env: Env) {
         json_extract(value, '$.activityAt') AS activity_at,
         json_extract(value, '$.stateSince') AS state_since,
         json_extract(value, '$.reasoningEffort') AS reasoning_effort
+        ,json_extract(value, '$.projectStartedAt') AS project_started_at
+        ,json_extract(value, '$.createdAtExplicit') AS created_at_explicit
+        ,json_extract(value, '$.turnCount') AS turn_count
+        ,json_extract(value, '$.turnCountLowerBound') AS turn_count_lower_bound
       FROM json_each(?)
     )
     INSERT INTO handoff_threads (
       id, owner_id, cwd, title, handoff_summary, status, handoff_enabled, pairing_code,
       pairing_code_expires_at, last_stop_at, created_at, updated_at, project_label,
       project_key, catalog_source, archived, visible, last_seen_at, catalog_generation,
-      activity_at, state_since, reasoning_effort
+      activity_at, state_since, reasoning_effort, project_started_at, catalog_created_at_explicit,
+      turn_count, turn_count_lower_bound
     )
     SELECT
       id, ?, cwd, title, NULL, status, 1, NULL, NULL, NULL, created_at, updated_at,
       project_label, project_key, 'service', archived, visible, ?, ?, activity_at,
-      state_since, reasoning_effort
+      state_since, reasoning_effort, project_started_at, created_at_explicit, turn_count,
+      turn_count_lower_bound
     FROM incoming
     WHERE 1
     ON CONFLICT(id) DO UPDATE SET
@@ -1188,6 +1209,14 @@ async function handleServiceCatalog(request: Request, env: Env) {
       activity_at = excluded.activity_at,
       state_since = excluded.state_since,
       reasoning_effort = excluded.reasoning_effort,
+      project_started_at = COALESCE(excluded.project_started_at, handoff_threads.project_started_at),
+      created_at = CASE
+        WHEN excluded.catalog_created_at_explicit = 1 THEN excluded.created_at
+        ELSE handoff_threads.created_at
+      END,
+      catalog_created_at_explicit = excluded.catalog_created_at_explicit,
+      turn_count = excluded.turn_count,
+      turn_count_lower_bound = excluded.turn_count_lower_bound,
       updated_at = excluded.updated_at
     WHERE handoff_threads.owner_id = excluded.owner_id`,
   ).bind(JSON.stringify(items), ownerId, now, generation).run();
@@ -1447,19 +1476,14 @@ async function handleServiceOutbound(request: Request, env: Env) {
   const activeThread = resolvedActiveThread
     ?? (binding.active_thread_id && "thread" in event && event.thread?.id === binding.active_thread_id ? event.thread : null);
   const presentation = { context: { activeThread } };
-  const rendered = renderOutboundEvent(event, presentation);
-  const chunks: string[] = [];
-  if ((event.kind === "thread.live-message" || event.kind === "thread.output" || event.kind === "thread.completed") && rendered.length > SENDBLUE_TEXT_LIMIT) {
-    const bodyChunks = splitText(event.body, multipartBodyLimit(activeThread));
-    for (let index = 0; index < bodyChunks.length; index += 1) {
-      const part = { index: index + 1, total: bodyChunks.length };
-      chunks.push(ensurePartLabel(renderOutboundEvent({ ...event, body: bodyChunks[index] }, { ...presentation, part }), part));
-    }
-  } else if (rendered.length > SENDBLUE_TEXT_LIMIT) {
-    chunks.push(...splitRenderedEvent(event, rendered, activeThread));
-  } else {
-    chunks.push(rendered);
-  }
+  // A semantic event may intentionally become multiple conversational
+  // messages (for example, opening a thread followed by its transcript). Keep
+  // those messages separate and only add transport part markers when one
+  // individual message is itself too large for Sendblue.
+  const semanticMessages = event.kind === "thread.progress"
+    ? []
+    : renderOutboundMessages(event, presentation).map((message) => message.trim()).filter(Boolean);
+  const chunks = semanticMessages.flatMap(splitSemanticMessage);
   let deliveryStartPart = 0;
   if (deliveryId) {
     const claim = await beginCompletionNotification(env, ownerId, deliveryId);
@@ -1521,52 +1545,21 @@ async function handleServiceOutbound(request: Request, env: Env) {
       // A progress bubble should not fail just because typing cannot resume.
     }
   }
-  return json({ ok: true, notification: { sent: true, status: result?.status, messageHandle: result?.messageHandle, parts: chunks.length } });
-}
-
-const STRUCTURED_BLOCK_START = /^(?:[◆✓●↪×▲◷] CODEX · |\d+\s{2}|▾ |About$|Active task$|Browse$|Codex(?: · .+)?$|Commands$|Current(?: \/ last turn)?$|Details$|Menu replies$|Note$|Options$|Recent projects$|Reply$|Turn \d+(?: · .+)?$|You(?: · .+)?$)/i;
-
-function multipartBodyLimit(activeThread: ThreadLabel | null) {
-  // Leave room for the per-part header and context footer while keeping each
-  // provider payload comfortably below Sendblue's documented text ceiling.
-  return Math.max(1_000, SENDBLUE_CHUNK_BODY_LIMIT - renderContextFooter(activeThread).length - 240);
-}
-
-function ensurePartLabel(rendered: string, part: { index: number; total: number }) {
-  const firstLineEnd = rendered.indexOf("\n");
-  const firstLine = firstLineEnd < 0 ? rendered : rendered.slice(0, firstLineEnd);
-  const marker = ` · ${part.index}/${part.total}`;
-  if (firstLine.includes(marker)) return rendered;
-  return `${firstLine}${marker}${firstLineEnd < 0 ? "" : rendered.slice(firstLineEnd)}`;
-}
-
-function renderedContentAndFooter(rendered: string) {
-  const marker = "\n\n────────────\n";
-  const index = rendered.lastIndexOf(marker);
-  if (index < 0) return { content: rendered.trim(), footer: "" };
-  return { content: rendered.slice(0, index).trim(), footer: rendered.slice(index + 2).trim() };
-}
-
-function splitRenderedEvent(event: OutboundEvent, rendered: string, activeThread: ThreadLabel | null) {
-  const { content, footer } = renderedContentAndFooter(rendered);
-  const contentChunks = splitText(content, multipartBodyLimit(activeThread), true);
-  const total = contentChunks.length;
-  return contentChunks.map((contentChunk, index) => {
-    const part = { index: index + 1, total };
-    const renderedPart = renderOutboundEvent(event, { context: { activeThread }, part });
-    const partFirstLine = ensurePartLabel(renderedPart, part).split("\n", 1)[0];
-    const firstLineEnd = contentChunk.indexOf("\n");
-    const chunkFirstLine = firstLineEnd < 0 ? contentChunk : contentChunk.slice(0, firstLineEnd);
-    const contentWithHeader = index === 0
-      ? `${partFirstLine}${firstLineEnd < 0 ? "" : contentChunk.slice(firstLineEnd)}`
-      : `${partFirstLine}\n\nContinued\n${contentChunk}`;
-    // If a structured split unexpectedly starts on a header, do not carry two
-    // headers into part one.
-    const normalized = index === 0 && chunkFirstLine === partFirstLine
-      ? contentChunk
-      : contentWithHeader;
-    return `${ensurePartLabel(normalized, part)}${footer ? `\n\n${footer}` : ""}`;
+  return json({
+    ok: true,
+    notification: chunks.length > 0
+      ? { sent: true, status: result?.status, messageHandle: result?.messageHandle, parts: chunks.length }
+      : { sent: false, status: "TYPING", parts: 0 },
   });
+}
+
+const STRUCTURED_BLOCK_START = /^(?:\*\*[^\n]+\*\*|[1-9]\uFE0F?\u20E3\s|🔟\s|\d+\.\s|▾\s|👤\s|☁️\s|Opened\s|Reply with\s|“\/(?:projects|search|threads)”)/iu;
+
+function splitSemanticMessage(message: string) {
+  if (message.length <= SENDBLUE_TEXT_LIMIT) return [message];
+  const contentChunks = splitText(message, SENDBLUE_CHUNK_BODY_LIMIT - 32, true);
+  if (contentChunks.length <= 1) return contentChunks;
+  return contentChunks.map((chunk, index) => `(${index + 1}/${contentChunks.length})\n\n${chunk}`);
 }
 
 function keepStructuredBlockTogether(value: string, index: number, minimum: number) {
@@ -1814,10 +1807,13 @@ function threadLabel(thread: HandoffThreadRow) {
     title: threadDisplayName(thread),
     projectKey: thread.project_key ?? thread.project_label ?? "codex",
     projectLabel: thread.project_label ?? null,
+    createdAt: thread.created_at,
     status: threadStatus(thread),
     activityAt: thread.activity_at ?? thread.updated_at,
     stateSince: thread.state_since ?? thread.activity_at ?? thread.updated_at,
     reasoningEffort: thread.reasoning_effort ?? null,
+    turnCount: thread.turn_count ?? undefined,
+    turnCountLowerBound: thread.turn_count_lower_bound === 1,
   };
 }
 
@@ -1833,6 +1829,7 @@ interface DirectoryProject {
   other: boolean;
   status: DirectoryStatus;
   activityAt: string;
+  startedAt: string;
   current: boolean;
   threads: HandoffThreadRow[];
 }
@@ -1874,6 +1871,10 @@ function projectGroups(threads: HandoffThreadRow[], activeThreadId: string | nul
       activityAt: sorted.reduce((latest, row) => {
         const value = row.activity_at ?? row.updated_at;
         return value > latest ? value : latest;
+      }, ""),
+      startedAt: sorted.reduce((earliest, row) => {
+        const startedAt = row.project_started_at || row.created_at;
+        return !earliest || startedAt < earliest ? startedAt : earliest;
       }, ""),
       current: sorted.some((row) => row.id === activeThreadId),
       threads: sorted,
@@ -1948,6 +1949,7 @@ function buildThreadDirectory(
     return [{
       projectKey: group.projectKey,
       projectLabel: group.projectLabel,
+      startedAt: group.startedAt,
       status: group.status,
       activityAt: group.activityAt,
       threadCount: group.threads.length,
@@ -1961,6 +1963,7 @@ function buildThreadDirectory(
     return {
       projectKey: group.projectKey,
       projectLabel: group.projectLabel,
+      startedAt: group.startedAt,
       status: group.status,
       activityAt: group.activityAt,
       threadCount: group.threads.length,
@@ -1973,11 +1976,6 @@ function buildThreadDirectory(
       totalTasks: threads.length,
       groups: renderedGroups,
       collapsedProjects,
-      note: references.length > 0
-        ? options.extended
-          ? "Reply with a number to open.\n\n/projects · /search · /help"
-          : "Reply with a number to open.\n\n/recent · /search · /help"
-        : undefined,
     },
     references,
   };
@@ -1995,6 +1993,7 @@ function buildProjectDirectory(threads: HandoffThreadRow[], activeThreadId: stri
       groups: [{
         projectKey: group.projectKey,
         projectLabel: group.projectLabel,
+        startedAt: group.startedAt,
         status: group.status,
         activityAt: group.activityAt,
         threadCount: group.threads.length,
@@ -2002,7 +2001,9 @@ function buildProjectDirectory(threads: HandoffThreadRow[], activeThreadId: stri
         threads: selected.map((thread, index) => ({ ...threadLabel(thread), current: thread.id === activeThreadId, index: index + 1 })),
       }],
       collapsedProjects: [],
-      note: references.length > 0 ? "Reply with a number to open.\n\n/threads · /search · /help" : undefined,
+      note: references.length > 0
+        ? "Reply with a number to open that thread. Add “1 (message)” to directly message the thread.\n“/threads” - See recent threads\n“/search” - Show threads with specific text"
+        : undefined,
     },
     references,
   };
@@ -2312,14 +2313,9 @@ function mediaUrlFromSendblue(body: unknown) {
 }
 
 function formatForSendblue(content: string) {
-  // Codex replies can contain Markdown. Convert the common cases to plain text
-  // so iMessage receives something readable.
-  return content
-    .replace(/\[([^\]]+)\]\((https?:\/\/[^)]+)\)/g, "$1: $2")
-    .replace(/\[([^\]]+)\]\(([^)]+)\)/g, "$1")
-    .replace(/\*\*([^*]+)\*\*/g, "$1")
-    .replace(/`([^`]+)`/g, "$1")
-    .trim();
+  // Keep Markdown literal. Sendblue currently transports it as plain text, and
+  // preserving the source makes the messages ready for richer clients later.
+  return content.trim();
 }
 
 function base64DecodedLength(value: string) {
@@ -2935,8 +2931,8 @@ async function handleSendblueWebhook(request: Request, env: Env, ctx?: WaitUntil
   }
 
   const detailCommands: Record<string, string> = {
-    thread: "open",
-    status: "open",
+    thread: "thread",
+    status: "status",
     request: "request",
     message: "request",
     turn: "turn",
@@ -2954,10 +2950,7 @@ async function handleSendblueWebhook(request: Request, env: Env, ctx?: WaitUntil
       }, contextOptions));
       return json({ ok: true, command: slashCommand.command, routed: false });
     }
-    const argument = slashCommand.command === "status"
-      ? "status"
-      : slashCommand.argument;
-    const routed = await startTypingAndSendOwnerControl(env, binding, detailCommands[slashCommand.command], argument);
+    const routed = await startTypingAndSendOwnerControl(env, binding, detailCommands[slashCommand.command], slashCommand.argument);
     await recordAppliedControl(env, binding, content, externalId);
     return json({ ok: true, command: slashCommand.command, routed, threadId: binding.active_thread_id });
   }
@@ -2978,6 +2971,7 @@ async function handleSendblueWebhook(request: Request, env: Env, ctx?: WaitUntil
     const items = groups.map((group) => ({
       title: group.projectLabel,
       projectKey: group.projectKey,
+      createdAt: group.startedAt,
       status: group.status,
       activityAt: group.activityAt,
       threadCount: group.threads.length,
@@ -2985,7 +2979,7 @@ async function handleSendblueWebhook(request: Request, env: Env, ctx?: WaitUntil
     await saveMenuSnapshot(env, binding, [], groups.map((group) => `project:${group.projectKey}`));
     await sendControlMessage(env, fromNumber, renderThreadMenu(items, {
       label: "PROJECTS",
-      note: "Reply with a number to browse that project.\n\n/threads · /search · /help",
+      note: "Reply with a number to show that project.\n“/threads” - See recent threads\n“/search” - Show threads with specific text",
       ...contextOptions,
     }));
     await recordAppliedControl(env, binding, content, externalId);
@@ -3059,7 +3053,7 @@ async function handleSendblueWebhook(request: Request, env: Env, ctx?: WaitUntil
       }
       await saveMenuSnapshot(env, binding, [], planned.references);
       if (selection.prompt) {
-        planned.directory.note = "Choose a task first. The text after the project number was not sent; use “N: your message” on this task list.";
+        planned.directory.note = "Choose a task first. The text after the project number was not sent; use “N (message)” on this task list.";
       }
       await sendControlMessage(env, fromNumber, renderThreadDirectory(planned.directory, { now: new Date(), ...contextOptions }));
       await recordAppliedControl(env, binding, content, externalId);
@@ -3086,12 +3080,12 @@ async function handleSendblueWebhook(request: Request, env: Env, ctx?: WaitUntil
     }
     const persistentService = await findServiceInstallation(env, binding.owner_id);
     const serviceOnline = Boolean(persistentService) && await isServiceSocketConnected(env, binding.owner_id);
-    const contextChanged = binding.active_thread_id !== selected.id;
     await setActiveThreadForOwner(env, binding.owner_id, selected.id);
     const selectedContext = { context: { activeThread: threadLabel(selected) } };
-    if (contextChanged && persistentService) {
-      await sendControlMessage(env, fromNumber, renderOutboundEvent({ kind: "service.switched", thread: threadLabel(selected) }, selectedContext));
-    }
+    // The selection acknowledgement is the one and only "Opened" message.
+    // Emit it even when the selected row is already active, then let the local
+    // service return the transcript as content-only messages.
+    await sendControlMessage(env, fromNumber, renderOutboundEvent({ kind: "service.switched", thread: threadLabel(selected) }, selectedContext));
     if (selection.prompt) {
       if ((persistentService || selected.catalog_source === "service") && !serviceOnline) {
         await sendControlMessage(env, fromNumber, renderOutboundEvent({

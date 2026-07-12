@@ -16,6 +16,8 @@ function thread(id, projectKey, projectLabel, lastTurnOffset, extras = {}) {
     projectKey,
     projectLabel,
     groupKind: extras.groupKind || (projectKey ? "project" : "other"),
+    createdAt: extras.createdAt || at(-7 * 24 * 60 * 60_000),
+    projectStartedAt: extras.projectStartedAt || null,
     lastTurnAt,
     lastTurnAtMs: lastTurnAt ? Date.parse(lastTurnAt) : null,
   };
@@ -117,4 +119,48 @@ test("directory keeps every qualifying row beyond the old eight-task budget", as
   assert.equal(planned.directory.totalTasks, 12);
   assert.equal(planned.directory.groups[0].threads.length, 12);
   assert.deepEqual(planned.directory.groups[0].threads.map((item) => item.index), Array.from({ length: 12 }, (_, index) => index + 1));
+});
+
+test("directory reads each eligible history once and carries stable identity and turn metadata", async () => {
+  const calls = [];
+  const threads = [
+    thread("old-project-root", "alpha", "Alpha", -60 * 60 * 60_000, { createdAt: at(-30 * 24 * 60 * 60_000) }),
+    thread("recent-exact", "alpha", "Alpha", -60_000, {
+      createdAt: at(-2 * 24 * 60 * 60_000),
+      projectStartedAt: at(-60 * 24 * 60 * 60_000),
+    }),
+    thread("recent-lower-bound", "alpha", "Alpha", -120_000, { createdAt: at(-24 * 60 * 60_000) }),
+    thread("other-recent", null, null, -180_000, { groupKind: "other", createdAt: at(-12 * 60 * 60_000) }),
+  ];
+  const planned = await buildThreadDirectory(threads, {
+    now: NOW,
+    activeThreadId: "recent-exact",
+    stateFor: (item) => ({ status: "idle", stateSince: item.lastTurnAt, pendingCount: 0, latestRequest: null }),
+    historyFor: async (item) => {
+      calls.push(item.id);
+      const lowerBound = item.id === "recent-lower-bound";
+      return {
+        currentTurn: null,
+        latestTurn: { request: `History request for ${item.id}`, startedAt: item.lastTurnAt },
+        turns: Array.from({ length: lowerBound ? 9 : 4 }, (_, index) => ({ id: `turn-${index}` })),
+        turnCount: lowerBound ? 9 : 4,
+        turnCountLowerBound: lowerBound,
+      };
+    },
+  });
+
+  assert.deepEqual(calls, ["recent-exact", "recent-lower-bound", "other-recent"]);
+  const alpha = planned.directory.groups.find((group) => group.projectKey === "alpha");
+  assert.equal(alpha.startedAt, at(-60 * 24 * 60 * 60_000), "archived catalog metadata keeps the project identity stable");
+  assert.equal(alpha.threads[0].createdAt, at(-2 * 24 * 60 * 60_000));
+  assert.equal(alpha.threads[0].turnCount, 4);
+  assert.equal(alpha.threads[0].turnCountLowerBound, false);
+  assert.equal(alpha.threads[0].requestPreview, "History request for recent-exact");
+  assert.equal(alpha.threads[1].turnCount, 9);
+  assert.equal(alpha.threads[1].turnCountLowerBound, true);
+  const other = planned.directory.groups.find((group) => group.projectKey === directoryConstants.otherProjectKey);
+  assert.equal(Object.hasOwn(other, "startedAt"), false);
+  assert.match(planned.directory.note, /Add “1 \(message\)”/);
+  assert.match(planned.directory.note, /“\/projects” - See all projects/);
+  assert.match(planned.directory.note, /“\/search” - Show threads with specific text/);
 });

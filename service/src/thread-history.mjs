@@ -362,6 +362,10 @@ function parseTurns(records, metadata = {}) {
     latestCompletedTurn: publicTurn(completedTurns[0] || null),
     completedTurns: completedTurns.map(publicTurn),
     turns: visibleTurns.map(publicTurn),
+    // A bounded read can omit older turns. Keep the observed count useful,
+    // while making it explicit when callers must render it as a lower bound.
+    turnCount: visibleTurns.length,
+    turnCountLowerBound: Boolean(metadata.truncated),
     truncated: Boolean(metadata.truncated),
     malformedTail: Boolean(metadata.malformedTail),
     malformedLines: Number(metadata.malformedLines) || 0,
@@ -457,6 +461,8 @@ export function getThreadDetail(thread, options = {}) {
     finalResponse: turn?.finalResponse ?? null,
     lastMessage: turn?.lastMessage ?? null,
     history: history.completedTurns.slice(0, historyLimit),
+    turnCount: history.turnCount,
+    turnCountLowerBound: history.turnCountLowerBound,
     truncated: history.truncated,
     malformedTail: history.malformedTail,
   };

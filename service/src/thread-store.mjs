@@ -42,15 +42,18 @@ function sqlString(value) {
   return `'${String(value).replaceAll("'", "''")}'`;
 }
 
-const ROOT_THREAD_PREDICATE = `
-  t.archived = 0
-  AND t.preview <> ''
-  AND t.source <> 'exec'
+const USER_THREAD_PREDICATE = `
+  t.source <> 'exec'
   AND COALESCE(t.thread_source, '') <> 'subagent'
   AND t.source NOT LIKE '%"subagent"%'
   AND NOT EXISTS (
     SELECT 1 FROM thread_spawn_edges edge WHERE edge.child_thread_id = t.id
   )`;
+
+const ROOT_THREAD_PREDICATE = `
+  t.archived = 0
+  AND t.preview <> ''
+  AND ${USER_THREAD_PREDICATE}`;
 
 const THREAD_COLUMNS = `
   t.id,
@@ -260,20 +263,37 @@ function disambiguateDisplayDuplicates(threads, roots) {
 }
 
 export async function listThreads(limit = MAX_THREADS) {
-  const [lineageRows, rows] = await Promise.all([
+  const [lineageRows, rows, projectRows] = await Promise.all([
     query(`SELECT t.id, t.rollout_path FROM threads t`),
     query(`
     SELECT ${THREAD_COLUMNS}
     FROM threads t
     WHERE ${ROOT_THREAD_PREDICATE}
     ORDER BY t.recency_at_ms DESC, t.updated_at_ms DESC, t.id DESC`),
+    query(`
+    SELECT t.id, t.cwd, t.created_at, t.created_at_ms
+    FROM threads t
+    WHERE ${USER_THREAD_PREDICATE}`),
   ]);
   const workspaceState = readWorkspaceState();
   const { roots, ancestors } = lineageMetadata(dedupeRows(lineageRows));
+  const projectStartedAt = new Map();
+  for (const row of dedupeRows(projectRows)) {
+    const id = String(row.id || "");
+    if (!id || workspaceState.projectlessThreadIds.has(id)) continue;
+    const workspaceRoot = normalizedCwd(workspaceState.workspaceRootHints.get(id) || row.cwd);
+    const key = projectKey(workspaceRoot);
+    const startedAt = iso(row.created_at_ms, row.created_at);
+    const startedAtMs = Date.parse(startedAt || "");
+    if (!Number.isFinite(startedAtMs)) continue;
+    const current = Date.parse(projectStartedAt.get(key) || "");
+    if (!Number.isFinite(current) || startedAtMs < current) projectStartedAt.set(key, startedAt);
+  }
   const threads = disambiguateProjectLabels(dedupeRows(rows)
     .map((row) => threadFromRow(row, workspaceState))
     .map((thread) => ({
       ...thread,
+      projectStartedAt: thread.projectKey ? projectStartedAt.get(thread.projectKey) || thread.createdAt : null,
       lineageRootId: roots.get(thread.id) || thread.id,
       lineageAncestorIds: ancestors.get(thread.id) || [],
     })));

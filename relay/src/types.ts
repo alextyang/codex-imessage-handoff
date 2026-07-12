@@ -38,6 +38,10 @@ export interface HandoffThreadRow {
   activity_at?: string | null;
   state_since?: string | null;
   reasoning_effort?: string | null;
+  project_started_at?: string | null;
+  catalog_created_at_explicit?: number;
+  turn_count?: number | null;
+  turn_count_lower_bound?: number;
 }
 
 export interface HandoffReplyRow {

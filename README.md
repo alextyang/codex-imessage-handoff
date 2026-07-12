@@ -40,7 +40,7 @@ text it to the displayed Sendblue number within 15 minutes:
 tail -f ~/.codex/imessage-handoff/service.log
 ```
 
-## iMessage interface
+## iMessage interface (v0.3.7)
 
 Normal text goes unchanged to the selected Codex thread. Service commands use a
 slash prefix:
@@ -70,147 +70,138 @@ projectless tasks appear in a final `Other tasks` section. Every row includes
 the latest user-message preview plus a Working, Pending, Idle, or Error label.
 Numbered menus are stable for ten minutes.
 
-Messages use natural-case semantic headers, readable symbols, and a footer that
-repeats the selected task. Symbols supplement words; they never carry meaning
-on their own. Each task also has a deterministic object emoji derived from its
-canonical thread ID, so the same task is recognizable wherever it appears:
+The interface is intentionally content-first. There is no universal masthead,
+line rule, or active-context footer. Markdown markers are preserved literally
+in the Sendblue body so clients can render them in the future; today they remain
+readable plain text. Emoji are used only for identity and speaker roles.
+
+Every real project and task receives a pseudo-random, deterministic object
+emoji. Task emoji are seeded from the normalized task name and canonical
+creation date; project emoji are seeded from the normalized project name and
+earliest known task start date. This keeps an identity recognizable wherever it
+appears without storing an additional visual preference. `Other tasks` is a
+synthetic group, so it does not receive a project emoji.
+
+`/help` is short and contains only available commands:
 
 ```text
-✓ CODEX · Result
+**Browse**
+/threads · Tasks by project
+/refresh · Refresh the task list
+/search (query) · Find a task
+/projects · Browse all projects
 
-🧭 Fix album metadata
-Music crawler
-
-All tests pass.
-
-────────────
-⌁ Active context
-Music crawler › 🧭 Fix album metadata
+**Active task**
+/thread · Status and latest response
+/turn · Show current or last turn
+/history (length) · Completed turn history
+/reasoning (level/none) · View or change reasoning
+/cancel · Stop iMessage-started work in current thread
 ```
 
+The recent-thread directory groups qualifying tasks by project, marks the
+selection, and gives each task just enough status and request context to identify
+it:
+
 ```text
-◆ CODEX · Threads
+▾  ⚙️ **iMessage handoff** · 2 tasks
 
-3 tasks · pending + activity in last 48h · updated now
+**Selected**
+1️⃣  🧪 **Polish message formatting**
+   ◷ Working for 4m
+   “Show a full example set of every message type.”
 
-▾ Music crawler · 2 tasks
+2️⃣  ✏️ Fix duplicate fork history
+   ◷ Working for 8m · 2 queued
+   “Prevent inherited history from replaying.”
 
-1  📦 Retry failed imports
-   ◷ Pending · waiting 12m · 2 queued
-   “Rerun the failed import without creating duplicate IDs.”
+▾ **Other tasks** · 1 task
 
-2  🧭 Fix album metadata
-   ⌁ Active · ○ Idle · 5m ago
-   “Normalize album dates, then rerun the tests.”
-
-▾ Other tasks · 1 task
-
-3  🧪 Compare messaging providers
-   ○ Idle · 3h ago
+3️⃣  🧲 Compare messaging providers
+   ○ 3h ago · 50 turns
    “Which provider supports richer iMessage interactions?”
 
-Reply
-Reply with a number to open.
-Use “2: message” to open and send.
-
-Commands
-/refresh · /search · /projects · /help
-
-────────────
-⌁ Active context
-Music crawler › 🧭 Fix album metadata
+Reply with a number to open that thread. Add “1 (message)” to directly message the thread.
+“/projects” - See all projects
+“/search” - Show threads with specific text
 ```
 
-Opening a task uses the same hierarchy and keeps task controls out of the
-conversation body:
+Opening a task sends one compact acknowledgement and its relevant controls:
 
 ```text
-◆ CODEX · Thread
-
-🧭 Fix album metadata
-Music crawler
-
-○ Idle · 5m ago · Reasoning: High
-
-Commands
-/request · /turn · /history · /reasoning
-/threads
-
-You · 7m ago
-Normalize all album fields…
-
-Note · /request shows the full message.
-
-Codex · Result · 5m ago
-Full final response.
-
-────────────
-⌁ Active context
-Music crawler › 🧭 Fix album metadata
+Opened  🧪 **Polish message formatting**
+/reasoning (level/none) · /turn · /history · /cancel
 ```
 
-Sendblue's [documented message body](https://docs.sendblue.com/api/resources/messages/methods/send)
-is plain text; its [`send_style` values](https://docs.sendblue.com/guides/expressive-messages/)
-are whole-message iMessage effects rather than inline bold or italic. The service
-therefore uses Unicode structure, spacing, and natural-case labels instead of
-markup or faux Unicode bold. Object emoji identify tasks, while every state
-symbol is paired with a word so SMS fallback stays understandable.
-
-The selected task is also a live subscription. Local user messages and Codex's
-user-visible commentary are mirrored as they appear in the open Codex thread:
+After that acknowledgement, the selected task is a content-only live
+subscription. Local user messages carry a small speaker marker; visible Codex
+commentary and final responses are sent without repeated task chrome.
+Consecutive reasoning/commentary updates are grouped with blank lines for
+readability:
 
 ```text
-Codex · Update · now
+👤 Please rerun the tests after that change.
+```
 
-I found the duplicate import path. I’m checking its callers now.
+```text
+I found the duplicate import path.
 
-────────────
-⌁ Active context
-Music crawler › 🧭 Fix album metadata
+I’m checking its callers now.
 ```
 
 Hidden reasoning, tool output, hook prompts, and system/developer messages are
 never mirrored. An iMessage-origin prompt is suppressed from the live feed
-because it is already visible in Messages, and its final answer continues to
-use the normal thread-result presentation. Native typing remains active between
-live updates; bounded generic progress is reserved for longer operations.
+because it is already visible in Messages. Native typing remains active while
+work is running; structured progress events update typing instead of creating
+progress bubbles.
+
+`/turn` and `/history` return one long role-marked transcript without a heading,
+timestamps, or command footer:
+
+```text
+👤 Normalize all album fields.
+
+
+☁️ I updated the parser and started the tests.
+
+
+👤 Also preserve unknown fields.
+
+
+☁️ Done. All tests pass.
+```
+
+`/reasoning none` removes the task-specific override and returns the task to its
+normal default. `/reasoning` shows the available levels with `●` on the current
+choice; the exact levels follow the task's model capabilities.
 
 When Codex moves the selected task into a locally created active fork, the
 service follows that descendant with a compare-and-swap that cannot overwrite a
-manual Messages selection. It emits one `↪ CODEX · Following Fork` context
-header and a
-current-turn snapshot, then continues the live feed. Existing fork history is
-baselined, so inherited parent turns are not replayed as new messages or task
-completions.
+manual Messages selection. It emits the same single `Opened` acknowledgement
+and a current-turn snapshot, then continues the content-only live feed. Existing
+fork history is baselined, so inherited parent turns are not replayed as new
+messages or task completions.
 
 When the paired user has texted Codex within the previous 24 hours, the service
 also watches visible top-level tasks that finish locally and sends their exact
-final response with a distinct completion header:
+final response. Results from any task other than the selected one name their
+source first:
 
 ```text
-✓ CODEX · Completed Elsewhere
-
-📦 Retry failed imports
-Music crawler
-✓ Completed · now
+✏️ **Fix duplicate fork history**
 
 All tests pass.
-
-────────────
-⌁ Active context unchanged
-Music crawler › 🧭 Fix album metadata
 ```
 
-The source task above is intentionally separate from the footer: background
-completion notices do not silently change where the next message will go.
+Selected-task results contain only the result body. A background notification
+never changes where the next ordinary message will go.
 
 Existing task history is baselined silently on first start, and iMessage-started
 turns are deduplicated so their requested reply is never followed by a second
 completion notice. The same 24-hour activity window applies to debounced
-`✓ CODEX · Mac Connected` and `× CODEX · Mac Disconnected` notices when the Mac
-connects or disconnects. Their `Active context unchanged` footers make it clear
-that connectivity did not switch tasks. Inbound prompts, commands, menu choices,
-media, and pairing all refresh the window; outbound notices do not.
+`● Codex is online.` and `○ Codex is offline. New messages will wait until it
+reconnects.` notices. Inbound prompts, commands, menu choices, media, and pairing
+all refresh the window; outbound notices do not.
 
 ## Service commands
 
@@ -243,9 +234,10 @@ without LaunchAgent support.
 6. A private cursor tails only canonical local user messages and visible Codex
    commentary for the task currently selected in Messages. Selection changes
    baseline the new rollout; same-selection restarts resume the cursor.
-7. Structured lifecycle events drive typing and safe progress.
-8. The final response is labeled outside Codex history and sent through
-   Sendblue.
+7. Structured lifecycle events drive typing while visible commentary is
+   mirrored as content.
+8. The final response is sent through Sendblue without adding transport text to
+   Codex history.
 9. A separate private incremental watcher detects locally completed top-level
    tasks without reinstalling Codex Stop hooks.
 10. The Codex child process exits; the small service returns to idle. A heartbeat

@@ -5,6 +5,7 @@ export interface ThreadLabel {
   title: string;
   projectKey?: string | null;
   projectLabel?: string | null;
+  createdAt?: string | null;
 }
 
 export interface MenuItem extends ThreadLabel {
@@ -17,11 +18,14 @@ export interface MenuItem extends ThreadLabel {
   threadCount?: number;
   pendingCount?: number;
   requestPreview?: string | null;
+  turnCount?: number;
+  turnCountLowerBound?: boolean;
 }
 
 export interface ThreadDirectoryGroup {
   projectKey: string;
   projectLabel: string;
+  startedAt?: string | null;
   status?: ThreadStatus | string | null;
   activityAt?: string | null;
   threadCount?: number;
@@ -32,6 +36,7 @@ export interface ThreadDirectoryGroup {
 export interface CollapsedProject {
   projectKey: string;
   projectLabel: string;
+  startedAt?: string | null;
   index: number;
   status?: ThreadStatus | string | null;
   activityAt?: string | null;
@@ -85,12 +90,14 @@ export type OutboundEvent =
     activityAt?: string | null;
     stateSince?: string | null;
     pendingCount?: number;
+    turnCount?: number;
+    turnCountLowerBound?: boolean;
     reasoningEffort?: string | null;
     requestPreview?: { body: string; at?: string | null; truncated?: boolean } | string | null;
     assistantMessages?: VisibleMessage[];
     historyTruncated?: boolean;
     deliveryId?: string;
-    reason?: "fork" | null;
+    reason?: "fork" | "status" | null;
   }
   | { kind: "thread.request"; thread: ThreadLabel; body?: string; request?: string | { body?: string; at?: string | null }; at?: string | null }
   | { kind: "thread.turn"; thread: ThreadLabel; turn: ThreadTurn | null; reasoningEffort?: string | null }
@@ -119,14 +126,11 @@ export interface PresentationOptions {
   part?: { index: number; total: number };
 }
 
-const CONTEXT_RULE = "────────────";
-const MAX_LABEL_LENGTH = 80;
+const MAX_LABEL_LENGTH = 120;
 
-// Thread identities use objects rather than faces or state-like symbols so the
-// marker remains useful even when a task changes from pending to working to
-// complete. This exact palette is part of the identity algorithm: changing its
-// order or length requires an explicit identity migration.
-const THREAD_OBJECT_EMOJIS = [
+// The exact palette is part of the deterministic identity algorithm. Changing
+// its order or length requires an explicit identity migration.
+const OBJECT_EMOJIS = [
   "📚", "🧭", "🧰", "🔭", "🧩", "🎛️", "🪴", "🧵",
   "🔬", "🗂️", "📐", "🪁", "🧲", "🪜", "🧪", "📎",
   "🗝️", "🛠️", "🖇️", "📡", "🪶", "🎒", "🗺️", "📦",
@@ -156,6 +160,14 @@ function safeBody(value: unknown, fallback = "") {
   return typeof value === "string" ? value.trim() || fallback : fallback;
 }
 
+function markdownText(value: unknown, fallback: string) {
+  return cleanLine(value, fallback).replaceAll("\\", "\\\\").replaceAll("*", "\\*").replaceAll("_", "\\_");
+}
+
+function bold(value: unknown, fallback: string) {
+  return `**${markdownText(value, fallback)}**`;
+}
+
 function dateValue(value: string | Date | number | null | undefined) {
   if (value instanceof Date) return value.getTime();
   if (typeof value === "number") return Number.isFinite(value) ? value : null;
@@ -164,8 +176,63 @@ function dateValue(value: string | Date | number | null | undefined) {
   return Number.isFinite(parsed) ? parsed : null;
 }
 
-function plural(value: number, singular: string, pluralValue = `${singular}s`) {
-  return `${value} ${value === 1 ? singular : pluralValue}`;
+function normalizedStart(value: unknown) {
+  const parsed = typeof value === "string" || typeof value === "number" || value instanceof Date ? dateValue(value) : null;
+  return parsed === null ? "unknown-start" : new Date(parsed).toISOString();
+}
+
+function normalizedName(value: unknown, fallback: string) {
+  return cleanLine(value, fallback).normalize("NFKC").replace(/\s+/g, " ").trim().toLocaleLowerCase("en-US");
+}
+
+function identityEmoji(kind: "thread" | "project", name: unknown, startedAt: unknown) {
+  const seed = `${kind}\u0000${normalizedName(name, kind)}\u0000${normalizedStart(startedAt)}`;
+  let hash = 0x811c9dc5;
+  for (let index = 0; index < seed.length; index += 1) {
+    hash ^= seed.charCodeAt(index);
+    hash = Math.imul(hash, 0x01000193) >>> 0;
+  }
+  return OBJECT_EMOJIS[hash % OBJECT_EMOJIS.length];
+}
+
+export function threadIdentityEmoji(thread: ThreadLabel) {
+  return identityEmoji("thread", thread.title, thread.createdAt);
+}
+
+export function projectIdentityEmoji(project: { projectLabel?: string | null; title?: string | null; startedAt?: string | null; createdAt?: string | null }) {
+  return identityEmoji("project", project.projectLabel || project.title, project.startedAt || project.createdAt);
+}
+
+export function threadTitle(thread: ThreadLabel) {
+  return `${threadIdentityEmoji(thread)} ${cleanLine(thread.title, "Untitled task")}`;
+}
+
+function styledThreadTitle(thread: ThreadLabel, selected = false) {
+  const title = selected ? bold(thread.title, "Untitled task") : markdownText(thread.title, "Untitled task");
+  return `${threadIdentityEmoji(thread)} ${title}`;
+}
+
+function sameThread(left?: ThreadLabel | null, right?: ThreadLabel | null) {
+  if (!left || !right) return false;
+  if (left.id && right.id) return left.id === right.id;
+  return normalizedName(left.title, "") === normalizedName(right.title, "")
+    && normalizedStart(left.createdAt) === normalizedStart(right.createdAt);
+}
+
+function eventActiveThread(event: OutboundEvent, options: PresentationOptions) {
+  if (event.kind === "service.switched") return event.thread;
+  if (options.context && Object.prototype.hasOwnProperty.call(options.context, "activeThread")) {
+    return options.context.activeThread ?? null;
+  }
+  if (event.kind === "service.directory") {
+    for (const group of event.directory.groups ?? []) {
+      const current = group.threads.find((thread) => thread.current);
+      if (current) return current;
+    }
+  }
+  if (event.kind === "service.menu") return event.items?.find((item) => item.current) ?? null;
+  if ("thread" in event && event.thread) return event.thread;
+  return null;
 }
 
 export function relativeTime(value: string | Date | number | null | undefined, now: string | Date | number = new Date()) {
@@ -194,124 +261,36 @@ function elapsed(value: string | null | undefined, now: string | Date | number =
 }
 
 function statusName(status: unknown) {
-  if (status === "working" || status === "running") return "Working";
-  if (status === "pending" || status === "queued") return "Pending";
-  if (status === "error" || status === "failed" || status === "aborted") return "Error";
-  return "Idle";
+  if (status === "working" || status === "running") return "working";
+  if (status === "pending" || status === "queued") return "pending";
+  if (status === "error" || status === "failed" || status === "aborted") return "error";
+  return "idle";
 }
 
-function statusLine(status: unknown, activityAt?: string | null, stateSince?: string | null, now: string | Date | number = new Date()) {
-  const label = statusName(status);
-  const symbol = label === "Working" ? "●" : label === "Pending" ? "◷" : label === "Error" ? "▲" : "○";
-  const time = label === "Working" || label === "Pending"
-    ? elapsed(stateSince || activityAt, now)
-    : relativeTime(activityAt || stateSince, now);
-  if (time === "unknown") return `${symbol} ${label}`;
-  if (label === "Pending") return `${symbol} ${label} · waiting ${time}`;
-  if (label === "Working") return `${symbol} ${label} · for ${time}`;
-  return `${symbol} ${label} · ${time}`;
+function turnCountText(item: { turnCount?: number; turnCountLowerBound?: boolean }) {
+  const count = Math.max(0, Number(item.turnCount) || 0);
+  if (count === 0 && item.turnCount === undefined) return null;
+  return `${count}${item.turnCountLowerBound ? "+" : ""} ${count === 1 ? "turn" : "turns"}`;
 }
 
-function reasoningName(value: unknown) {
-  const text = cleanLine(value, "");
-  if (!text) return null;
-  if (text.toLowerCase() === "xhigh") return "Extra high";
-  return text.charAt(0).toUpperCase() + text.slice(1);
-}
-
-function threadIdentitySeed(thread: ThreadLabel) {
-  const id = typeof thread.id === "string" ? thread.id.trim() : "";
-  if (id) return `id:${id}`;
-  const fallback = [thread.projectKey, thread.projectLabel, thread.title]
-    .map((value) => typeof value === "string" ? value.replace(/\s+/g, " ").trim().toLowerCase() : "")
-    .filter(Boolean)
-    .join("\u0000");
-  return `fallback:${fallback || "untitled-task"}`;
-}
-
-/** Returns the stable, non-status object marker used to identify a thread. */
-export function threadIdentityEmoji(thread: ThreadLabel) {
-  const seed = threadIdentitySeed(thread);
-  let hash = 0x811c9dc5;
-  for (let index = 0; index < seed.length; index += 1) {
-    hash ^= seed.charCodeAt(index);
-    hash = Math.imul(hash, 0x01000193) >>> 0;
-  }
-  return THREAD_OBJECT_EMOJIS[hash % THREAD_OBJECT_EMOJIS.length];
-}
-
-export function threadTitle(thread: ThreadLabel) {
-  return `${threadIdentityEmoji(thread)} ${cleanLine(thread.title, "Untitled task")}`;
-}
-
-function titleCase(value: unknown, fallback: string) {
-  return cleanLine(value, fallback)
-    .toLowerCase()
-    .replace(/(^|[\s/-])([a-z])/g, (_match, prefix, letter) => `${prefix}${letter.toUpperCase()}`);
-}
-
-export function header(label: string, options: { symbol?: string; part?: { index: number; total: number } } = {}) {
-  const part = options.part && options.part.total > 1 ? ` · ${options.part.index}/${options.part.total}` : "";
-  return `${options.symbol ?? "◆"} CODEX · ${titleCase(label, "Codex")}${part}`;
-}
-
-function partSuffix(part?: { index: number; total: number }) {
-  return part && part.total > 1 ? ` · ${part.index}/${part.total}` : "";
-}
-
-function threadProject(thread: ThreadLabel) {
-  return cleanLine(thread.projectLabel, "Other tasks");
-}
-
-function threadSubject(thread: ThreadLabel) {
-  return `${threadTitle(thread)}\n${threadProject(thread)}`;
-}
-
-function sameThread(left?: ThreadLabel | null, right?: ThreadLabel | null) {
-  if (!left || !right) return false;
-  if (left.id && right.id) return left.id === right.id;
-  return cleanLine(left.projectLabel, "").toLowerCase() === cleanLine(right.projectLabel, "").toLowerCase()
-    && cleanLine(left.title, "").toLowerCase() === cleanLine(right.title, "").toLowerCase();
-}
-
-function directoryActiveThread(directory: ThreadDirectory) {
-  for (const group of directory.groups ?? []) {
-    const current = group.threads.find((thread) => thread.current);
-    if (current) return { ...current, projectKey: current.projectKey ?? group.projectKey, projectLabel: current.projectLabel ?? group.projectLabel };
-  }
-  return null;
-}
-
-function eventActiveThread(event: OutboundEvent, options: PresentationOptions) {
-  // A switch event is the transition itself. Its target is authoritative even
-  // when the caller's pre-switch binding context is still in scope.
-  if (event.kind === "service.switched") return event.thread;
-  if (options.context && Object.prototype.hasOwnProperty.call(options.context, "activeThread")) {
-    return options.context.activeThread ?? null;
-  }
-  if (event.kind === "service.directory") return directoryActiveThread(event.directory);
-  if (event.kind === "service.menu") return event.items?.find((item) => item.current) ?? null;
-  if ("thread" in event && event.thread) return event.thread;
-  return null;
-}
-
-export function renderContextFooter(activeThread?: ThreadLabel | null, label = "Active context") {
-  if (!activeThread) return `${CONTEXT_RULE}\n⌁ No active task · /threads`;
-  return `${CONTEXT_RULE}\n⌁ ${label}\n${threadProject(activeThread)} › ${threadTitle(activeThread)}`;
-}
-
-function withContext(body: string, activeThread: ThreadLabel | null, label = "Active context") {
-  return `${body.trim()}\n\n${renderContextFooter(activeThread, label)}`;
-}
-
-function menuMetadata(item: MenuItem, now: string | Date | number) {
-  const state = `${item.current ? "⌁ Active · " : ""}${statusLine(item.status, item.activityAt, item.stateSince, now)}`;
-  const parts = [state];
+function directoryStatus(item: MenuItem, now: string | Date | number) {
+  const status = statusName(item.status);
   const pending = Math.max(0, Number(item.pendingCount) || 0);
-  if (pending > 0 && (statusName(item.status) !== "Pending" || pending > 1)) {
-    parts.push(`${pending} queued`);
-  }
+  const turns = turnCountText(item);
+  const parts: string[] = [];
+  if (status === "working") parts.push(`◷ Working for ${elapsed(item.stateSince || item.activityAt, now)}`);
+  else if (status === "pending") parts.push(`◷ Pending for ${elapsed(item.stateSince || item.activityAt, now)}`);
+  else if (status === "error") parts.push(`▲ Needs attention${item.activityAt ? ` · ${relativeTime(item.activityAt, now)}` : ""}`);
+  else parts.push(`○ ${relativeTime(item.activityAt || item.stateSince, now)}`);
+  if (pending > 0) parts.push(`${pending} queued`);
+  if ((status === "idle" || status === "error") && turns) parts.push(turns);
   return parts.join(" · ");
+}
+
+function keycap(index: number) {
+  if (index >= 1 && index <= 9) return `${index}\uFE0F\u20E3`;
+  if (index === 10) return "🔟";
+  return `${index}.`;
 }
 
 function requestPreview(value: unknown) {
@@ -320,90 +299,71 @@ function requestPreview(value: unknown) {
   return text.length <= 160 ? text : `${truncateText(text, 159).trimEnd()}…`;
 }
 
-function directoryGroupLabel(group: ThreadDirectoryGroup) {
-  const label = cleanLine(group.projectLabel, "Other tasks");
+function projectHeading(group: ThreadDirectoryGroup) {
   const count = group.threadCount ?? group.threads.length + Math.max(0, group.hiddenCount ?? 0);
-  return `▾ ${label} · ${plural(count, "task")}`;
+  if (group.projectLabel.trim().toLowerCase() === "other tasks") return `▾ ${bold("Other tasks", "Other tasks")} · ${count} ${count === 1 ? "task" : "tasks"}`;
+  return `▾  ${projectIdentityEmoji(group)} ${bold(group.projectLabel, "Project")} · ${count} ${count === 1 ? "task" : "tasks"}`;
 }
 
-function renderDirectoryFooter(note: string) {
-  const blocks = safeBody(note).split(/\n\s*\n/).map((block) => block.trim()).filter(Boolean);
-  if (blocks.length === 0) return "";
-  const optionIndex = blocks.findIndex((block) => block.startsWith("/"));
-  if (optionIndex > 0) {
-    const reply = blocks.slice(0, optionIndex).join("\n\n");
-    const options = blocks.slice(optionIndex).join("\n");
-    return `Reply\n${reply}\n\nCommands\n${options}`;
-  }
-  return `${blocks[0].startsWith("/") ? "Commands" : "Reply"}\n${blocks.join("\n\n")}`;
+function renderThreadRow(item: MenuItem, offset: number, now: string | Date | number) {
+  const index = item.index ?? offset + 1;
+  const preview = requestPreview(item.requestPreview);
+  return [
+    `${keycap(index)}  ${styledThreadTitle(item, Boolean(item.current))}`,
+    `   ${directoryStatus(item, now)}`,
+    preview ? `   “${preview}”` : null,
+  ].filter(Boolean).join("\n");
 }
 
-function renderLabeledBody(label: string, value: unknown) {
-  const blocks = safeBody(value).split(/\n\s*\n/).map((block) => block.trim()).filter(Boolean);
-  if (blocks.length === 0) return `${label}\nNo details available.`;
-  const actionIndex = blocks.findIndex((block) => block.startsWith("/"));
-  if (actionIndex === 0) return `Commands\n${blocks.join("\n")}`;
-  if (actionIndex > 0) {
-    return `${label}\n${blocks.slice(0, actionIndex).join("\n\n")}\n\nCommands\n${blocks.slice(actionIndex).join("\n")}`;
-  }
-  return `${label}\n${blocks.join("\n\n")}`;
-}
+const DEFAULT_THREAD_DIRECTORY_NOTE = [
+  "Reply with a number to open that thread. Add “1 (message)” to directly message the thread.",
+  "“/projects” - See all projects",
+  "“/search” - Show threads with specific text",
+].join("\n");
 
 export function renderThreadDirectory(directory: ThreadDirectory, options: { now?: string | Date | number; context?: PresentationContext; part?: { index: number; total: number } } = {}) {
   const now = options.now ?? new Date();
-  const groups = directory.groups ?? [];
-  const collapsed = directory.collapsedProjects ?? [];
-  const total = directory.totalTasks ?? (
-    groups.reduce((sum, group) => sum + (group.threadCount ?? group.threads.length), 0)
-    + collapsed.reduce((sum, project) => sum + project.threadCount, 0)
-  );
-  const selected = options.context && Object.prototype.hasOwnProperty.call(options.context, "activeThread")
-    ? options.context.activeThread ?? null
-    : directoryActiveThread(directory);
-  const sections: string[] = [
-    header(directory.label === "PROJECTS" ? "Projects" : "Threads", { part: options.part }),
-    [
-      plural(total, "task"),
-      cleanLine(directory.criteria, ""),
-      "updated now",
-    ].filter(Boolean).join(" · "),
-  ];
-
-  for (const group of groups) {
-    const rows = group.threads.map((item, offset) => {
-      const resolvedItem = { ...item, projectKey: item.projectKey ?? group.projectKey, projectLabel: item.projectLabel ?? group.projectLabel };
-      const index = item.index ?? offset + 1;
-      const preview = requestPreview(item.requestPreview);
-      return [`${index}  ${threadTitle(resolvedItem)}`, `   ${menuMetadata(resolvedItem, now)}`, preview ? `   “${preview}”` : null].filter(Boolean).join("\n");
-    });
-    const hidden = group.hiddenCount && group.hiddenCount > 0 ? `\n\n   + ${plural(group.hiddenCount, "more task")}` : "";
-    sections.push(`${directoryGroupLabel(group)}\n\n${rows.join("\n\n")}${hidden}`);
+  const sections: string[] = [];
+  for (const group of directory.groups ?? []) {
+    const current = group.threads.find((item) => item.current);
+    const others = group.threads.filter((item) => item !== current);
+    const rows: string[] = [];
+    if (current) rows.push(`**Selected**\n${renderThreadRow(current, 0, now)}`);
+    rows.push(...others.map((item, index) => renderThreadRow(item, index, now)));
+    const hidden = Math.max(0, Number(group.hiddenCount) || 0);
+    if (hidden > 0) rows.push(`+${hidden} more ${hidden === 1 ? "task" : "tasks"}`);
+    sections.push(`${projectHeading(group)}\n\n${rows.join("\n\n")}`);
   }
-
-  if (collapsed.length > 0) {
-    const rows = collapsed.map((project) => {
-      return `${project.index}  ▸ ${cleanLine(project.projectLabel, "Other")} · ${plural(project.threadCount, "task")}\n   ${statusLine(project.status, project.activityAt, project.activityAt, now)}`;
-    });
-    sections.push(`Recent projects\n\n${rows.join("\n\n")}`);
+  for (const project of directory.collapsedProjects ?? []) {
+    const statusItem: MenuItem = { title: project.projectLabel, status: project.status, activityAt: project.activityAt, stateSince: project.activityAt };
+    const identity = project.projectLabel.trim().toLowerCase() === "other tasks" ? "" : `${projectIdentityEmoji(project)} `;
+    sections.push(`${keycap(project.index)}  ▸  ${identity}${bold(project.projectLabel, "Project")} · ${project.threadCount} ${project.threadCount === 1 ? "task" : "tasks"}\n   ${directoryStatus(statusItem, now)}`);
   }
-
-  if (groups.length === 0 && collapsed.length === 0) sections.push("No pending or recently active tasks.");
-  if (directory.note) sections.push(renderDirectoryFooter(directory.note));
-  return withContext(sections.filter(Boolean).join("\n\n"), selected);
+  if (sections.length === 0) sections.push("No pending or recently active threads.");
+  sections.push(safeBody(directory.note, DEFAULT_THREAD_DIRECTORY_NOTE));
+  return sections.filter(Boolean).join("\n\n");
 }
 
 export function renderThreadMenu(items: MenuItem[], options: { label?: "THREADS" | "PROJECTS"; note?: string; now?: string | Date | number; context?: PresentationContext; part?: { index: number; total: number } } = {}) {
-  const label = options.label ?? "THREADS";
-  if (label === "PROJECTS") {
+  if (options.label === "PROJECTS") {
+    const now = options.now ?? new Date();
     const rows = items.map((item, index) => {
-      const count = item.threadCount ? `${plural(item.threadCount, "task")} · ` : "";
-      return `${item.index ?? index + 1}  ▸ Browse ${cleanLine(item.title, "Other")}\n   ${count}${statusLine(item.status, item.activityAt, item.stateSince, options.now)}`;
+      const count = Math.max(0, Number(item.threadCount) || 0);
+      const state = statusName(item.status);
+      const status = state === "working"
+        ? `◷ Working · ${count} ${count === 1 ? "task" : "tasks"}`
+        : state === "pending"
+          ? `◷ Pending · ${count} ${count === 1 ? "task" : "tasks"}`
+          : state === "error"
+            ? `▲ Needs attention · ${count} ${count === 1 ? "task" : "tasks"}`
+            : `○ ${relativeTime(item.activityAt || item.stateSince, now)} · ${count} ${count === 1 ? "task" : "tasks"}`;
+      return `${keycap(item.index ?? index + 1)}  ${projectIdentityEmoji({ title: item.title, createdAt: item.createdAt })} ${bold(item.title, "Project")}\n   ${status}`;
     });
-    return withContext([
-      header("Projects", { part: options.part }),
-      rows.join("\n\n") || "No available projects.",
-      options.note ? renderDirectoryFooter(options.note) : null,
-    ].filter(Boolean).join("\n\n"), options.context?.activeThread ?? null);
+    return [
+      "**Projects**",
+      rows.join("\n\n") || "No projects found.",
+      safeBody(options.note, "Reply with a number to show that project.\n“/threads” - See recent threads\n“/search” - Show threads with specific text"),
+    ].join("\n\n");
   }
   const groups = new Map<string, MenuItem[]>();
   for (const item of items) {
@@ -412,197 +372,165 @@ export function renderThreadMenu(items: MenuItem[], options: { label?: "THREADS"
   }
   return renderThreadDirectory({
     label: "THREADS",
-    groups: [...groups.entries()].map(([projectLabel, threads]) => ({ projectKey: projectLabel, projectLabel, threads })),
-    note: options.note ?? (items.length ? "Reply with a number to open.\n\n/threads · /search · /help" : undefined),
-  }, { now: options.now, context: options.context, part: options.part });
+    groups: [...groups.entries()].map(([projectLabel, threads]) => ({
+      projectKey: projectLabel,
+      projectLabel,
+      startedAt: threads.map((item) => item.createdAt).filter(Boolean).sort()[0] ?? null,
+      threads,
+    })),
+    note: options.note,
+  }, options);
 }
 
-export function renderHelp(options: PresentationOptions = {}) {
-  return withContext([
-    header("Commands", { part: options.part }),
-    "Browse\n/threads · Tasks by project\n/refresh · Refresh the task list\n/search words · Find a task\n/projects · Browse all projects",
-    "Active task\n/thread · Status and latest response\n/request · Full latest request\n/turn · Current or last turn\n/history 3 · Completed turn history\n/reasoning · View or change reasoning",
-    "Work\n/cancel · Stop iMessage-started work\n/retry · Retry the oldest failed request\n/dismiss · Clear the oldest failed request",
-    "Menu replies\n1 · Open item 1\n2: message · Open item 2 and send",
-  ].join("\n\n"), options.context?.activeThread ?? null);
+export function renderHelp(_options: PresentationOptions = {}) {
+  return [
+    "**Browse**\n/threads · Tasks by project\n/refresh · Refresh the task list\n/search (query) · Find a task\n/projects · Browse all projects",
+    "**Active task**\n/thread · Status and latest response\n/turn · Show current or last turn\n/history (length) · Completed turn history\n/reasoning (level/none) · View or change reasoning\n/cancel · Stop iMessage-started work in current thread",
+  ].join("\n\n");
 }
 
-function commandLines(state: unknown) {
-  const primary = "/request · /turn · /history · /reasoning";
-  if (statusName(state) === "Error") return `Commands\n${primary}\n/retry · /dismiss · /threads`;
-  return statusName(state) === "Working" || statusName(state) === "Pending"
-    ? `Commands\n${primary}\n/cancel · /threads`
-    : `Commands\n${primary}\n/threads`;
+function reasoningName(value: unknown) {
+  const text = cleanLine(value, "").toLowerCase();
+  if (!text || text === "default") return "none";
+  if (text === "xhigh") return "xhigh";
+  return text;
 }
 
-function speakerLine(role: "user" | "assistant", at?: string | null, phase?: string | null) {
-  const when = at ? relativeTime(at) : "now";
-  if (role === "user") return `You · ${when}`;
-  const normalized = cleanLine(phase, "update").replace(/[_-]+/g, " ").toLowerCase();
-  const label = normalized === "final answer" ? "Result" : normalized === "commentary" ? "Update" : titleCase(normalized, "Update");
-  return `Codex · ${label} · ${when}`;
+function openedMessage(thread: ThreadLabel) {
+  return `Opened  ${styledThreadTitle(thread, true)}\n/reasoning (level/none) · /turn · /history · /cancel`;
 }
 
-function renderThreadDetail(event: Extract<OutboundEvent, { kind: "thread.detail" }>, part?: { index: number; total: number }) {
-  const state = statusLine(event.state, event.activityAt, event.stateSince);
-  const reasoning = reasoningName(event.reasoningEffort);
-  const pending = event.pendingCount && event.pendingCount > 0 ? `${event.pendingCount} queued` : null;
-  const metadata = [state, pending, reasoning ? `Reasoning: ${reasoning}` : null].filter(Boolean).join(" · ");
-  const preview = typeof event.requestPreview === "string"
-    ? { body: event.requestPreview, at: null, truncated: false }
-    : event.requestPreview;
-  const context = [
-    header(event.reason === "fork" ? "Following fork" : "Thread", { symbol: event.reason === "fork" ? "↪" : "◆", part }),
-    threadSubject(event.thread),
-    event.reason === "fork" ? `${metadata}\nFollowing the active fork of this task.` : metadata,
-  ].filter(Boolean).join("\n\n");
-  const sections = [context, commandLines(event.state)];
-  if (preview?.body) {
-    sections.push(`${speakerLine("user", preview.at)}\n${preview.body}${preview.truncated ? "\n\nNote · /request shows the full message." : ""}`);
-  }
-  const messages = event.assistantMessages ?? [];
-  for (const message of messages) {
-    sections.push(`${speakerLine("assistant", message.at, message.phase)}\n${safeBody(message.body, "No text response.")}`);
-  }
-  if (messages.length === 0) {
-    const note = statusName(event.state) === "Pending"
-      ? "This request is waiting for a run slot."
-      : statusName(event.state) === "Working"
-        ? "Codex is working; no user-visible update has arrived yet."
-        : statusName(event.state) === "Error"
-          ? "This request did not produce a final response. Use /retry to try it again."
-          : "No assistant response was found in the available history.";
-    sections.push(`Note\n${note}`);
-  }
-  if (event.historyTruncated) sections.push("Note\nOlder content is outside the local history window. /history may show less than requested.");
-  return sections.filter(Boolean).join("\n\n");
+function statusSummary(event: Extract<OutboundEvent, { kind: "thread.detail" }>) {
+  const item: MenuItem = {
+    ...event.thread,
+    status: event.state,
+    activityAt: event.activityAt,
+    stateSince: event.stateSince,
+    pendingCount: event.pendingCount,
+    turnCount: event.turnCount,
+    turnCountLowerBound: event.turnCountLowerBound,
+  };
+  const lines = [styledThreadTitle(event.thread, true), directoryStatus(item, new Date())];
+  if (event.reasoningEffort) lines.push(`Reasoning: ${reasoningName(event.reasoningEffort)}`);
+  return lines.join("\n");
 }
 
 function normalizeRequest(event: Extract<OutboundEvent, { kind: "thread.request" }>) {
-  if (typeof event.body === "string") return { body: event.body, at: event.at };
-  if (typeof event.request === "string") return { body: event.request, at: event.at };
-  return { body: event.request?.body || "", at: event.request?.at || event.at };
+  if (typeof event.body === "string") return event.body;
+  if (typeof event.request === "string") return event.request;
+  return event.request?.body || "";
 }
 
-function renderTurn(thread: ThreadLabel, turn: ThreadTurn | null, label = "Turn", part?: { index: number; total: number }) {
-  const sections = [header(label, { part }), threadSubject(thread), "Commands\n/thread · /request · /history · /reasoning"];
-  if (!turn) return [...sections, "Note\nNo turn was found in the available history."].join("\n\n");
-  if (turn.request) sections.push(`${speakerLine("user", turn.requestAt)}\n${turn.request}`);
+function turnBlocks(turn: ThreadTurn | null) {
+  if (!turn) return [];
+  const blocks: string[] = [];
+  if (turn.request) blocks.push(`👤 ${safeBody(turn.request)}`);
   for (const message of turn.assistantMessages ?? []) {
-    sections.push(`${speakerLine("assistant", message.at, message.phase)}\n${safeBody(message.body)}`);
+    const body = safeBody(message.body);
+    if (body) blocks.push(`☁️ ${body}`);
   }
   const finalAlreadyShown = (turn.assistantMessages ?? []).some((message) => safeBody(message.body) === safeBody(turn.finalResponse));
-  if (turn.finalResponse && !finalAlreadyShown) {
-    sections.push(`${speakerLine("assistant", turn.completedAt, "final_answer")}\n${turn.finalResponse}`);
-  }
-  return sections.filter(Boolean).join("\n\n");
+  if (turn.finalResponse && !finalAlreadyShown) blocks.push(`☁️ ${safeBody(turn.finalResponse)}`);
+  return blocks;
 }
 
-export function renderOutboundEvent(event: OutboundEvent, options: PresentationOptions = {}) {
+function scopedBody(thread: ThreadLabel | undefined, body: string, activeThread: ThreadLabel | null) {
+  if (!thread || sameThread(thread, activeThread)) return body;
+  return `${styledThreadTitle(thread, true)}\n\n${body}`;
+}
+
+function partPrefix(options: PresentationOptions) {
+  return options.part && options.part.total > 1 ? `(${options.part.index}/${options.part.total})\n\n` : "";
+}
+
+export function renderOutboundMessages(event: OutboundEvent, options: PresentationOptions = {}): string[] {
+  if (event.kind === "thread.progress") return [];
+  if (event.kind === "thread.detail") {
+    const activeThread = eventActiveThread(event, options);
+    const messages: string[] = [];
+    if (event.reason === "fork") messages.push(openedMessage(event.thread));
+    if (event.reason === "status") messages.push(statusSummary(event));
+    const preview = typeof event.requestPreview === "string" ? event.requestPreview : event.requestPreview?.body;
+    if (preview && !/^No user request was found/i.test(preview)) messages.push(`👤 ${safeBody(preview)}`);
+    const assistant = (event.assistantMessages ?? []).map((message) => safeBody(message.body)).filter(Boolean);
+    if (assistant.length > 0) messages.push(assistant.join("\n\n"));
+    if (messages.length === 0) messages.push("No response yet.");
+    if (!sameThread(event.thread, activeThread) && event.reason !== "status") {
+      messages[0] = scopedBody(event.thread, messages[0], activeThread);
+    }
+    return messages;
+  }
+  return [renderOutboundEvent(event, options)];
+}
+
+export function renderOutboundEvent(event: OutboundEvent, options: PresentationOptions = {}): string {
   const activeThread = eventActiveThread(event, options);
-  const finish = (body: string, label = "Active context") => withContext(body, activeThread, label);
-  if (event.kind === "thread.output") {
-    return finish([header("Result", { symbol: "✓", part: options.part }), threadSubject(event.thread), safeBody(event.body)].filter(Boolean).join("\n\n"));
-  }
-  if (event.kind === "thread.completed") {
-    const elsewhere = Boolean(activeThread) && !sameThread(activeThread, event.thread);
-    return finish([
-      header(elsewhere ? "Completed elsewhere" : "Completed", { symbol: "✓", part: options.part }),
-      `${threadSubject(event.thread)}\n✓ Completed · ${event.completedAt ? relativeTime(event.completedAt) : "now"}`,
-      safeBody(event.body),
-    ].filter(Boolean).join("\n\n"), elsewhere ? "Active context unchanged" : "Active context");
-  }
+  const part = partPrefix(options);
+  if (event.kind === "thread.output") return `${part}${scopedBody(event.thread, safeBody(event.body), activeThread)}`;
+  if (event.kind === "thread.completed") return `${part}${scopedBody(event.thread, safeBody(event.body), activeThread)}`;
   if (event.kind === "thread.live-message") {
-    const when = event.at ? relativeTime(event.at) : "now";
-    const line = event.role === "user"
-      ? `You · Mirrored from Mac · ${when}${partSuffix(options.part)}`
-      : `${speakerLine("assistant", event.at, event.phase).replace(/ · unknown$/, " · now")}${partSuffix(options.part)}`;
-    return finish([line, safeBody(event.body, "No text content.")].join("\n\n"));
+    const body = safeBody(event.body, "No text content.");
+    return `${part}${event.role === "user" ? `👤 ${body}` : body}`;
   }
-  if (event.kind === "thread.progress") {
-    return finish([header("Still working", { symbol: "●", part: options.part }), safeBody(event.phase)].join("\n\n"));
-  }
-  if (event.kind === "service.directory") return renderThreadDirectory(event.directory, { context: options.context, part: options.part });
-  if (event.kind === "thread.detail") return finish(renderThreadDetail(event, options.part));
+  if (event.kind === "thread.progress") return `${part}${safeBody(event.phase)}`;
+  if (event.kind === "thread.detail") return renderOutboundMessages(event, options).join("\n\n\n");
   if (event.kind === "thread.request") {
-    const request = normalizeRequest(event);
-    return finish([header("Latest request", { part: options.part }), threadSubject(event.thread), "Commands\n/thread · /turn · /history · /reasoning", `${speakerLine("user", request.at)}\n${request.body || "No user request was found."}`].join("\n\n"));
+    const body = `👤 ${safeBody(normalizeRequest(event), "No user request was found.")}`;
+    return `${part}${scopedBody(event.thread, body, activeThread)}`;
   }
-  if (event.kind === "thread.turn") return finish(renderTurn(event.thread, event.turn, "Current / last turn", options.part));
+  if (event.kind === "thread.turn") {
+    const blocks = turnBlocks(event.turn);
+    const body = blocks.length ? blocks.join("\n\n\n") : "No turn found.";
+    return `${part}${scopedBody(event.thread, body, activeThread)}`;
+  }
   if (event.kind === "thread.history") {
-    const turns = event.turns.filter((turn): turn is ThreadTurn => Boolean(turn));
-    const sections = [header("History", { part: options.part }), `${threadSubject(event.thread)}\n${plural(turns.length, "completed turn")} · newest first`, "Commands\n/thread · /request · /turn · /reasoning"];
-    turns.forEach((turn, index) => {
-      const response = turn.finalResponse || turn.assistantMessages?.at(-1)?.body || "No final text response.";
-      sections.push(`Turn ${index + 1} · ${relativeTime(turn.completedAt || turn.requestAt)}\nYou\n${turn.request || "No request text found."}\n\nCodex\n${response}`);
-    });
-    if (turns.length === 0) sections.push("Note\nNo completed turns were found in the available history.");
-    if (event.hasMore) sections.push("Note\nMore completed turns are available. Try /history 5.");
-    return finish(sections.join("\n\n"));
+    const blocks = event.turns.flatMap(turnBlocks);
+    const body = blocks.length ? blocks.join("\n\n\n") : "No completed turns found.";
+    return `${part}${scopedBody(event.thread, body, activeThread)}`;
   }
   if (event.kind === "service.reasoning") {
-    const reasoningOptions = event.options.map((option) => typeof option === "string" ? { value: option, label: reasoningName(option) || option } : option);
-    const rows = reasoningOptions.map((option) => `${option.selected ? "●" : "○"} ${option.label || reasoningName(option.value) || option.value}${option.selected ? " · selected" : ""}\n   /reasoning ${option.value}`);
-    const selected = reasoningOptions.find((option) => option.selected);
-    const current = reasoningName(event.current);
-    const selection = selected?.value === "default"
-      ? `Task default${current ? ` · ${current}` : ""}`
-      : selected?.label || reasoningName(selected?.value) || current || "Task default";
-    const status = event.invalid
-      ? `▲ “${cleanLine(event.invalid, "value")}” is not available.`
-      : event.changed
-        ? `✓ Updated · ${selection}`
-        : `Current · ${selection}`;
-    return finish([
-      header("Reasoning", { part: options.part }),
-      threadSubject(event.thread),
-      status,
-      `Options\n${rows.join("\n\n")}`,
-      event.note ? `Note\n${event.note}` : null,
-    ].filter(Boolean).join("\n\n"));
+    let body: string;
+    if (event.invalid) {
+      body = `“${cleanLine(event.invalid, "value")}” isn’t a reasoning level.\n\n/reasoning (level/none)`;
+      return `${part}${scopedBody(event.thread, body, activeThread)}`;
+    }
+    const optionsList = event.options.map((option) => typeof option === "string" ? { value: option } : option);
+    const selected = optionsList.find((option) => option.selected);
+    const selectedName = reasoningName(selected?.value || event.current);
+    if (event.changed) {
+      const message = selectedName === "none" ? "Reasoning override removed." : `Reasoning set to ${bold(selectedName, "none")}.`;
+      body = `${message}${event.note ? `\n\n${safeBody(event.note)}` : ""}`;
+      return `${part}${scopedBody(event.thread, body, activeThread)}`;
+    }
+    const rows = optionsList.map((option) => {
+      const name = reasoningName(option.value);
+      return `${option.selected ? "●" : "○"} ${name}`;
+    });
+    body = `**Reasoning**\n${rows.join("\n")}\n\n/reasoning (level/none)`;
+    return `${part}${scopedBody(event.thread, body, activeThread)}`;
   }
-  if (event.kind === "service.switched") {
-    const followingFork = event.reason === "fork";
-    return finish([
-      header(followingFork ? "Following fork" : "Context switched", { symbol: "↪", part: options.part }),
-      threadSubject(event.thread),
-      followingFork ? "New messages now go to the active fork of this task." : "New messages now go to this task.",
-      "Commands\n/thread · /threads",
-    ].join("\n\n"), "Now active");
-  }
+  if (event.kind === "service.directory") return `${part}${renderThreadDirectory(event.directory, { context: options.context })}`;
+  if (event.kind === "service.switched") return `${part}${openedMessage(event.thread)}`;
   if (event.kind === "service.presence") {
-    return event.state === "online"
-      ? finish([header("Mac connected", { symbol: "✓", part: options.part }), "Ready for new task messages."].join("\n\n"), "Active context unchanged")
-      : finish([header("Mac disconnected", { symbol: "×", part: options.part }), "New task messages will wait until it reconnects."].join("\n\n"), "Active context unchanged");
+    return `${part}${event.state === "online" ? "● Codex is online." : "○ Codex is offline. New messages will wait until it reconnects."}`;
   }
   if (event.kind === "service.menu") {
-    if (event.label === "COMMANDS") {
-      return event.body
-        ? finish([header("Commands", { part: options.part }), event.body, event.note].filter(Boolean).join("\n\n"))
-        : renderHelp(options);
-    }
-    return renderThreadMenu(event.items ?? [], { label: event.label === "PROJECTS" ? "PROJECTS" : "THREADS", note: event.note, context: options.context, part: options.part });
+    if (event.label === "COMMANDS") return `${part}${event.body ? [event.body, event.note].filter(Boolean).join("\n\n") : renderHelp()}`;
+    return `${part}${renderThreadMenu(event.items ?? [], { label: event.label === "PROJECTS" ? "PROJECTS" : "THREADS", note: event.note, context: options.context })}`;
   }
-  const labels: Record<NoticeCode, { symbol: string; label: string }> = {
-    connected: { symbol: "◆", label: "Connected" },
-    queued: { symbol: "◷", label: "Pending" },
-    cancelled: { symbol: "×", label: "Cancelled" },
-    "needs-attention": { symbol: "▲", label: "Needs attention" },
-    updated: { symbol: "✓", label: "Updated" },
-  };
-  const notice = labels[event.code];
-  const about = event.thread ? `About\n${threadTitle(event.thread)}\n${threadProject(event.thread)}` : null;
-  const unchanged = Boolean(event.thread && activeThread && !sameThread(event.thread, activeThread));
-  return finish([
-    header(notice.label, { symbol: notice.symbol, part: options.part }),
-    about,
-    renderLabeledBody("Details", event.body),
-  ].filter(Boolean).join("\n\n"), unchanged ? "Active context unchanged" : "Active context");
+  const body = safeBody(event.body, "No details available.");
+  return `${part}${scopedBody(event.thread, body, activeThread)}`;
 }
 
 export function parseMenuSelection(value: string) {
-  const match = value.trim().match(/^([1-9]\d*)(?:\s*:\s*([\s\S]+))?$/);
-  return match ? { index: Number(match[1]) - 1, prompt: match[2]?.trim() || null } : null;
+  const text = value.trim();
+  const bare = text.match(/^([1-9]\d*)$/);
+  if (bare) return { index: Number(bare[1]) - 1, prompt: null };
+  const withPrompt = text.match(/^([1-9]\d*)(?:\s*:\s*|\s+)([\s\S]+)$/);
+  if (!withPrompt) return null;
+  let prompt = withPrompt[2].trim();
+  if (prompt.startsWith("(") && prompt.endsWith(")")) prompt = prompt.slice(1, -1).trim();
+  return prompt ? { index: Number(withPrompt[1]) - 1, prompt } : null;
 }
 
 export function parseSlashCommand(value: string) {

@@ -106,6 +106,7 @@ test("catalog excludes subagents, groups projects, carries state, and finds IDs 
       ${sql(row.model)}, ${sql(row.reasoning)}, 'openai', NULL, NULL,
       ${sql(row.source)}, ${sql(row.threadSource)}
     );`),
+    "UPDATE threads SET created_at = 1, created_at_ms = 1000 WHERE id = 'fork-hidden-root';",
     "INSERT INTO thread_spawn_edges VALUES ('root-000','child-edge','closed');",
   ];
   execFileSync("sqlite3", [database], { input: statements.join("\n") });
@@ -140,9 +141,11 @@ test("catalog excludes subagents, groups projects, carries state, and finds IDs 
     assert.equal(all[0].model, "gpt-fixture");
     assert.equal(all[0].reasoningEffort, "high");
     assert.equal(all[0].rolloutPath, runningRollout);
+    assert.equal(all[0].createdAt, "2026-07-12T02:40:00.000Z");
     assert.equal(all[0].projectLabel, "catalog-app · projects");
     assert.equal(all.find((thread) => thread.id === "same-name-project")?.projectLabel, "catalog-app · copies");
     assert.equal(all[0].projectKey, projectKey(project));
+    assert.equal(all[0].projectStartedAt, "1970-01-01T00:00:01.000Z");
     assert.equal(all[0].lastTurnAt, "2026-07-12T03:00:00.010Z");
     assert.equal(all.find((thread) => thread.id === "hinted-worktree")?.projectKey, projectKey(project));
     assert.equal(all.find((thread) => thread.id === "hinted-worktree")?.workspaceRoot, project);
