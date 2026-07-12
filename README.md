@@ -1,5 +1,9 @@
 # Codex iMessage Handoff
 
+> An alternate persistent-service architecture that removes per-thread Stop
+> hooks is specified in
+> [docs/PERSISTENT_SERVICE_PLAN.md](docs/PERSISTENT_SERVICE_PLAN.md).
+
 iMessage Handoff lets you continue a local Codex thread from iMessage or via SMS. It has two parts:
 
 - `imessage-handoff`: the installable Codex skill.
