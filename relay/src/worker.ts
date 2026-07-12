@@ -137,6 +137,11 @@ interface OutboundBody {
   event?: unknown;
 }
 
+interface ActiveThreadBody {
+  threadId?: unknown;
+  expectedThreadId?: unknown;
+}
+
 interface StatusBody {
   cwd?: unknown;
   lastAssistantMessage?: unknown;
@@ -1083,6 +1088,7 @@ async function handleServiceRegister(request: Request, env: Env) {
     pairingCodeExpiresAt,
     sendblueNumber: env.SENDBLUE_FROM_NUMBER || "+12344198201",
     activeThreadId: binding?.active_thread_id ?? null,
+    activeThreadUpdatedAt: binding?.updated_at ?? null,
   });
 }
 
@@ -1204,9 +1210,68 @@ async function handleServiceStatus(request: Request, env: Env) {
     connected: Boolean(installation) && await isServiceSocketConnected(env, ownerId),
     paired: Boolean(binding),
     activeThread: activeThread ? publicThread(activeThread) : null,
+    activeThreadUpdatedAt: binding?.updated_at ?? null,
     lastSeenAt: installation?.last_seen_at ?? null,
     clientId: installation?.client_id ?? null,
     serviceVersion: installation?.service_version ?? null,
+  });
+}
+
+function serviceThreadAvailable(thread: HandoffThreadRow | null, ownerId: string) {
+  return Boolean(
+    thread
+    && thread.owner_id === ownerId
+    && thread.handoff_enabled === 1
+    && thread.visible !== 0
+    && thread.archived !== 1
+  );
+}
+
+async function handleServiceActiveThread(request: Request, env: Env) {
+  const ownerId = await requireOwnerId(request);
+  const body = await readJsonBody<ActiveThreadBody>(request);
+  const threadId = requireLimitedString(body.threadId, "threadId", 160);
+  const expectedThreadId = body.expectedThreadId === null
+    ? null
+    : requireLimitedString(body.expectedThreadId, "expectedThreadId", 160);
+  const target = await findThread(env, threadId);
+  if (!serviceThreadAvailable(target, ownerId)) {
+    throw Object.assign(new Error("Target thread is not available."), { status: 409 });
+  }
+
+  let binding = await findPhoneBindingForOwner(env, ownerId);
+  if (!binding) {
+    return json({
+      ok: true,
+      switched: false,
+      status: "NO_BINDING",
+      currentThreadId: null,
+      activeThreadUpdatedAt: null,
+    });
+  }
+  if (binding.active_thread_id === threadId) {
+    return json({
+      ok: true,
+      switched: false,
+      currentThreadId: binding.active_thread_id,
+      activeThreadUpdatedAt: binding.updated_at,
+    });
+  }
+
+  const updatedAt = nowIso();
+  const changed = await env.DB.prepare(
+    `UPDATE phone_bindings
+      SET active_thread_id = ?, updated_at = ?
+      WHERE owner_id = ?
+        AND ((? IS NULL AND active_thread_id IS NULL) OR active_thread_id = ?)`,
+  ).bind(threadId, updatedAt, ownerId, expectedThreadId, expectedThreadId).run();
+  binding = await findPhoneBindingForOwner(env, ownerId);
+  const switched = Number(changed.meta?.changes) > 0;
+  return json({
+    ok: true,
+    switched,
+    currentThreadId: binding?.active_thread_id ?? null,
+    activeThreadUpdatedAt: binding?.updated_at ?? null,
   });
 }
 
@@ -1314,11 +1379,53 @@ async function handleServiceOutbound(request: Request, env: Env) {
   const ownerId = await requireOwnerId(request);
   const body = await readJsonBody<OutboundBody>(request, SERVICE_OUTBOUND_JSON_BODY_MAX_BYTES);
   const event = outboundEvent(body.event);
-  const completionId = event.kind === "thread.completed"
+  let deliveryId = event.kind === "thread.completed"
     ? requireLimitedString(event.completionId, "completionId", 128)
     : null;
   const binding = await findPhoneBindingForOwner(env, ownerId);
-  if (event.kind === "thread.completed") {
+  if (event.kind === "thread.live-message") {
+    const messageId = requireLimitedString(event.messageId, "messageId", 160);
+    if (event.role !== "user" && event.role !== "assistant") {
+      throw new Error("role must be user or assistant.");
+    }
+    requireString(event.body, "body");
+    optionalLimitedString(event.phase, "phase", 80);
+    optionalLimitedString(event.at, "at", 64);
+    const threadId = requireLimitedString(event.thread?.id, "thread.id", 160);
+    if (!binding) {
+      return json({ ok: true, notification: { sent: false, status: "NO_BINDING", terminal: true } });
+    }
+    const activity = notificationActivity(binding);
+    if (!activity.active) {
+      return json({ ok: true, notification: { sent: false, status: "INACTIVE", terminal: true } });
+    }
+    if (binding.active_thread_id !== threadId) {
+      return json({ ok: true, notification: { sent: false, status: "STALE_SELECTION", terminal: true } });
+    }
+    const selectedThread = await findThread(env, threadId);
+    if (!serviceThreadAvailable(selectedThread, ownerId)) {
+      return json({ ok: true, notification: { sent: false, status: "STALE_SELECTION", terminal: true } });
+    }
+    deliveryId = `live-message:${encodeURIComponent(threadId)}:${encodeURIComponent(messageId)}`;
+  } else if (event.kind === "thread.detail" && event.reason === "fork") {
+    const contextId = requireLimitedString(event.deliveryId, "deliveryId", 160);
+    const threadId = requireLimitedString(event.thread?.id, "thread.id", 160);
+    if (!binding) {
+      return json({ ok: true, notification: { sent: false, status: "NO_BINDING", terminal: true } });
+    }
+    const activity = notificationActivity(binding);
+    if (!activity.active) {
+      return json({ ok: true, notification: { sent: false, status: "INACTIVE", terminal: true } });
+    }
+    if (binding.active_thread_id !== threadId) {
+      return json({ ok: true, notification: { sent: false, status: "STALE_SELECTION", terminal: true } });
+    }
+    const selectedThread = await findThread(env, threadId);
+    if (!serviceThreadAvailable(selectedThread, ownerId)) {
+      return json({ ok: true, notification: { sent: false, status: "STALE_SELECTION", terminal: true } });
+    }
+    deliveryId = `follow-context:${encodeURIComponent(threadId)}:${encodeURIComponent(contextId)}`;
+  } else if (event.kind === "thread.completed") {
     const activity = notificationActivity(binding);
     if (!activity.active) {
       return json({ ok: true, notification: { sent: false, status: activity.status } });
@@ -1332,7 +1439,14 @@ async function handleServiceOutbound(request: Request, env: Env) {
     : null;
   const rendered = renderOutboundEvent(event);
   const chunks: string[] = [];
-  if ((event.kind === "thread.output" || event.kind === "thread.completed") && rendered.length > SENDBLUE_TEXT_LIMIT) {
+  if (event.kind === "thread.live-message" && rendered.length > SENDBLUE_TEXT_LIMIT) {
+    const bodyChunks = splitText(event.body, SENDBLUE_CHUNK_BODY_LIMIT);
+    for (let index = 0; index < bodyChunks.length; index += 1) {
+      const renderedPart = renderOutboundEvent({ ...event, body: bodyChunks[index] });
+      const baseHeader = renderedPart.slice(0, renderedPart.indexOf("\n\n"));
+      chunks.push(`${multipartHeader(baseHeader, index + 1, bodyChunks.length)}${renderedPart.slice(baseHeader.length)}`);
+    }
+  } else if ((event.kind === "thread.output" || event.kind === "thread.completed") && rendered.length > SENDBLUE_TEXT_LIMIT) {
     const bodyChunks = splitText(event.body, SENDBLUE_CHUNK_BODY_LIMIT);
     for (let index = 0; index < bodyChunks.length; index += 1) {
       const context = `${threadHeader(event.thread, { index: index + 1, total: bodyChunks.length })}\n\n${threadTitle(event.thread)}`;
@@ -1369,18 +1483,23 @@ async function handleServiceOutbound(request: Request, env: Env) {
   } else {
     chunks.push(rendered);
   }
-  let completionStartPart = 0;
-  if (completionId) {
-    const claim = await beginCompletionNotification(env, ownerId, completionId);
+  let deliveryStartPart = 0;
+  if (deliveryId) {
+    const claim = await beginCompletionNotification(env, ownerId, deliveryId);
     if (claim.state === "delivered") {
-      return json({ ok: true, notification: { sent: true, status: "DUPLICATE", parts: claim.partsSent } });
+      return event.kind === "thread.live-message"
+        ? json({ ok: true, notification: { sent: false, status: "DUPLICATE", terminal: true, parts: claim.partsSent } })
+        : json({ ok: true, notification: { sent: true, status: "DUPLICATE", parts: claim.partsSent } });
     }
     if (claim.state === "in-progress") {
       return json({ ok: true, notification: { sent: false, status: "IN_PROGRESS", parts: claim.partsSent } });
     }
-    completionStartPart = Math.min(chunks.length, claim.partsSent);
+    deliveryStartPart = Math.min(chunks.length, claim.partsSent);
   }
-  if (event.kind !== "thread.completed") {
+  const selectedCompletion = event.kind === "thread.completed"
+    && Boolean(event.thread.id)
+    && event.thread.id === binding.active_thread_id;
+  if (event.kind !== "thread.completed" || selectedCompletion) {
     try {
       await sendSendblueTypingIndicator(env, binding.phone_number, "stop");
     } catch {
@@ -1393,26 +1512,32 @@ async function handleServiceOutbound(request: Request, env: Env) {
   // mapping only after every part is accepted by Sendblue.
   if (directoryReferences) await saveMenuSnapshot(env, binding, [], []);
   let result = null;
-  let completionPartsSent = completionStartPart;
+  let deliveryPartsSent = deliveryStartPart;
   try {
-    for (let index = completionStartPart; index < chunks.length; index += 1) {
+    for (let index = deliveryStartPart; index < chunks.length; index += 1) {
       const chunk = chunks[index];
       if (chunk.length > SENDBLUE_TEXT_LIMIT) requestTooLarge("Rendered message is too large.");
       result = await sendSendblueMessage(env, binding.phone_number, chunk);
-      if (completionId) {
-        completionPartsSent = index + 1;
-        await updateCompletionNotification(env, ownerId, completionId, "sending", completionPartsSent);
+      if (deliveryId) {
+        deliveryPartsSent = index + 1;
+        await updateCompletionNotification(env, ownerId, deliveryId, "sending", deliveryPartsSent);
       }
     }
-    if (completionId) await updateCompletionNotification(env, ownerId, completionId, "delivered", chunks.length);
+    if (deliveryId) await updateCompletionNotification(env, ownerId, deliveryId, "delivered", chunks.length);
   } catch (caught) {
-    if (completionId) {
-      try { await updateCompletionNotification(env, ownerId, completionId, "failed", completionPartsSent); } catch {}
+    if (deliveryId) {
+      try { await updateCompletionNotification(env, ownerId, deliveryId, "failed", deliveryPartsSent); } catch {}
     }
     throw caught;
   }
   if (directoryReferences) await saveMenuSnapshot(env, binding, [], directoryReferences);
-  if (event.kind === "thread.progress") {
+  const resumeTyping = event.kind === "thread.progress"
+    || (event.kind === "thread.live-message"
+      && (event.role === "user" || event.phase?.trim().toLowerCase() === "commentary"))
+    || (event.kind === "thread.detail"
+      && event.reason === "fork"
+      && String(event.state).trim().toLowerCase() === "working");
+  if (resumeTyping) {
     try {
       await sendSendblueTypingIndicator(env, binding.phone_number, "start");
     } catch {
@@ -3103,6 +3228,9 @@ export async function handleRequest(request: Request, env: Env, ctx?: WaitUntilC
     }
     if (url.pathname === "/service/status" && request.method === "GET") {
       return await handleServiceStatus(request, env);
+    }
+    if (url.pathname === "/service/active-thread" && request.method === "POST") {
+      return await handleServiceActiveThread(request, env);
     }
     if (url.pathname === "/service/notifications" && request.method === "GET") {
       return await handleServiceNotificationStatus(request, env);

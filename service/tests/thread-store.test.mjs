@@ -36,11 +36,17 @@ test("catalog excludes subagents, groups projects, carries state, and finds IDs 
   const hiddenForkRootRollout = path.join(directory, "fork-hidden-root.jsonl");
   const hiddenForkARollout = path.join(directory, "fork-hidden-a.jsonl");
   const hiddenForkBRollout = path.join(directory, "fork-hidden-b.jsonl");
+  const ancestryRootRollout = path.join(directory, "ancestry-root.jsonl");
+  const ancestryHiddenRollout = path.join(directory, "ancestry-hidden.jsonl");
+  const ancestryGrandchildRollout = path.join(directory, "ancestry-grandchild.jsonl");
   writeFileSync(forkRootRollout, `${JSON.stringify({ type: "session_meta", payload: { id: "fork-root" } })}\n`);
   writeFileSync(forkCopyRollout, `${JSON.stringify({ type: "session_meta", payload: { id: "fork-copy", forked_from_id: "fork-root" } })}\n`);
   writeFileSync(hiddenForkRootRollout, `${JSON.stringify({ type: "session_meta", payload: { id: "fork-hidden-root" } })}\n`);
   writeFileSync(hiddenForkARollout, `${JSON.stringify({ type: "session_meta", payload: { id: "fork-hidden-a", forked_from_id: "fork-hidden-root" } })}\n`);
   writeFileSync(hiddenForkBRollout, `${JSON.stringify({ type: "session_meta", payload: { id: "fork-hidden-b", forked_from_id: "fork-hidden-root" } })}\n`);
+  writeFileSync(ancestryRootRollout, `${JSON.stringify({ type: "session_meta", payload: { id: "ancestry-root" } })}\n`);
+  writeFileSync(ancestryHiddenRollout, `${JSON.stringify({ type: "session_meta", payload: { id: "ancestry-hidden", forked_from_id: "ancestry-root" } })}\n`);
+  writeFileSync(ancestryGrandchildRollout, `${JSON.stringify({ type: "session_meta", payload: { id: "ancestry-grandchild", forked_from_id: "ancestry-hidden" } })}\n`);
 
   const rows = [];
   for (let index = 0; index < 125; index += 1) {
@@ -68,6 +74,9 @@ test("catalog excludes subagents, groups projects, carries state, and finds IDs 
     { id: "fork-hidden-root", rollout: hiddenForkRootRollout, title: "Hidden ancestor", cwd: project, source: "vscode", threadSource: "user", recency: 1_783_824_100_000, archived: true },
     { id: "fork-hidden-a", rollout: hiddenForkARollout, title: "Hidden-parent fork", cwd: project, source: "vscode", threadSource: "user", recency: 1_783_824_200_000 },
     { id: "fork-hidden-b", rollout: hiddenForkBRollout, title: "Hidden-parent fork", cwd: project, source: "vscode", threadSource: "user", recency: 1_783_824_200_001 },
+    { id: "ancestry-root", rollout: ancestryRootRollout, title: "Ancestry root", cwd: project, source: "vscode", threadSource: "user", recency: 1_783_824_190_000 },
+    { id: "ancestry-hidden", rollout: ancestryHiddenRollout, title: "Archived intermediate", cwd: project, source: "vscode", threadSource: "user", recency: 1_783_824_190_001, archived: true },
+    { id: "ancestry-grandchild", rollout: ancestryGrandchildRollout, title: "Visible grandchild", cwd: project, source: "vscode", threadSource: "user", recency: 1_783_824_190_002 },
     { id: "session-a", rollout: path.join(directory, "session-a.jsonl"), title: "Separate conversation", cwd: project, source: "vscode", threadSource: "user", recency: 1_783_824_150_000 },
     { id: "session-b", rollout: path.join(directory, "session-b.jsonl"), title: "Separate conversation", cwd: project, source: "vscode", threadSource: "user", recency: 1_783_824_150_001 },
     { id: "same-name-project", rollout: path.join(directory, "same-name-project.jsonl"), title: "Other checkout", cwd: sameNameProject, source: "vscode", threadSource: "user", recency: 1_783_824_140_000 },
@@ -107,8 +116,8 @@ test("catalog excludes subagents, groups projects, carries state, and finds IDs 
   process.env.IMESSAGE_HANDOFF_GLOBAL_STATE = globalState;
   try {
     const all = await listThreads(999);
-    assert.equal(all.length, 135);
-    assert.equal(new Set(all.map((thread) => thread.id)).size, 135);
+    assert.equal(all.length, 137);
+    assert.equal(new Set(all.map((thread) => thread.id)).size, 137);
     assert.equal(all.some((thread) => thread.id.startsWith("child-")), false);
     assert.equal(all.some((thread) => thread.id === "automated-exec"), false);
     assert.equal(all.find((thread) => thread.id === "fork-root")?.title, "Fork 1 · Indistinguishable fork");
@@ -116,6 +125,13 @@ test("catalog excludes subagents, groups projects, carries state, and finds IDs 
     assert.equal(all.find((thread) => thread.id === "fork-hidden-a")?.title, "Fork 1 · Hidden-parent fork");
     assert.equal(all.find((thread) => thread.id === "fork-hidden-b")?.title, "Fork 2 · Hidden-parent fork");
     assert.equal(all.some((thread) => thread.id === "fork-hidden-root"), false);
+    assert.equal(all.find((thread) => thread.id === "fork-copy")?.lineageRootId, "fork-root");
+    assert.equal(all.find((thread) => thread.id === "fork-hidden-a")?.lineageRootId, "fork-hidden-root");
+    assert.equal(all.find((thread) => thread.id === "session-a")?.lineageRootId, "session-a");
+    assert.deepEqual(all.find((thread) => thread.id === "fork-copy")?.lineageAncestorIds, ["fork-root"]);
+    assert.deepEqual(all.find((thread) => thread.id === "ancestry-root")?.lineageAncestorIds, []);
+    assert.deepEqual(all.find((thread) => thread.id === "ancestry-grandchild")?.lineageAncestorIds, ["ancestry-hidden", "ancestry-root"]);
+    assert.equal(all.some((thread) => thread.id === "ancestry-hidden"), false);
     assert.equal(all.find((thread) => thread.id === "session-a")?.title, "Session 1 · Separate conversation");
     assert.equal(all.find((thread) => thread.id === "session-b")?.title, "Session 2 · Separate conversation");
     assert.equal(new Set(all.map((thread) => `${thread.cwd}\u0000${thread.title}`)).size, all.length);

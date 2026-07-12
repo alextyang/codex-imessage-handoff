@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import WebSocket from "ws";
 import os from "node:os";
+import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
 import { readConfig } from "./config.mjs";
 import { listThreads } from "./thread-store.mjs";
@@ -13,11 +14,22 @@ import { RunManager } from "./run-manager.mjs";
 import { FailureQueue } from "./failure-queue.mjs";
 import { loadClaimedJobs, markClaimedJobState, removeClaimedJob, saveClaimedJob } from "./claimed-store.mjs";
 import { CompletionMonitor } from "./completion-monitor.mjs";
+import { LiveMirror } from "./live-mirror.mjs";
+import { activeDescendant } from "./active-thread.mjs";
+import { ActiveSelection } from "./active-selection.mjs";
+import { LiveMirrorRetryBackoff } from "./live-mirror-backoff.mjs";
+import { PendingFollowStore } from "./pending-follow-store.mjs";
 import { servicePaths } from "./paths.mjs";
 
 const config = readConfig();
 const relay = new RelayClient(config);
-const completions = new CompletionMonitor(servicePaths().completionState);
+const paths = servicePaths();
+const completions = new CompletionMonitor(paths.completionState);
+const liveMirror = new LiveMirror({ stateFile: paths.liveMirrorState });
+const activeSelection = new ActiveSelection();
+const liveMirrorBackoff = new LiveMirrorRetryBackoff();
+const pendingFollow = new PendingFollowStore(paths.pendingFollowState);
+const pendingFollowBackoff = new LiveMirrorRetryBackoff();
 const failedRuns = new FailureQueue();
 const pendingNotices = new Set();
 const claimingReplyIds = new Map();
@@ -35,11 +47,65 @@ let catalogById = new Map();
 let controlChain = Promise.resolve();
 let completionMonitoringStarted = false;
 let completionScanInFlight = null;
+let liveMirrorScanInFlight = null;
+let activeFollowInFlight = null;
+let liveMirrorPaused = Boolean(pendingFollow.get());
+let pendingFollowDeliveryInFlight = null;
+
+function clearPendingFollow(deliveryId = null) {
+  const cleared = pendingFollow.clear(deliveryId);
+  if (cleared) {
+    pendingFollowBackoff.reset();
+    liveMirrorPaused = false;
+    scheduleLiveMirrorScan();
+  }
+  return cleared;
+}
+
+function selectActiveThread(threadId, selectedAt, { resume = true } = {}) {
+  const { id: nextId, changed } = activeSelection.update(threadId, selectedAt);
+  if (!nextId) {
+    liveMirror.deactivate();
+    liveMirrorBackoff.reset();
+    clearPendingFollow();
+    return { changed, active: false };
+  }
+  const thread = catalogById.get(nextId);
+  if (!thread) return { changed, active: false };
+  let activation = null;
+  if (changed || liveMirror.activeThreadId !== nextId) {
+    activation = liveMirror.activate(thread, { resume: changed ? resume : true });
+    liveMirrorBackoff.reset();
+  }
+  scheduleLiveMirrorScan();
+  return { changed, active: true, thread, activation };
+}
+
+function applyRegistration(registration, { resume = true } = {}) {
+  if (!registration || !Object.prototype.hasOwnProperty.call(registration, "activeThreadId")) return;
+  const remoteId = String(registration.activeThreadId || "").trim() || null;
+  const pending = pendingFollow.get();
+  if (pending && pending.threadId !== remoteId && !activeFollowInFlight) {
+    clearPendingFollow(pending.deliveryId);
+  }
+  selectActiveThread(registration.activeThreadId, registration.activeThreadUpdatedAt, { resume });
+}
+
+function cancelPendingFollowForSelection(threadId) {
+  const pending = pendingFollow.get();
+  const selectedId = String(threadId || "").trim();
+  if (!pending || !selectedId || pending.threadId === selectedId) return;
+  clearPendingFollow(pending.deliveryId);
+}
 
 async function deliverLocalCompletion(completion) {
   const activity = await relay.notificationStatus({ signal: AbortSignal.timeout(10_000) });
   if (activity?.active !== true) return { status: activity?.status || "INACTIVE" };
   const thread = catalogById.get(String(completion.threadId || ""));
+  if (thread && activeSelection.id === thread.id) {
+    const mirror = await drainSelectedLiveMirror(thread);
+    if (mirror.pending) return { status: "IN_PROGRESS" };
+  }
   const label = thread
     ? threadLabel(thread)
     : { id: completion.threadId, title: "Codex task", projectLabel: "Codex" };
@@ -62,6 +128,164 @@ function scheduleCompletionScan() {
   completionScanInFlight = scanKnownCompletions()
     .catch(() => log("Completion synchronization failed; will retry."))
     .finally(() => { completionScanInFlight = null; });
+}
+
+async function deliverLiveMessage(message) {
+  if (!activeSelection.id || message.threadId !== activeSelection.id) return { status: "STALE_SELECTION" };
+  const thread = catalogById.get(message.threadId);
+  if (!thread) return { status: "STALE_SELECTION" };
+  return relay.outbound({
+    kind: "thread.live-message",
+    messageId: message.deliveryId,
+    thread: threadLabel(thread),
+    role: message.role,
+    phase: message.phase,
+    body: message.body,
+    at: message.createdAt,
+  }, { signal: AbortSignal.timeout(15_000) });
+}
+
+async function scanLiveMirror() {
+  const selectedId = activeSelection.id;
+  if (!selectedId || liveMirrorPaused || !liveMirrorBackoff.ready()) return;
+  const thread = catalogById.get(selectedId);
+  if (!thread) return;
+  if (liveMirror.activeThreadId !== selectedId) liveMirror.activate(thread, { resume: true });
+  let retryable = false;
+  for (let pass = 0; pass < 16 && selectedId === activeSelection.id && !liveMirrorPaused; pass += 1) {
+    const result = await liveMirror.reconcile(thread, { deliver: deliverLiveMessage });
+    if (result.retryable > 0) {
+      liveMirrorBackoff.recordFailure();
+      retryable = true;
+      break;
+    }
+    if (!result.more) break;
+  }
+  if (!retryable) liveMirrorBackoff.reset();
+}
+
+function scheduleLiveMirrorScan() {
+  if (stopped || liveMirrorPaused || liveMirrorScanInFlight || !activeSelection.id || !liveMirrorBackoff.ready()) return;
+  liveMirrorScanInFlight = scanLiveMirror()
+    .catch(() => {
+      liveMirrorBackoff.recordFailure();
+      log("Live task synchronization failed; will retry.");
+    })
+    .finally(() => { liveMirrorScanInFlight = null; });
+}
+
+async function drainSelectedLiveMirror(thread) {
+  if (liveMirrorPaused || !liveMirrorBackoff.ready()) return { pending: true };
+  if (!thread || liveMirror.activeThreadId !== thread.id || activeSelection.id !== thread.id) {
+    return { pending: false };
+  }
+  for (let pass = 0; pass < 16; pass += 1) {
+    const result = await liveMirror.reconcile(thread, { deliver: deliverLiveMessage });
+    if (result.retryable > 0) {
+      liveMirrorBackoff.recordFailure();
+      return { pending: true };
+    }
+    if (!result.more) {
+      if (!result.partial) liveMirrorBackoff.reset();
+      return { pending: result.partial === true };
+    }
+  }
+  return { pending: true };
+}
+
+async function settleLiveSuppression(event, thread, { forceClear = false } = {}) {
+  const token = typeof event?.mirrorSuppressionToken === "string"
+    ? event.mirrorSuppressionToken
+    : null;
+  let drain = { pending: false };
+  let cleared = false;
+  try {
+    drain = await drainSelectedLiveMirror(thread);
+  } catch {
+    liveMirrorBackoff.recordFailure();
+    drain = { pending: true };
+  } finally {
+    if (token && (forceClear || !drain.pending)) {
+      liveMirror.clearSuppression(token);
+      if (event) event.mirrorSuppressionToken = null;
+      cleared = true;
+    }
+  }
+  return { cleared, pending: drain.pending };
+}
+
+function followDeliveryId(parentThreadId, threadId, selectedAt, activityAt) {
+  return createHash("sha256")
+    .update(`follow-context-v1\0${parentThreadId}\0${threadId}\0${selectedAt || ""}\0${activityAt || ""}`)
+    .digest("hex");
+}
+
+function outboundOutcome(result) {
+  const status = String(result?.status ?? result?.notification?.status ?? "").toUpperCase();
+  return {
+    status,
+    terminal: result?.sent === true
+      || result?.notification?.sent === true
+      || ["DUPLICATE", "INACTIVE", "STALE_SELECTION", "NO_BINDING"].includes(status),
+  };
+}
+
+async function preparePendingFollow() {
+  const pending = pendingFollow.get();
+  if (!pending || pending.event || pending.threadId !== activeSelection.id) return pending;
+  const thread = catalogById.get(pending.threadId);
+  if (!thread) {
+    clearPendingFollow(pending.deliveryId);
+    return null;
+  }
+  const activation = liveMirror.activate(thread, { resume: true });
+  const event = await buildThreadDetailEvent(thread, {
+    deliveryId: pending.deliveryId,
+    reason: "fork",
+    endOffset: activation.offset,
+  });
+  return pendingFollow.save({ ...pending, event });
+}
+
+async function deliverPendingFollowNow() {
+  let pending = pendingFollow.get();
+  if (!pending) return;
+  if (pending.threadId !== activeSelection.id) return;
+  pending = await preparePendingFollow();
+  if (!pending) return;
+  if (!pending.event) throw new Error("Pending fork context is not ready.");
+  const result = await relay.outbound(pending.event, { signal: AbortSignal.timeout(15_000) });
+  const outcome = outboundOutcome(result);
+  if (outcome.status === "STALE_SELECTION") {
+    const status = await relay.serviceStatus({ signal: AbortSignal.timeout(10_000) });
+    const remoteId = String(status?.activeThread?.id || "").trim() || null;
+    selectActiveThread(remoteId, status?.activeThreadUpdatedAt, { resume: false });
+  } else if (outcome.status === "NO_BINDING") {
+    selectActiveThread(null, null, { resume: false });
+  }
+  if (outcome.terminal) {
+    clearPendingFollow(pending.deliveryId);
+  } else {
+    pendingFollowBackoff.recordFailure();
+  }
+}
+
+function schedulePendingFollowDelivery() {
+  const pending = pendingFollow.get();
+  if (stopped
+    || pendingFollowDeliveryInFlight
+    || !pendingFollowBackoff.ready()
+    || !pending
+    || pending.threadId !== activeSelection.id) {
+    return pendingFollowDeliveryInFlight;
+  }
+  pendingFollowDeliveryInFlight = deliverPendingFollowNow()
+    .catch(() => {
+      pendingFollowBackoff.recordFailure();
+      log("Fork context delivery failed; will retry.");
+    })
+    .finally(() => { pendingFollowDeliveryInFlight = null; });
+  return pendingFollowDeliveryInFlight;
 }
 
 function log(message) {
@@ -148,8 +372,91 @@ async function synchronizeNow() {
     await relay.syncCatalog(catalog);
     lastCatalogSignature = signature;
   }
+  if (activeSelection.id && liveMirror.activeThreadId !== activeSelection.id) {
+    const selected = catalogById.get(activeSelection.id);
+    if (selected) liveMirror.activate(selected, { resume: true });
+  }
   scheduleCompletionScan();
+  scheduleLiveMirrorScan();
+  scheduleActiveForkFollow(threads);
   return threads;
+}
+
+function scheduleActiveForkFollow(threads) {
+  if (stopped || activeFollowInFlight || !activeSelection.id || !activeSelection.selectedAt) return;
+  const existing = pendingFollow.get();
+  if (existing) {
+    if (existing.threadId === activeSelection.id) {
+      schedulePendingFollowDelivery();
+      return;
+    }
+    activeFollowInFlight = relay.serviceStatus({ signal: AbortSignal.timeout(10_000) })
+      .then((status) => {
+        const remoteId = String(status?.activeThread?.id || "").trim() || null;
+        if (remoteId === existing.threadId) {
+          selectActiveThread(remoteId, status?.activeThreadUpdatedAt, { resume: false });
+          schedulePendingFollowDelivery();
+        } else {
+          clearPendingFollow(existing.deliveryId);
+          if (remoteId !== activeSelection.id) {
+            selectActiveThread(remoteId, status?.activeThreadUpdatedAt, { resume: false });
+          }
+        }
+      })
+      .catch(() => log("Pending fork selection could not be reconciled; will retry."))
+      .finally(() => { activeFollowInFlight = null; });
+    return;
+  }
+  const expectedThreadId = activeSelection.id;
+  const selectionSnapshot = activeSelection.capture();
+  const descendant = activeDescendant(threads, expectedThreadId, activeSelection.selectedAt);
+  if (!descendant) return;
+  const deliveryId = followDeliveryId(
+    expectedThreadId,
+    descendant.id,
+    activeSelection.selectedAt,
+    descendant.activityAt || descendant.updatedAt,
+  );
+  pendingFollow.save({ deliveryId, threadId: descendant.id, parentThreadId: expectedThreadId, event: null });
+  liveMirrorPaused = true;
+  activeFollowInFlight = (async () => {
+    const result = await relay.followThread(descendant.id, expectedThreadId, { signal: AbortSignal.timeout(10_000) });
+    if (!activeSelection.isCurrent(selectionSnapshot)) {
+      clearPendingFollow(deliveryId);
+      const status = await relay.serviceStatus({ signal: AbortSignal.timeout(10_000) });
+      const currentId = String(status?.activeThread?.id || "").trim() || null;
+      selectActiveThread(currentId, status?.activeThreadUpdatedAt, { resume: false });
+      return;
+    }
+    const remoteId = String(result?.currentThreadId || "").trim() || null;
+    if (remoteId === descendant.id) {
+      liveMirrorPaused = true;
+      try {
+        selectActiveThread(descendant.id, result.activeThreadUpdatedAt, { resume: false });
+        await preparePendingFollow();
+        await schedulePendingFollowDelivery();
+      } finally {
+        if (!pendingFollow.get()) {
+          liveMirrorPaused = false;
+          scheduleLiveMirrorScan();
+        }
+      }
+      return;
+    }
+    // A manual selection won the compare-and-swap. Mirror that choice and do
+    // not emit a second switch notice over the user's own navigation.
+    clearPendingFollow(deliveryId);
+    if (remoteId !== activeSelection.id) {
+      selectActiveThread(remoteId, result?.activeThreadUpdatedAt, { resume: false });
+    } else if (remoteId) {
+      selectActiveThread(remoteId, result?.activeThreadUpdatedAt, { resume: true });
+    }
+  })()
+    .catch(() => {
+      log("Active fork synchronization failed; selection will be reconciled.");
+      scheduleSynchronize(1000);
+    })
+    .finally(() => { activeFollowInFlight = null; });
 }
 
 function synchronize() {
@@ -174,6 +481,7 @@ async function publishFailure(thread, error) {
 }
 
 async function discardReply(event) {
+  await settleLiveSuppression(event, catalogById.get(String(event.threadId || "")), { forceClear: true });
   try { markClaimedJobState(event.replyId, "cancelled"); } catch {}
   try {
     if (!event.claimed) await relay.claim(String(event.threadId), String(event.replyId));
@@ -214,9 +522,16 @@ async function executeReply(event, context) {
     completions.manage(thread.id, managedSince);
     completions.suppressNext(thread.id, String(event.delivery.body || ""), managedSince);
     try {
+      const mirror = await settleLiveSuppression(event, thread);
+      saveClaimedJob(event, "delivering");
+      if (mirror.pending) {
+        context.defer(Math.max(1000, liveMirrorBackoff.remaining()));
+        return;
+      }
       await deliverCompleted(event, thread);
     } catch {
       context.defer(15000);
+      saveClaimedJob(event, "delivering");
       log(`Completed output for ${thread.id} could not be delivered; will retry.`);
     } finally {
       completions.unmanage(thread.id);
@@ -303,6 +618,10 @@ async function executeReply(event, context) {
     progressTimer.unref?.();
 
     markClaimedJobState(event.replyId, "running");
+    if (!event.mirrorSuppressionToken) {
+      event.mirrorSuppressionToken = liveMirror.suppressUser(thread.id, String(reply.body || ""));
+      if (event.mirrorSuppressionToken) saveClaimedJob(event, "running");
+    }
     runStartedAt = new Date().toISOString();
     completions.manage(thread.id, runStartedAt);
     managedCompletion = true;
@@ -314,6 +633,7 @@ async function executeReply(event, context) {
       onPhase: (phase) => { pendingPhase = phase; },
     });
     if (result.status === "cancelled") {
+      await settleLiveSuppression(event, thread, { forceClear: true });
       removeClaimedJob(event.replyId);
       failedRuns.remove(thread.id, event.replyId);
       await relay.outbound({ kind: "service.notice", code: "cancelled", thread: threadLabel(thread), body: "Stopped at your request." });
@@ -322,6 +642,13 @@ async function executeReply(event, context) {
       event.delivery = { body: result.body, generatedImages: result.generatedImages || [], textDelivered: false };
       saveClaimedJob(event, "delivering");
       completions.suppressNext(thread.id, result.body, runStartedAt);
+      const mirror = await settleLiveSuppression(event, thread);
+      saveClaimedJob(event, "delivering");
+      if (mirror.pending) {
+        deferred = true;
+        context.defer(Math.max(1000, liveMirrorBackoff.remaining()));
+        return;
+      }
       await deliverCompleted(event, thread);
     }
   } catch (error) {
@@ -332,7 +659,8 @@ async function executeReply(event, context) {
     } else if (error?.code === "BUSY") {
       deferred = true;
       context.defer(15000);
-      markClaimedJobState(event.replyId, "queued");
+      await settleLiveSuppression(event, thread, { forceClear: true });
+      saveClaimedJob(event, "queued");
       await relay.updateThreadStatus(thread, "pending");
       if (!event.busyNoticeSent) {
         event.busyNoticeSent = true;
@@ -346,8 +674,9 @@ async function executeReply(event, context) {
     } else {
       const code = typeof error?.code === "string" && /^[A-Z0-9_]{1,40}$/.test(error.code) ? error.code : "UNKNOWN";
       log(`Codex run for ${thread.id} failed (${code}).`);
-      failedRuns.record(thread.id, { body: String(reply.body || ""), images, replyId: event.replyId, claimed: event.claimed, queuedAt: event.queuedAt });
-      markClaimedJobState(event.replyId, "failed");
+      await settleLiveSuppression(event, thread, { forceClear: true });
+      failedRuns.record(thread.id, { body: String(reply.body || ""), images, replyId: event.replyId, claimed: event.claimed, queuedAt: event.queuedAt, mirrorSuppressionToken: null });
+      saveClaimedJob(event, "failed");
       await publishFailure(thread, error);
       try { await relay.updateThreadStatus(thread, "error"); } catch {}
     }
@@ -461,33 +790,36 @@ function queueIngest(event) {
   }).catch(() => {});
 }
 
-function restoreClaimedState(jobs) {
+async function restoreClaimedState(jobs) {
   for (const job of jobs) {
     if (job.state === "queued" || job.state === "delivering") {
       enqueueReply(job);
       continue;
     }
     if (job.state === "cancelled") {
-      discardReply(job).catch(() => scheduleDiscardRetry(job));
+      try { await discardReply(job); } catch { scheduleDiscardRetry(job); }
       continue;
     }
-    markClaimedJobState(job.replyId, "failed");
+    await settleLiveSuppression(job, catalogById.get(String(job.threadId || "")), { forceClear: true });
+    saveClaimedJob(job, "failed");
     failedRuns.record(job.threadId, {
       body: String(job.claimed?.reply?.body || ""),
       images: job.claimed?.images || [],
       replyId: job.replyId,
       claimed: job.claimed,
       queuedAt: job.queuedAt,
+      mirrorSuppressionToken: null,
     });
   }
 }
 
-async function publishThreadDetail(thread) {
+async function buildThreadDetailEvent(thread, options = {}) {
   const state = effectiveState(thread);
   const detail = await getThreadDetail(thread, {
     stateOverride: state.status,
     reasoningEffort: effectiveReasoning(thread),
     userPreviewLimit: 360,
+    endOffset: options.endOffset,
   });
   const turn = detail.turn;
   const hasQueuedRequest = state.request !== null;
@@ -501,8 +833,10 @@ async function publishThreadDetail(thread) {
     : state.status === "idle" && detail.finalResponse
       ? [{ body: detail.finalResponse, at: turn?.completedAt || detail.activityAt, phase: "final_answer" }]
       : [];
-  await relay.outbound({
+  return {
     kind: "thread.detail",
+    ...(options.deliveryId ? { deliveryId: options.deliveryId } : {}),
+    ...(options.reason ? { reason: options.reason } : {}),
     thread: threadLabel(thread),
     state: state.status,
     activityAt: detail.activityAt || thread.activityAt,
@@ -516,7 +850,11 @@ async function publishThreadDetail(thread) {
     },
     assistantMessages: messages,
     historyTruncated: detail.truncated,
-  });
+  };
+}
+
+async function publishThreadDetail(thread) {
+  await relay.outbound(await buildThreadDetailEvent(thread));
 }
 
 function outboundTurn(turn) {
@@ -673,6 +1011,7 @@ async function handleControl(event) {
       await relay.outbound({ kind: "service.notice", code: "needs-attention", thread: threadLabel(thread), body: "That failed request is already pending or running. Use /cancel before dismissing it." });
       return;
     }
+    await settleLiveSuppression(failed, thread, { forceClear: true });
     failedRuns.remove(thread.id, failed.replyId);
     removeClaimedJob(failed.replyId);
     const remaining = failedRuns.list(thread.id).length;
@@ -691,6 +1030,11 @@ async function handleControl(event) {
 
 async function runControl(event) {
   try {
+    if (event.threadId) {
+      const threadId = String(event.threadId);
+      cancelPendingFollowForSelection(threadId);
+      selectActiveThread(threadId, event.createdAt, { resume: threadId === activeSelection.id });
+    }
     await handleControl(event);
   } catch {
     log("Control command failed.");
@@ -718,7 +1062,14 @@ function connect() {
   socket.on("message", (data) => {
     try {
       const event = JSON.parse(String(data));
-      if (event.type === "reply-pending") queueIngest(event);
+      if (event.type === "reply-pending") {
+        const threadId = String(event.threadId || "");
+        if (threadId) {
+          cancelPendingFollowForSelection(threadId);
+          selectActiveThread(threadId, event.createdAt, { resume: threadId === activeSelection.id });
+        }
+        queueIngest(event);
+      }
       if (event.type === "control") {
         // Cancellation stays immediate even if a large directory/history view
         // is still scanning or delivering. Presentation controls remain
@@ -744,8 +1095,9 @@ async function main() {
   }
   const threads = await synchronize();
   await completions.reconcile(threads, { deliver: deliverLocalCompletion, deliverPending: false });
-  restoreClaimedState(restoredJobs);
   const registration = await relay.register();
+  applyRegistration(registration, { resume: true });
+  await restoreClaimedState(restoredJobs);
   if (registration.pairingRequired) {
     log(`Pairing required: text ${registration.pairingCode} to ${registration.sendblueNumber} within 15 minutes.`);
   } else {
@@ -754,9 +1106,20 @@ async function main() {
   connect();
   completionMonitoringStarted = true;
   scheduleCompletionScan();
+  scheduleLiveMirrorScan();
+  scheduleActiveForkFollow(threads);
+  setInterval(() => {
+    scheduleLiveMirrorScan();
+    schedulePendingFollowDelivery();
+  }, 750).unref();
   setInterval(scheduleCompletionScan, 10 * 1000).unref();
   setInterval(() => synchronize().catch(() => log("Background synchronization failed; will retry.")), 30 * 1000).unref();
-  setInterval(() => relay.register().catch(() => log("Service registration refresh failed; will retry.")), 5 * 60 * 1000).unref();
+  setInterval(() => relay.register()
+    .then((refreshed) => {
+      applyRegistration(refreshed, { resume: true });
+      scheduleActiveForkFollow([...catalogById.values()]);
+    })
+    .catch(() => log("Service registration refresh failed; will retry.")), 5 * 60 * 1000).unref();
 }
 
 process.on("SIGTERM", () => { stopped = true; runs.cancelAll(); process.exit(0); });

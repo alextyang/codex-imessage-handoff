@@ -16,9 +16,10 @@ test("claimed prompts survive restart state privately until completion", () => {
       queuedAt: "2026-07-12T00:00:00.000Z",
       claimed: { reply: { body: "Exact private prompt", media: [{ url: "https://example.test/image" }] }, images: ["/tmp/image.png"] },
     };
-    saveClaimedJob(event, "queued");
+    saveClaimedJob({ ...event, mirrorSuppressionToken: "token-123" }, "queued");
     assert.equal(statSync(path.join(home, "run-state.json")).mode & 0o777, 0o600);
     assert.equal(loadClaimedJobs()[0].claimed.reply.body, "Exact private prompt");
+    assert.equal(loadClaimedJobs()[0].mirrorSuppressionToken, "token-123");
     assert.equal(markClaimedJobState("reply-a", "running").state, "running");
     assert.equal(loadClaimedJobs()[0].state, "running");
     saveClaimedJob({ ...event, delivery: { body: "Completed response", generatedImages: [] } }, "delivering");

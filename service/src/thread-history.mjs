@@ -60,9 +60,13 @@ function readTailRecords(filePath, options = {}) {
   try {
     descriptor = openSync(filePath, "r");
     const stat = fstatSync(descriptor);
-    const desiredStart = Math.max(0, stat.size - maxBytes);
+    const requestedEnd = Number(options.endOffset);
+    const endOffset = Number.isSafeInteger(requestedEnd) && requestedEnd >= 0
+      ? Math.min(stat.size, requestedEnd)
+      : stat.size;
+    const desiredStart = Math.max(0, endOffset - maxBytes);
     const actualStart = desiredStart > 0 ? desiredStart - 1 : 0;
-    const length = stat.size - actualStart;
+    const length = endOffset - actualStart;
     const buffer = Buffer.allocUnsafe(length);
     let offset = 0;
     while (offset < length) {

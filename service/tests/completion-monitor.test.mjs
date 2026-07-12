@@ -1,6 +1,15 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { appendFileSync, mkdtempSync, readFileSync, readdirSync, statSync, utimesSync, writeFileSync } from "node:fs";
+import {
+  appendFileSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  renameSync,
+  statSync,
+  utimesSync,
+  writeFileSync,
+} from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { CompletionMonitor } from "../src/completion-monitor.mjs";
@@ -61,6 +70,41 @@ test("a task created after startup can complete before its first catalog discove
   assert.deepEqual(delivered, ["New task final"]);
 });
 
+test("a newly discovered fork baselines inherited history and delivers its post-fork completion", async () => {
+  const item = fixture();
+  let now = Date.parse("2026-07-12T01:00:00.000Z");
+  const monitor = new CompletionMonitor({ stateFile: item.stateFile, now: () => now });
+  append(item.rolloutPath, complete("parent-turn", "Inherited parent final", "2026-07-12T00:59:00.000Z"));
+  await monitor.reconcile([item.thread], { deliver: async () => ({ sent: true }) });
+
+  now = Date.parse("2026-07-12T01:05:00.000Z");
+  const forkPath = path.join(item.directory, "fork.jsonl");
+  writeFileSync(forkPath, [
+    complete("parent-turn", "Inherited parent final", "2026-07-12T00:59:00.000Z"),
+    complete("fork-turn", "Only the fork final", "2026-07-12T01:03:00.000Z"),
+  ].join(""), "utf8");
+  const delivered = [];
+  await monitor.reconcile([
+    item.thread,
+    {
+      id: "thread-fork",
+      rolloutPath: forkPath,
+      createdAt: "2026-07-12T01:02:00.500Z",
+      forkedFromId: item.thread.id,
+    },
+  ], {
+    deliver: async (event) => {
+      delivered.push([event.turnId, event.body]);
+      return { sent: true };
+    },
+  });
+
+  assert.deepEqual(delivered, [["fork-turn", "Only the fork final"]]);
+  const state = JSON.parse(readFileSync(item.stateFile, "utf8"));
+  assert.equal(state.threads["thread-fork"].forkedFromId, item.thread.id);
+  assert.equal(state.threads["thread-fork"].notBefore, "2026-07-12T01:02:00.000Z");
+});
+
 test("new completion sends its exact final once and ignores blank or incomplete records", async () => {
   const item = fixture();
   const monitor = new CompletionMonitor(item.stateFile);
@@ -101,6 +145,46 @@ test("multiple completions appended between polls are each delivered", async () 
     },
   });
   assert.deepEqual(turns, ["turn-1", "turn-2"]);
+});
+
+test("owner-global completion ids suppress a legacy cross-thread duplicate after restart", async () => {
+  const item = fixture();
+  let now = Date.parse("2026-07-12T01:00:00.000Z");
+  let monitor = new CompletionMonitor({ stateFile: item.stateFile, now: () => now });
+  await monitor.reconcile([item.thread], { deliver: async () => ({ sent: true }) });
+  append(item.rolloutPath, complete("shared-turn", "Shared final", "2026-07-12T01:01:00.000Z"));
+  let calls = 0;
+  await monitor.reconcile([item.thread], {
+    deliver: async () => {
+      calls += 1;
+      return { sent: true };
+    },
+  });
+  assert.equal(calls, 1);
+
+  // Simulate state written by the previous thread-scoped key scheme.
+  const state = JSON.parse(readFileSync(item.stateFile, "utf8"));
+  const [globalKey, handled] = Object.entries(state.handled)[0];
+  delete state.handled[globalKey];
+  state.handled["legacy-thread-scoped-key"] = handled;
+  writeFileSync(item.stateFile, `${JSON.stringify(state, null, 2)}\n`, { mode: 0o600 });
+
+  now = Date.parse("2026-07-12T01:05:00.000Z");
+  const forkPath = path.join(item.directory, "duplicate-fork.jsonl");
+  writeFileSync(forkPath, complete("shared-turn", "Shared final", "2026-07-12T01:03:00.000Z"), "utf8");
+  monitor = new CompletionMonitor({ stateFile: item.stateFile, now: () => now });
+  await monitor.reconcile([{
+    id: "thread-fork",
+    rolloutPath: forkPath,
+    createdAt: "2026-07-12T01:02:00.000Z",
+    forkedFromId: item.thread.id,
+  }], {
+    deliver: async () => {
+      calls += 1;
+      return { sent: true };
+    },
+  });
+  assert.equal(calls, 1);
 });
 
 test("provider failures remain durable and retry after restart", async () => {
@@ -225,6 +309,40 @@ test("first startup baselines only complete lines and later observes a finishing
     },
   });
   assert.deepEqual(delivered, ["Do not lose this completion"]);
+});
+
+test("rollout replacement does not replay completions before its tracked observation boundary", async () => {
+  const item = fixture();
+  let now = Date.parse("2026-07-12T01:00:00.000Z");
+  const monitor = new CompletionMonitor({ stateFile: item.stateFile, now: () => now });
+  await monitor.reconcile([item.thread], { deliver: async () => ({ sent: true }) });
+
+  now = Date.parse("2026-07-12T01:10:00.000Z");
+  append(item.rolloutPath, complete("first-new", "First new final", "2026-07-12T01:09:00.000Z"));
+  const delivered = [];
+  await monitor.reconcile([item.thread], {
+    deliver: async (event) => {
+      delivered.push(event.body);
+      return { sent: true };
+    },
+  });
+
+  now = Date.parse("2026-07-12T01:20:00.000Z");
+  renameSync(item.rolloutPath, `${item.rolloutPath}.rotated`);
+  writeFileSync(item.rolloutPath, [
+    complete("unseen-history", "Do not replay this", "2026-07-12T01:09:30.000Z"),
+    complete("after-rotation", "Deliver after rotation", "2026-07-12T01:11:00.000Z"),
+  ].join(""), "utf8");
+  await monitor.reconcile([item.thread], {
+    deliver: async (event) => {
+      delivered.push(event.body);
+      return { sent: true };
+    },
+  });
+
+  assert.deepEqual(delivered, ["First new final", "Deliver after rotation"]);
+  const state = JSON.parse(readFileSync(item.stateFile, "utf8"));
+  assert.equal(state.threads[item.thread.id].notBefore, "2026-07-12T01:10:00.000Z");
 });
 
 test("no-op scans do not rewrite state and corrupt optional state is quarantined", async () => {

@@ -189,6 +189,15 @@ class FakeD1Database {
       return { meta: { changes: 1 } };
     }
 
+    if (sql.includes("UPDATE phone_bindings") && sql.includes("active_thread_id IS NULL")) {
+      const [nextThreadId, updatedAt, ownerId, expectedThreadId] = values as Array<string | null>;
+      const binding = [...this.phoneBindings.values()].find((item) => item.owner_id === ownerId);
+      if (!binding || binding.active_thread_id !== expectedThreadId) return { meta: { changes: 0 } };
+      binding.active_thread_id = String(nextThreadId);
+      binding.updated_at = String(updatedAt);
+      return { meta: { changes: 1 } };
+    }
+
     if (sql.includes("UPDATE phone_bindings") && sql.includes("WHERE owner_id = ?")) {
       const [nextThreadId, updatedAt, ownerId] = values as string[];
       for (const binding of this.phoneBindings.values()) {
@@ -608,6 +617,16 @@ async function registerService(testEnv: Env, options: { serviceVersion?: string;
       serviceVersion: options.serviceVersion || "0.3.2",
       capabilities: options.capabilities || ["catalog-v2", "local-directory-v1"],
     }),
+  }), testEnv);
+  assert.equal(response.status, 200);
+  return json(response);
+}
+
+async function syncServiceCatalog(testEnv: Env, threads: Array<Record<string, unknown>>) {
+  const response = await handleRequest(req("/service/catalog", {
+    method: "PUT",
+    headers: { authorization: "Bearer dev-token" },
+    body: JSON.stringify({ complete: true, threads }),
   }), testEnv);
   assert.equal(response.status, 200);
   return json(response);
@@ -3065,6 +3084,294 @@ test("service outbound labels model output with its source thread", async () => 
   } finally {
     globalThis.fetch = originalFetch;
   }
+});
+
+test("live mirroring sends only the currently selected available task and maintains typing", async () => {
+  const testEnv = env();
+  await registerService(testEnv);
+  await syncServiceCatalog(testEnv, [
+    { id: "live-selected", title: "Selected task", cwd: "/tmp/live", projectLabel: "Live project" },
+    { id: "live-other", title: "Other task", cwd: "/tmp/live", projectLabel: "Live project" },
+  ]);
+  const db = testEnv.DB as unknown as FakeD1Database;
+  db.phoneBindings.set("+15551234567", {
+    phone_number: "+15551234567", owner_id: DEV_OWNER_ID, active_thread_id: "live-selected",
+    contact_card_sent_at: null, last_user_message_at: new Date().toISOString(),
+    created_at: "2026-07-12T00:00:00.000Z", updated_at: "2026-07-12T00:00:00.000Z",
+  });
+  const calls: Array<{ url: string; body: Record<string, unknown> | null }> = [];
+  globalThis.fetch = async (input, init) => {
+    calls.push({ url: String(input), body: init?.body ? JSON.parse(String(init.body)) : null });
+    return new Response(JSON.stringify({ status: "QUEUED", message_handle: `live-${calls.length}` }), { status: 200 });
+  };
+
+  const sendLive = (event: Record<string, unknown>) => handleRequest(req("/service/events/outbound", {
+    method: "POST",
+    headers: { authorization: "Bearer dev-token" },
+    body: JSON.stringify({ event }),
+  }), testEnv);
+  const user = await sendLive({
+    kind: "thread.live-message", messageId: "user-1",
+    thread: { id: "live-selected", title: "Selected task", projectLabel: "Live project" },
+    role: "user", body: "This local request should be mirrored.",
+  });
+  assert.equal((await notification(user)).sent, true);
+  assert.deepEqual(calls.map((call) => [call.url.split("/").at(-1), call.body?.state ?? null]), [
+    ["send-typing-indicator", "stop"],
+    ["send-message", null],
+    ["send-typing-indicator", null],
+  ]);
+  assert.match(String(outboundContents(calls.map((call) => call.body))[0]), /^CODEX LIVE · YOU/);
+  assert.match(String(outboundContents(calls.map((call) => call.body))[0]), /\[MESSAGE\] now[\s\S]*This local request should be mirrored\.$/);
+
+  calls.length = 0;
+  const commentary = await sendLive({
+    kind: "thread.live-message", messageId: "assistant-1",
+    thread: { id: "live-selected", title: "Selected task", projectLabel: "Live project" },
+    role: "assistant", phase: "commentary", body: "I’m checking the delivery path.",
+  });
+  assert.equal((await notification(commentary)).sent, true);
+  assert.deepEqual(calls.map((call) => [call.url.split("/").at(-1), call.body?.state ?? null]), [
+    ["send-typing-indicator", "stop"],
+    ["send-message", null],
+    ["send-typing-indicator", null],
+  ]);
+  assert.match(String(outboundContents(calls.map((call) => call.body))[0]), /^CODEX LIVE · CODEX/);
+  assert.match(String(outboundContents(calls.map((call) => call.body))[0]), /\[COMMENTARY\] now/);
+
+  calls.length = 0;
+  const stale = await sendLive({
+    kind: "thread.live-message", messageId: "stale-1",
+    thread: { id: "live-other", title: "Other task" }, role: "assistant", body: "Do not send.",
+  });
+  assert.deepEqual(await notification(stale), { sent: false, status: "STALE_SELECTION", terminal: true });
+  assert.equal(calls.length, 0);
+
+  db.phoneBindings.get("+15551234567")!.last_user_message_at = "2026-01-01T00:00:00.000Z";
+  const inactive = await sendLive({
+    kind: "thread.live-message", messageId: "inactive-1",
+    thread: { id: "live-selected", title: "Selected task" }, role: "assistant", body: "Do not send.",
+  });
+  assert.deepEqual(await notification(inactive), { sent: false, status: "INACTIVE", terminal: true });
+  assert.equal(calls.length, 0);
+
+  db.phoneBindings.clear();
+  const unpaired = await sendLive({
+    kind: "thread.live-message", messageId: "unpaired-1",
+    thread: { id: "live-selected", title: "Selected task" }, role: "assistant", body: "Do not send.",
+  });
+  assert.deepEqual(await notification(unpaired), { sent: false, status: "NO_BINDING", terminal: true });
+  assert.equal(calls.length, 0);
+});
+
+test("live mirroring rejects an unavailable selected task and deduplicates without storing content", async () => {
+  const testEnv = env();
+  await registerService(testEnv);
+  await syncServiceCatalog(testEnv, [
+    { id: "live-dedupe", title: "Dedupe task", cwd: "/tmp/live", projectLabel: "Live project" },
+  ]);
+  const db = testEnv.DB as unknown as FakeD1Database;
+  db.phoneBindings.set("+15551234567", {
+    phone_number: "+15551234567", owner_id: DEV_OWNER_ID, active_thread_id: "live-dedupe",
+    contact_card_sent_at: null, last_user_message_at: new Date().toISOString(),
+    created_at: new Date().toISOString(), updated_at: new Date().toISOString(),
+  });
+  const calls: Array<Record<string, unknown> | null> = [];
+  globalThis.fetch = async (_input, init) => {
+    calls.push(init?.body ? JSON.parse(String(init.body)) : null);
+    return new Response(JSON.stringify({ status: "QUEUED", message_handle: `dedupe-${calls.length}` }), { status: 200 });
+  };
+  const event = {
+    kind: "thread.live-message", messageId: "stable-message-id",
+    thread: { id: "live-dedupe", title: "Dedupe task", projectLabel: "Live project" },
+    role: "assistant", phase: "final_answer", body: "Sensitive content is delivered but never persisted in D1.",
+  };
+  const send = () => handleRequest(req("/service/events/outbound", {
+    method: "POST", headers: { authorization: "Bearer dev-token" }, body: JSON.stringify({ event }),
+  }), testEnv);
+  assert.equal((await notification(await send())).sent, true);
+  const sendsAfterFirst = outboundContents(calls).length;
+  assert.deepEqual(await notification(await send()), { sent: false, status: "DUPLICATE", terminal: true, parts: 1 });
+  assert.equal(outboundContents(calls).length, sendsAfterFirst);
+  const deliveryKey = `${DEV_OWNER_ID}:live-message:live-dedupe:stable-message-id`;
+  assert.ok(db.completionNotifications.has(deliveryKey));
+  assert.doesNotMatch(JSON.stringify(db.completionNotifications.get(deliveryKey)), /Sensitive content/);
+
+  db.threads.get("live-dedupe")!.visible = 0;
+  const unavailable = await handleRequest(req("/service/events/outbound", {
+    method: "POST", headers: { authorization: "Bearer dev-token" },
+    body: JSON.stringify({ event: { ...event, messageId: "unavailable-message" } }),
+  }), testEnv);
+  assert.deepEqual(await notification(unavailable), { sent: false, status: "STALE_SELECTION", terminal: true });
+  assert.equal(outboundContents(calls).length, sendsAfterFirst);
+});
+
+test("fork context is selected-task gated, content-free, and idempotent", async () => {
+  const testEnv = env();
+  await registerService(testEnv);
+  await syncServiceCatalog(testEnv, [
+    { id: "follow-task", title: "Followed fork", cwd: "/tmp/follow", projectLabel: "Follow project" },
+    { id: "other-task", title: "Other task", cwd: "/tmp/follow", projectLabel: "Follow project" },
+  ]);
+  const db = testEnv.DB as unknown as FakeD1Database;
+  db.phoneBindings.set("+15551234567", {
+    phone_number: "+15551234567", owner_id: DEV_OWNER_ID, active_thread_id: "follow-task",
+    contact_card_sent_at: null, last_user_message_at: new Date().toISOString(),
+    created_at: new Date().toISOString(), updated_at: new Date().toISOString(),
+  });
+  const calls: Array<Record<string, unknown> | null> = [];
+  globalThis.fetch = async (_input, init) => {
+    calls.push(init?.body ? JSON.parse(String(init.body)) : null);
+    return new Response(JSON.stringify({ status: "QUEUED", message_handle: `follow-${calls.length}` }), { status: 200 });
+  };
+  const event = {
+    kind: "thread.detail", deliveryId: "stable-follow-context", reason: "fork",
+    thread: { id: "follow-task", title: "Followed fork", projectLabel: "Follow project" },
+    state: "working", requestPreview: { body: "Private fork request" },
+    assistantMessages: [{ body: "Private current commentary", phase: "commentary" }],
+  };
+  const send = (value = event) => handleRequest(req("/service/events/outbound", {
+    method: "POST", headers: { authorization: "Bearer dev-token" }, body: JSON.stringify({ event: value }),
+  }), testEnv);
+
+  assert.equal((await notification(await send())).sent, true);
+  assert.match(String(outboundContents(calls)[0]), /^CODEX CONTROL · FOLLOWING FORK/);
+  assert.equal(calls.filter((call) => call && !("content" in call) && call.state === undefined).length, 1,
+    "working fork context resumes the native typing indicator");
+  assert.deepEqual(await notification(await send()), { sent: true, status: "DUPLICATE", parts: 1 });
+  const deliveryKey = `${DEV_OWNER_ID}:follow-context:follow-task:stable-follow-context`;
+  assert.ok(db.completionNotifications.has(deliveryKey));
+  assert.doesNotMatch(JSON.stringify(db.completionNotifications.get(deliveryKey)), /Private fork request|Private current commentary/);
+
+  const stale = await send({ ...event, deliveryId: "stale-follow", thread: { ...event.thread, id: "other-task" } });
+  assert.deepEqual(await notification(stale), { sent: false, status: "STALE_SELECTION", terminal: true });
+});
+
+test("multipart live mirroring resumes after the last provider-accepted part", async () => {
+  const testEnv = env();
+  await registerService(testEnv);
+  await syncServiceCatalog(testEnv, [
+    { id: "live-long", title: "Long live task", cwd: "/tmp/live", projectLabel: "Live project" },
+  ]);
+  const db = testEnv.DB as unknown as FakeD1Database;
+  db.phoneBindings.set("+15551234567", {
+    phone_number: "+15551234567", owner_id: DEV_OWNER_ID, active_thread_id: "live-long",
+    contact_card_sent_at: null, last_user_message_at: new Date().toISOString(),
+    created_at: new Date().toISOString(), updated_at: new Date().toISOString(),
+  });
+  const event = {
+    kind: "thread.live-message", messageId: "long-commentary",
+    thread: { id: "live-long", title: "Long live task", projectLabel: "Live project" },
+    role: "assistant", phase: "commentary", body: "L".repeat(9000),
+  };
+  const calls: Array<{ url: string; body: Record<string, unknown> | null }> = [];
+  let messageAttempts = 0;
+  globalThis.fetch = async (input, init) => {
+    const url = String(input);
+    calls.push({ url, body: init?.body ? JSON.parse(String(init.body)) : null });
+    if (url.includes("send-message")) {
+      messageAttempts += 1;
+      if (messageAttempts === 2) return new Response(JSON.stringify({ error: "temporary" }), { status: 500 });
+    }
+    return new Response(JSON.stringify({ status: "QUEUED", message_handle: `live-part-${calls.length}` }), { status: 200 });
+  };
+  const send = () => handleRequest(req("/service/events/outbound", {
+    method: "POST", headers: { authorization: "Bearer dev-token" }, body: JSON.stringify({ event }),
+  }), testEnv);
+
+  assert.equal((await send()).status, 400);
+  const deliveryKey = `${DEV_OWNER_ID}:live-message:live-long:long-commentary`;
+  assert.equal(db.completionNotifications.get(deliveryKey)?.parts_sent, 1);
+  const retry = await send();
+  assert.equal(retry.status, 200);
+  assert.equal((await notification(retry)).sent, true);
+  const contents = outboundContents(calls.map((call) => call.body));
+  assert.equal(contents.length, 3, "the retry sends only the failed second part");
+  assert.match(String(contents[0]), /^CODEX LIVE · CODEX · 1\/2/);
+  assert.match(String(contents[1]), /^CODEX LIVE · CODEX · 2\/2/);
+  assert.match(String(contents[2]), /^CODEX LIVE · CODEX · 2\/2/);
+  assert.ok(contents.every((content) => String(content).length <= 8000));
+  assert.equal(calls.filter((call) => call.url.includes("send-typing-indicator") && !call.body?.state).length, 1,
+    "typing restarts only after the successful resumed delivery");
+});
+
+test("active-thread compare-and-set follows one winner and reports the current selection to losers", async () => {
+  const testEnv = env();
+  await syncServiceCatalog(testEnv, [
+    { id: "cas-old", title: "Old task", cwd: "/tmp/cas", projectLabel: "CAS" },
+    { id: "cas-winner", title: "Winning fork", cwd: "/tmp/cas", projectLabel: "CAS" },
+    { id: "cas-loser", title: "Losing fork", cwd: "/tmp/cas", projectLabel: "CAS" },
+    { id: "cas-archived", title: "Archived", cwd: "/tmp/cas", projectLabel: "CAS", archived: true },
+  ]);
+  const db = testEnv.DB as unknown as FakeD1Database;
+  const originalUpdatedAt = "2026-07-12T01:00:00.000Z";
+  db.phoneBindings.set("+15551234567", {
+    phone_number: "+15551234567", owner_id: DEV_OWNER_ID, active_thread_id: "cas-old",
+    contact_card_sent_at: null, last_user_message_at: new Date().toISOString(),
+    created_at: originalUpdatedAt, updated_at: originalUpdatedAt,
+  });
+  const registration = await registerService(testEnv);
+  assert.equal(registration.activeThreadUpdatedAt, originalUpdatedAt);
+  const before = await json(await handleRequest(req("/service/status", {
+    headers: { authorization: "Bearer dev-token" },
+  }), testEnv));
+  assert.equal(before.activeThreadUpdatedAt, originalUpdatedAt);
+
+  const follow = (threadId: string, expectedThreadId: string | null) => handleRequest(req("/service/active-thread", {
+    method: "POST", headers: { authorization: "Bearer dev-token" },
+    body: JSON.stringify({ threadId, expectedThreadId }),
+  }), testEnv);
+  const winner = await json(await follow("cas-winner", "cas-old"));
+  assert.equal(winner.switched, true);
+  assert.equal(winner.currentThreadId, "cas-winner");
+  assert.notEqual(winner.activeThreadUpdatedAt, originalUpdatedAt);
+  const winnerUpdatedAt = winner.activeThreadUpdatedAt;
+
+  const loser = await json(await follow("cas-loser", "cas-old"));
+  assert.deepEqual(loser, {
+    ok: true,
+    switched: false,
+    currentThreadId: "cas-winner",
+    activeThreadUpdatedAt: winnerUpdatedAt,
+  });
+  assert.equal(db.phoneBindings.get("+15551234567")?.active_thread_id, "cas-winner");
+
+  const archived = await follow("cas-archived", "cas-winner");
+  assert.equal(archived.status, 409);
+  assert.equal(db.phoneBindings.get("+15551234567")?.active_thread_id, "cas-winner");
+
+  db.phoneBindings.get("+15551234567")!.active_thread_id = null;
+  const fromNull = await json(await follow("cas-loser", null));
+  assert.equal(fromNull.switched, true);
+  assert.equal(fromNull.currentThreadId, "cas-loser");
+});
+
+test("a selected completion stops typing while an unrelated completion leaves it alone", async () => {
+  const testEnv = env();
+  await registerService(testEnv);
+  const db = testEnv.DB as unknown as FakeD1Database;
+  db.phoneBindings.set("+15551234567", {
+    phone_number: "+15551234567", owner_id: DEV_OWNER_ID, active_thread_id: "completion-selected",
+    contact_card_sent_at: null, last_user_message_at: new Date().toISOString(),
+    created_at: new Date().toISOString(), updated_at: new Date().toISOString(),
+  });
+  const calls: Array<{ url: string; body: Record<string, unknown> | null }> = [];
+  globalThis.fetch = async (input, init) => {
+    calls.push({ url: String(input), body: init?.body ? JSON.parse(String(init.body)) : null });
+    return new Response(JSON.stringify({ status: "QUEUED", message_handle: `completion-${calls.length}` }), { status: 200 });
+  };
+  const complete = (completionId: string, threadId: string) => handleRequest(req("/service/events/outbound", {
+    method: "POST", headers: { authorization: "Bearer dev-token" },
+    body: JSON.stringify({ event: {
+      kind: "thread.completed", completionId,
+      thread: { id: threadId, title: "Completed task" }, body: "Done.",
+    } }),
+  }), testEnv);
+  await complete("selected-completion", "completion-selected");
+  assert.equal(calls.filter((call) => call.url.includes("send-typing-indicator") && call.body?.state === "stop").length, 1);
+  calls.length = 0;
+  await complete("unrelated-completion", "completion-other");
+  assert.equal(calls.some((call) => call.url.includes("send-typing-indicator")), false);
 });
 
 test("proactive completions use the 24-hour inbound activity gate without affecting requested output", async () => {

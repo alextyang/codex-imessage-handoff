@@ -20,6 +20,8 @@ export function servicePaths() {
     attachments: path.join(home, "attachments"),
     runState: path.join(home, "run-state.json"),
     completionState: path.join(home, "completion-state.json"),
+    liveMirrorState: path.join(home, "live-mirror-state.json"),
+    pendingFollowState: path.join(home, "pending-follow.json"),
     stdoutLog: path.join(home, "service.log"),
     stderrLog: path.join(home, "service-error.log"),
     plist: path.join(os.homedir(), "Library", "LaunchAgents", "com.codex.imessage-handoff.plist"),

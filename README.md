@@ -143,8 +143,31 @@ therefore uses compact labels, spacing, state chips, and a restrained divider
 instead of markup or effects, so the hierarchy remains meaningful under SMS
 fallback too.
 
-The service uses native typing indicators for ordinary work and sends bounded,
-deterministic progress only for longer runs.
+The selected task is also a live subscription. Local user messages and Codex's
+user-visible commentary are mirrored as they appear in the open Codex thread:
+
+```text
+CODEX LIVE · CODEX
+────────────────────────
+
+MUSIC CRAWLER · Fix album metadata
+[COMMENTARY] now
+
+I found the duplicate import path. I’m checking its callers now.
+```
+
+Hidden reasoning, tool output, hook prompts, and system/developer messages are
+never mirrored. An iMessage-origin prompt is suppressed from the live feed
+because it is already visible in Messages, and its final answer continues to
+use the normal thread-result presentation. Native typing remains active between
+live updates; bounded generic progress is reserved for longer operations.
+
+When Codex moves the selected task into a locally created active fork, the
+service follows that descendant with a compare-and-swap that cannot overwrite a
+manual Messages selection. It emits one `FOLLOWING FORK` context header and a
+current-turn snapshot, then continues the live feed. Existing fork history is
+baselined, so inherited parent turns are not replayed as new messages or task
+completions.
 
 When the paired user has texted Codex within the previous 24 hours, the service
 also watches visible top-level tasks that finish locally and sends their exact
@@ -197,12 +220,15 @@ without LaunchAgent support.
    Pending and distinct tasks run concurrently within a small bound. Claimed
    work and completed-but-undelivered output survive a service restart.
 5. It passes the exact message through stdin to `codex exec resume --json`.
-6. Structured lifecycle events drive typing and safe progress.
-7. The final response is labeled outside Codex history and sent through
+6. A private cursor tails only canonical local user messages and visible Codex
+   commentary for the task currently selected in Messages. Selection changes
+   baseline the new rollout; same-selection restarts resume the cursor.
+7. Structured lifecycle events drive typing and safe progress.
+8. The final response is labeled outside Codex history and sent through
    Sendblue.
-8. A private incremental rollout watcher detects locally completed top-level
+9. A separate private incremental watcher detects locally completed top-level
    tasks without reinstalling Codex Stop hooks.
-9. The Codex child process exits; the small service returns to idle. A heartbeat
+10. The Codex child process exits; the small service returns to idle. A heartbeat
    keeps relay presence accurate across sleep and network loss.
 
 ## Self-hosting
@@ -224,9 +250,16 @@ and redeploy the Worker before starting the service.
 - Thread history, full local paths, and git remotes stay local. Directory
   previews are read locally only when requested, sent transiently to Sendblue,
   and never written to D1 or menu snapshots.
+- The live cursor is mode `0600` local state and contains offsets, opaque IDs,
+  and one-shot body hashes—not conversation text. The relay persists only
+  opaque live-delivery IDs and multipart counters for idempotency.
+- A fork context awaiting provider acknowledgement is kept as an exact,
+  mode-`0600` local retry record and removed after a terminal delivery result;
+  its text is never stored by the relay.
 - Tokens, media, logs, and service state are owner-readable only.
 - User text is passed through stdin, not process arguments.
-- Raw JSONL tool output and secrets are never sent as progress.
+- Raw JSONL reasoning, tool output, hooks, system/developer records, and secrets
+  are never sent as progress or live conversation.
 - Per-task reasoning overrides are stored only in the private local service
   directory and applied to the next iMessage-started turn. The service does not
   remotely change approval, sandbox, deletion, or archival settings.

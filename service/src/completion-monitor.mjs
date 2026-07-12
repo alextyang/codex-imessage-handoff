@@ -51,8 +51,12 @@ function bodyDigest(value) {
   return digest(String(value).trim());
 }
 
-function completionKey(threadId, turnId) {
-  return digest(`${threadId}\0${turnId}`);
+function completionKey(turnId) {
+  // A rollout can be copied when Codex forks a task. Turn ids belong to the
+  // owner represented by this private state file, not to an individual
+  // rollout, so including the thread id would make the copied completion look
+  // new and notify it again.
+  return digest(turnId);
 }
 
 function emptyState() {
@@ -130,13 +134,18 @@ function sameFile(tracked, filePath, stat) {
     && Number(tracked.offset) <= stat.size;
 }
 
-function trackedFile(filePath, stat, offset, observedAt) {
-  return {
+function trackedFile(filePath, stat, offset, observedAt, options = {}) {
+  const tracked = {
     path: filePath,
     ...identity(stat),
     offset,
     observedAt,
   };
+  const notBefore = dateMs(options.notBefore);
+  if (notBefore !== null) tracked.notBefore = new Date(notBefore).toISOString();
+  const forkedFromId = String(options.forkedFromId || "").trim();
+  if (forkedFromId) tracked.forkedFromId = forkedFromId;
+  return tracked;
 }
 
 function threadDetails(thread) {
@@ -144,7 +153,13 @@ function threadDetails(thread) {
   const threadId = String(thread.id ?? thread.threadId ?? "").trim();
   const filePath = String(thread.rolloutPath ?? thread.rollout_path ?? "").trim();
   if (!threadId || !filePath) return null;
-  return { threadId, filePath, createdAt: thread.createdAt ?? thread.created_at ?? null };
+  const forkedFromId = String(thread.forkedFromId ?? thread.forked_from_id ?? "").trim() || null;
+  return {
+    threadId,
+    filePath,
+    createdAt: thread.createdAt ?? thread.created_at ?? null,
+    forkedFromId,
+  };
 }
 
 function readAppendedRecords(filePath, offset, size) {
@@ -208,7 +223,7 @@ function completionFrom(record, threadId, observedAt) {
   if (!turnId || typeof body !== "string" || !body.trim()) return null;
   const bodyHash = bodyDigest(body);
   return {
-    key: completionKey(threadId, turnId),
+    key: completionKey(turnId),
     threadId,
     turnId,
     body,
@@ -359,8 +374,20 @@ export class CompletionMonitor {
     delete this.state.pending[completion.key];
   }
 
+  #alreadyObserved(completion) {
+    if (this.state.handled[completion.key] || this.state.pending[completion.key]) return true;
+
+    // v1 state written before completion ids became owner-global used
+    // hash(threadId, turnId) as the object key. Defend the migration without
+    // broadly merging unrelated legacy turns that happen to reuse an id.
+    const matchesLegacyEntry = (entry) => entry?.turnId === completion.turnId
+      && entry?.bodyHash === completion.bodyHash;
+    return Object.values(this.state.handled).some(matchesLegacyEntry)
+      || Object.values(this.state.pending).some(matchesLegacyEntry);
+  }
+
   #observe(completion, currentTime, summary) {
-    if (this.state.handled[completion.key] || this.state.pending[completion.key]) return;
+    if (this.#alreadyObserved(completion)) return;
     summary.observed += 1;
 
     if (this.#consumeSuppression(completion, currentTime)) {
@@ -391,7 +418,6 @@ export class CompletionMonitor {
   async #reconcile(threads, { deliver, deliverPending = true } = {}) {
     if (typeof deliver !== "function") throw new TypeError("CompletionMonitor.reconcile requires deliver.");
     const currentTime = nowIso(this.now);
-    const processStartedMs = dateMs(this.processStartedAt) ?? Date.now();
     const summary = {
       baselined: 0,
       observed: 0,
@@ -408,7 +434,7 @@ export class CompletionMonitor {
 
     const firstUse = !this.state.initializedAt;
     let dirty = false;
-    for (const { threadId, filePath, createdAt } of uniqueThreads.values()) {
+    for (const { threadId, filePath, createdAt, forkedFromId } of uniqueThreads.values()) {
       let stat;
       try {
         stat = statSync(filePath);
@@ -418,7 +444,13 @@ export class CompletionMonitor {
       if (!stat.isFile()) continue;
       const tracked = this.state.threads[threadId];
       if (firstUse) {
-        this.state.threads[threadId] = trackedFile(filePath, stat, completeFileOffset(filePath, stat.size), currentTime);
+        this.state.threads[threadId] = trackedFile(
+          filePath,
+          stat,
+          completeFileOffset(filePath, stat.size),
+          currentTime,
+          { forkedFromId },
+        );
         summary.baselined += 1;
         dirty = true;
         continue;
@@ -426,15 +458,38 @@ export class CompletionMonitor {
 
       if (!sameFile(tracked, filePath, stat)) {
         const appended = readAppendedRecords(filePath, 0, stat.size);
-        const createdAfterInitialization = (dateMs(createdAt) ?? 0) > (dateMs(this.state.initializedAt) ?? Number.POSITIVE_INFINITY);
+        const createdMs = dateMs(createdAt);
+        const createdBoundary = createdMs === null
+          ? null
+          : new Date(Math.floor(createdMs / 1_000) * 1_000).toISOString();
+        const initializedMs = dateMs(this.state.initializedAt);
+        const createdAfterInitialization = createdMs !== null
+          && initializedMs !== null
+          && createdMs > initializedMs;
+        const trackedObservedMs = dateMs(tracked?.observedAt);
+        // A newly created task may finish before it first reaches the catalog,
+        // so scan back to its creation time. Fork rollouts contain their
+        // parent's records; this cutoff baselines those inherited completions.
+        // For an older/undated discovery, only trust records from this process.
+        // For a known rollout replacement, never cross the last tracked scan.
+        const boundary = tracked
+          ? trackedObservedMs === null
+            ? this.processStartedAt
+            : new Date(trackedObservedMs).toISOString()
+          : createdAfterInitialization
+            ? createdBoundary
+            : this.processStartedAt;
         for (const record of appended.records) {
           const completion = completionFrom(record, threadId, currentTime);
           if (!completion) continue;
-          if (createdAfterInitialization || (dateMs(completion.completedAt) ?? 0) >= processStartedMs) {
+          if (completionIsAfter(completion.completedAt, boundary)) {
             this.#observe(completion, currentTime, summary);
           }
         }
-        this.state.threads[threadId] = trackedFile(filePath, stat, appended.offset, currentTime);
+        this.state.threads[threadId] = trackedFile(filePath, stat, appended.offset, currentTime, {
+          notBefore: boundary,
+          forkedFromId,
+        });
         summary.baselined += 1;
         dirty = true;
         continue;
@@ -444,10 +499,15 @@ export class CompletionMonitor {
       const appended = readAppendedRecords(filePath, Number(tracked.offset), stat.size);
       for (const record of appended.records) {
         const completion = completionFrom(record, threadId, currentTime);
-        if (completion) this.#observe(completion, currentTime, summary);
+        if (completion && completionIsAfter(completion.completedAt, tracked.notBefore)) {
+          this.#observe(completion, currentTime, summary);
+        }
       }
       if (appended.offset !== Number(tracked.offset)) {
-        this.state.threads[threadId] = trackedFile(filePath, stat, appended.offset, currentTime);
+        this.state.threads[threadId] = trackedFile(filePath, stat, appended.offset, currentTime, {
+          notBefore: tracked.notBefore,
+          forkedFromId: forkedFromId ?? tracked.forkedFromId,
+        });
         dirty = true;
       }
     }

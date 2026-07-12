@@ -50,6 +50,9 @@ export function saveClaimedJob(event, state = "queued") {
     claimed: event.claimed,
     delivery: event.delivery || null,
     busyNoticeSent: Boolean(event.busyNoticeSent),
+    mirrorSuppressionToken: typeof event.mirrorSuppressionToken === "string"
+      ? event.mirrorSuppressionToken
+      : null,
     retryOf: event.retryOf || null,
     state,
     updatedAt: new Date().toISOString(),

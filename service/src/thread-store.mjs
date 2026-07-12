@@ -150,7 +150,7 @@ function dedupeRows(rows) {
   return [...byId.values()];
 }
 
-function lineageRoots(rows) {
+function lineageMetadata(rows) {
   const parents = new Map(rows.map((row) => [String(row.id), forkParent(String(row.rollout_path || ""))]));
   const roots = new Map();
   const resolve = (id) => {
@@ -183,7 +183,24 @@ function lineageRoots(rows) {
     return root;
   };
   for (const id of parents.keys()) resolve(id);
-  return roots;
+
+  // Visible catalog rows are only a subset of the complete threads table.
+  // Keep each row's exact ancestor chain so fork following can cross an
+  // archived/filtered intermediate task without treating a sibling as a
+  // descendant. Missing terminal parents are retained as useful identities.
+  const ancestors = new Map();
+  for (const id of parents.keys()) {
+    const chain = [];
+    const seen = new Set([id]);
+    let parent = parents.get(id);
+    while (parent && !seen.has(parent)) {
+      chain.push(parent);
+      seen.add(parent);
+      parent = parents.get(parent);
+    }
+    ancestors.set(id, chain);
+  }
+  return { roots, ancestors };
 }
 
 function stableThreadOrder(left, right) {
@@ -252,8 +269,14 @@ export async function listThreads(limit = MAX_THREADS) {
     ORDER BY t.recency_at_ms DESC, t.updated_at_ms DESC, t.id DESC`),
   ]);
   const workspaceState = readWorkspaceState();
-  const roots = lineageRoots(dedupeRows(lineageRows));
-  const threads = disambiguateProjectLabels(dedupeRows(rows).map((row) => threadFromRow(row, workspaceState)));
+  const { roots, ancestors } = lineageMetadata(dedupeRows(lineageRows));
+  const threads = disambiguateProjectLabels(dedupeRows(rows)
+    .map((row) => threadFromRow(row, workspaceState))
+    .map((thread) => ({
+      ...thread,
+      lineageRootId: roots.get(thread.id) || thread.id,
+      lineageAncestorIds: ancestors.get(thread.id) || [],
+    })));
   return disambiguateDisplayDuplicates(threads, roots).slice(0, safeLimit(limit));
 }
 

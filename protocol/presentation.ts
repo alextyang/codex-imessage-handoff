@@ -68,6 +68,15 @@ export type NoticeCode = "connected" | "queued" | "cancelled" | "needs-attention
 export type OutboundEvent =
   | { kind: "thread.output"; thread: ThreadLabel; body: string }
   | { kind: "thread.completed"; completionId: string; thread: ThreadLabel; body: string; completedAt?: string | null }
+  | {
+    kind: "thread.live-message";
+    messageId: string;
+    thread: ThreadLabel;
+    role: "user" | "assistant";
+    phase?: string | null;
+    body: string;
+    at?: string | null;
+  }
   | { kind: "thread.progress"; thread: ThreadLabel; phase: string }
   | {
     kind: "thread.detail";
@@ -80,6 +89,8 @@ export type OutboundEvent =
     requestPreview?: { body: string; at?: string | null; truncated?: boolean } | string | null;
     assistantMessages?: VisibleMessage[];
     historyTruncated?: boolean;
+    deliveryId?: string;
+    reason?: "fork" | null;
   }
   | { kind: "thread.request"; thread: ThreadLabel; body?: string; request?: string | { body?: string; at?: string | null }; at?: string | null }
   | { kind: "thread.turn"; thread: ThreadLabel; turn: ThreadTurn | null; reasoningEffort?: string | null }
@@ -95,12 +106,13 @@ export type OutboundEvent =
   }
   | { kind: "service.menu"; label?: "THREADS" | "PROJECTS" | "COMMANDS"; items?: MenuItem[]; body?: string; note?: string }
   | { kind: "service.directory"; directory: ThreadDirectory }
-  | { kind: "service.switched"; thread: ThreadLabel }
+  | { kind: "service.switched"; thread: ThreadLabel; reason?: "fork" | null }
   | { kind: "service.presence"; state: "online" | "offline" }
   | { kind: "service.notice"; code: NoticeCode; body: string; thread?: ThreadLabel };
 
 const CONTROL_PREFIX = "CODEX CONTROL · ";
 const THREAD_PREFIX = "CODEX THREAD · ";
+const LIVE_PREFIX = "CODEX LIVE · ";
 const HEADER_RULE = "────────────────────────";
 const MAX_LABEL_LENGTH = 80;
 
@@ -333,7 +345,10 @@ function renderThreadDetail(event: Extract<OutboundEvent, { kind: "thread.detail
   const preview = typeof event.requestPreview === "string"
     ? { body: event.requestPreview, at: null, truncated: false }
     : event.requestPreview;
-  const sections = [`${threadContext(event.thread)}\n${metadata}`, commandLines(event.state)];
+  const context = event.reason === "fork"
+    ? `${header("FOLLOWING FORK")}\n\nPROJECT · ${cleanLine(event.thread.projectLabel, "Codex").toUpperCase()}\n${threadTitle(event.thread)}\n[SELECTED] Following the active fork of this task.\n${metadata}`
+    : `${threadContext(event.thread)}\n${metadata}`;
+  const sections = [context, commandLines(event.state)];
   if (preview?.body) {
     sections.push(`YOU · ${relativeTime(preview.at)}\n${preview.body}${preview.truncated ? "\n\nTIP · /request shows the full message." : ""}`);
   }
@@ -385,6 +400,18 @@ export function renderOutboundEvent(event: OutboundEvent) {
       `RESULT\n${safeBody(event.body)}`,
     ].filter(Boolean).join("\n\n");
   }
+  if (event.kind === "thread.live-message") {
+    const speaker = event.role === "user" ? "YOU" : "CODEX";
+    const phase = event.role === "user"
+      ? "MESSAGE"
+      : cleanLine(event.phase, "UPDATE").replace(/[_-]+/g, " ").toUpperCase();
+    const when = event.at ? relativeTime(event.at) : "now";
+    return [
+      `${LIVE_PREFIX}${speaker}\n${HEADER_RULE}`,
+      `${threadProject(event.thread)} · ${threadTitle(event.thread)}\n[${phase}] ${when}`,
+      safeBody(event.body, "No text content."),
+    ].join("\n\n");
+  }
   if (event.kind === "thread.progress") {
     return [`${threadContext(event.thread)}\n[WORKING]`, `PROGRESS\n${safeBody(event.phase)}`].join("\n\n");
   }
@@ -428,10 +455,11 @@ export function renderOutboundEvent(event: OutboundEvent) {
     ].filter(Boolean).join("\n\n");
   }
   if (event.kind === "service.switched") {
+    const followingFork = event.reason === "fork";
     return [
-      header("SWITCHED"),
+      header(followingFork ? "FOLLOWING FORK" : "SWITCHED"),
       `PROJECT · ${cleanLine(event.thread.projectLabel, "Codex").toUpperCase()}\n${threadTitle(event.thread)}`,
-      "[SELECTED] Context is active.",
+      followingFork ? "[SELECTED] Following the active fork of this task." : "[SELECTED] Context is active.",
       "ACTIONS\n/thread · /threads",
     ].join("\n\n");
   }

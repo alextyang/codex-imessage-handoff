@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { RelayClient } from "../src/relay-client.mjs";
 import {
   parseMenuSelection,
   parseSlashCommand,
@@ -229,4 +230,83 @@ test("proactive completion and Mac presence notices have distinct compact header
     body: "The request needs attention.\n\n/retry · /dismiss",
   });
   assert.match(notice, /DETAILS\nThe request needs attention\.\n\nACTIONS\n\/retry · \/dismiss$/);
+});
+
+test("live messages use compact speaker and phase labels", () => {
+  assert.equal(renderOutboundEvent({
+    kind: "thread.live-message",
+    messageId: "live-user-1",
+    thread: { id: "thread-1", title: "Mirror this task", projectLabel: "iMessage handoff" },
+    role: "user",
+    phase: "user_message",
+    body: "Show this local message remotely.",
+  }), [
+    "CODEX LIVE · YOU\n────────────────────────",
+    "IMESSAGE HANDOFF · Mirror this task\n[MESSAGE] now",
+    "Show this local message remotely.",
+  ].join("\n\n"));
+
+  const commentary = renderOutboundEvent({
+    kind: "thread.live-message",
+    messageId: "live-codex-1",
+    thread: { id: "thread-1", title: "Mirror this task", projectLabel: "iMessage handoff" },
+    role: "assistant",
+    phase: "commentary",
+    body: "I found the relay path and I’m checking delivery.",
+    at: new Date().toISOString(),
+  });
+  assert.match(commentary, /^CODEX LIVE · CODEX\n─+\n\nIMESSAGE HANDOFF · Mirror this task\n\[COMMENTARY\] now/);
+  assert.match(commentary, /I found the relay path and I’m checking delivery\.$/);
+});
+
+test("fork switches explain that the service is following the active fork", () => {
+  const switched = renderOutboundEvent({
+    kind: "service.switched",
+    reason: "fork",
+    thread: { id: "fork-2", title: "Continue implementation", projectLabel: "iMessage handoff" },
+  });
+  assert.match(switched, /^CODEX CONTROL · FOLLOWING FORK/);
+  assert.match(switched, /\[SELECTED\] Following the active fork of this task\./);
+
+  const manual = renderOutboundEvent({
+    kind: "service.switched",
+    thread: { id: "thread-1", title: "Original task", projectLabel: "iMessage handoff" },
+  });
+  assert.match(manual, /^CODEX CONTROL · SWITCHED/);
+  assert.match(manual, /\[SELECTED\] Context is active\./);
+
+  const context = renderOutboundEvent({
+    kind: "thread.detail",
+    deliveryId: "follow-context-1",
+    reason: "fork",
+    thread: { id: "fork-2", title: "Continue implementation", projectLabel: "iMessage handoff" },
+    state: "working",
+    requestPreview: { body: "Finish the live mirror.", at: new Date().toISOString() },
+    assistantMessages: [{ body: "Checking the rollout cursor.", phase: "commentary", at: new Date().toISOString() }],
+  });
+  assert.match(context, /^CODEX CONTROL · FOLLOWING FORK/);
+  assert.match(context, /ACTIONS\n\/request · \/turn · \/history · \/reasoning/);
+  assert.match(context, /YOU · now\nFinish the live mirror\./);
+  assert.match(context, /CODEX · now\nChecking the rollout cursor\./);
+});
+
+test("relay client advertises live mirroring and follows tasks with compare-and-set", async () => {
+  const originalFetch = globalThis.fetch;
+  const calls = [];
+  globalThis.fetch = async (url, init) => {
+    calls.push({ url: String(url), body: init?.body ? JSON.parse(String(init.body)) : null });
+    return new Response(JSON.stringify({ ok: true, switched: true, currentThreadId: "fork-2" }), { status: 200 });
+  };
+  try {
+    const relay = new RelayClient({ apiBaseUrl: "https://relay.test", token: "secret", clientId: "client-1" });
+    await relay.register();
+    await relay.followThread("fork-2", "thread-1");
+    assert.ok(calls[0].body.capabilities.includes("live-mirror-v1"));
+    assert.deepEqual(calls[1], {
+      url: "https://relay.test/service/active-thread",
+      body: { threadId: "fork-2", expectedThreadId: "thread-1" },
+    });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });

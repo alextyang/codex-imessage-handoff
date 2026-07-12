@@ -26,6 +26,21 @@ function message(timestamp, role, turnId, text, phase) {
   });
 }
 
+test("detail snapshots stop at an exact rollout offset for lossless live handoff", () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "imessage-thread-offset-"));
+  const rollout = path.join(directory, "rollout.jsonl");
+  const before = [
+    record("2026-07-12T00:00:00.000Z", "event_msg", { type: "task_started", turn_id: "turn-offset" }),
+    message("2026-07-12T00:00:00.010Z", "user", "turn-offset", "Original request"),
+    message("2026-07-12T00:00:01.000Z", "assistant", "turn-offset", "Visible at baseline.", "commentary"),
+  ].join("\n") + "\n";
+  const after = `${message("2026-07-12T00:00:02.000Z", "assistant", "turn-offset", "Must remain in the live tail.", "commentary")}\n`;
+  writeFileSync(rollout, before + after, "utf8");
+
+  const detail = getThreadDetail({ id: "thread-offset", rolloutPath: rollout }, { endOffset: Buffer.byteLength(before) });
+  assert.deepEqual(detail.commentary, ["Visible at baseline."]);
+});
+
 test("history exposes exact completed output and every current commentary message", () => {
   const directory = mkdtempSync(path.join(os.tmpdir(), "imessage-thread-history-"));
   const rollout = path.join(directory, "rollout.jsonl");
