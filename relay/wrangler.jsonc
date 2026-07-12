@@ -12,8 +12,8 @@
   "d1_databases": [
     {
       "binding": "DB",
-      "database_name": "imessage-handoff",
-      "database_id": "29b280f6-a3a0-4980-86f3-d58b142b9bd6",
+      "database_name": "imessage-handoff-selfhosted",
+      "database_id": "94e9879f-5c59-466c-ad31-e62f1c1c3eb5",
       "migrations_dir": "./src/db/migrations"
     }
   ],
@@ -53,7 +53,7 @@
     }
   },
   "vars": {
-    "SENDBLUE_FROM_NUMBER": "+12344198201",
+    "SENDBLUE_FROM_NUMBER": "+12143547196",
     "SENDBLUE_API_BASE_URL": "https://api.sendblue.com/api"
   }
 }
