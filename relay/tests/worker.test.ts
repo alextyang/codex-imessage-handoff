@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { HandoffSocket, handleRequest } from "../src/worker.ts";
-import type { Env, InstallationPairingRow, MenuSnapshotRow, PairingAttemptLimitRow, PhoneBindingRow, HandoffReplyRow, HandoffThreadRow, ServiceInstallationRow } from "../src/types.ts";
+import type { CompletionNotificationRow, Env, InstallationPairingRow, MenuSnapshotRow, PairingAttemptLimitRow, PhoneBindingRow, HandoffReplyRow, HandoffThreadRow, ServiceInstallationRow } from "../src/types.ts";
 
 // The relay tests run the Worker directly in Node. These fakes keep the tests
 // fast while still exercising the same request handlers that Wrangler serves.
@@ -66,6 +66,7 @@ class FakeD1Database {
   serviceInstallations = new Map<string, ServiceInstallationRow>();
   installationPairings = new Map<string, InstallationPairingRow>();
   menuSnapshots = new Map<string, MenuSnapshotRow>();
+  completionNotifications = new Map<string, CompletionNotificationRow>();
   runCount = 0;
 
   prepare(sql: string) {
@@ -130,6 +131,41 @@ class FakeD1Database {
       return { meta: { changes: 1 } };
     }
 
+    if (sql.includes("INSERT OR IGNORE INTO completion_notifications")) {
+      const [ownerId, completionId, startedAt, updatedAt] = values as string[];
+      const key = `${ownerId}:${completionId}`;
+      if (this.completionNotifications.has(key)) return { meta: { changes: 0 } };
+      this.completionNotifications.set(key, {
+        owner_id: ownerId,
+        completion_id: completionId,
+        status: "sending",
+        parts_sent: 0,
+        started_at: startedAt,
+        updated_at: updatedAt,
+        delivered_at: null,
+      });
+      return { meta: { changes: 1 } };
+    }
+
+    if (sql.includes("UPDATE completion_notifications SET status = 'sending'")) {
+      const [updatedAt, ownerId, completionId] = values as string[];
+      const row = this.completionNotifications.get(`${ownerId}:${completionId}`);
+      if (row) { row.status = "sending"; row.updated_at = updatedAt; }
+      return { meta: { changes: row ? 1 : 0 } };
+    }
+
+    if (sql.includes("UPDATE completion_notifications") && sql.includes("SET status = ?")) {
+      const [status, partsSent, updatedAt, deliveredAt, ownerId, completionId] = values as [CompletionNotificationRow["status"], number, string, string | null, string, string];
+      const row = this.completionNotifications.get(`${ownerId}:${completionId}`);
+      if (row) {
+        row.status = status;
+        row.parts_sent = Number(partsSent);
+        row.updated_at = updatedAt;
+        row.delivered_at = deliveredAt;
+      }
+      return { meta: { changes: row ? 1 : 0 } };
+    }
+
     if (sql.includes("DELETE FROM service_installations")) {
       return { meta: { changes: this.serviceInstallations.delete(String(values[0])) ? 1 : 0 } };
     }
@@ -169,6 +205,16 @@ class FakeD1Database {
       const binding = this.phoneBindings.get(phoneNumber);
       if (binding) {
         binding.contact_card_sent_at = sentAt;
+        binding.updated_at = updatedAt;
+      }
+      return { meta: { changes: binding ? 1 : 0 } };
+    }
+
+    if (sql.includes("UPDATE phone_bindings") && sql.includes("last_user_message_at") && sql.includes("WHERE phone_number = ?")) {
+      const [lastUserMessageAt, updatedAt, phoneNumber] = values as string[];
+      const binding = this.phoneBindings.get(phoneNumber);
+      if (binding) {
+        binding.last_user_message_at = lastUserMessageAt;
         binding.updated_at = updatedAt;
       }
       return { meta: { changes: binding ? 1 : 0 } };
@@ -316,7 +362,7 @@ class FakeD1Database {
     }
 
     if (sql.includes("INSERT INTO phone_bindings")) {
-      const [phoneNumber, ownerId, activeThreadId, createdAt, updatedAt] = values as string[];
+      const [phoneNumber, ownerId, activeThreadId, lastUserMessageAt, createdAt, updatedAt] = values as string[];
       const existing = this.phoneBindings.get(phoneNumber);
       for (const [key, binding] of this.phoneBindings.entries()) {
         if (binding.owner_id === ownerId && binding.phone_number !== phoneNumber) {
@@ -328,6 +374,7 @@ class FakeD1Database {
         owner_id: ownerId,
         active_thread_id: activeThreadId,
         contact_card_sent_at: existing?.contact_card_sent_at ?? null,
+        last_user_message_at: lastUserMessageAt,
         created_at: existing?.created_at ?? createdAt,
         updated_at: updatedAt,
       });
@@ -338,6 +385,9 @@ class FakeD1Database {
   }
 
   first<T>(sql: string, values: unknown[]) {
+    if (sql.includes("FROM completion_notifications WHERE owner_id = ?")) {
+      return (this.completionNotifications.get(`${String(values[0])}:${String(values[1])}`) ?? null) as T | null;
+    }
     if (sql.includes("FROM service_installations WHERE owner_id = ?")) {
       return (this.serviceInstallations.get(String(values[0])) ?? null) as T | null;
     }
@@ -797,6 +847,144 @@ test("relay buffer sends queued replies to a socket on connect", async () => {
   assert.equal(message.type, "reply-pending");
   assert.equal(message.threadId, "thread-test-1");
   assert.match(message.replyId, /^reply_/);
+});
+
+test("Mac presence notices are debounced transitions, respect multiple sockets, and use the activity gate", async () => {
+  const testEnv = env();
+  await registerService(testEnv);
+  const db = testEnv.DB as unknown as FakeD1Database;
+  db.phoneBindings.set("+15551234567", {
+    phone_number: "+15551234567", owner_id: DEV_OWNER_ID, active_thread_id: null,
+    contact_card_sent_at: null, last_user_message_at: new Date(Date.now() - 1000).toISOString(),
+    created_at: new Date().toISOString(), updated_at: new Date().toISOString(),
+  });
+
+  class PresenceStorage {
+    values = new Map<string, unknown>();
+    alarmAt: number | null = null;
+    async get<T>(key: string) { return this.values.get(key) as T | undefined; }
+    async put(key: string, value: unknown) { this.values.set(key, structuredClone(value)); }
+    async list<T>(options: { prefix?: string } = {}) {
+      return new Map([...this.values.entries()]
+        .filter(([key]) => !options.prefix || key.startsWith(options.prefix))) as Map<string, T>;
+    }
+    async getAlarm() { return this.alarmAt; }
+    async setAlarm(value: number | Date) { this.alarmAt = value instanceof Date ? value.getTime() : value; }
+    async deleteAlarm() { this.alarmAt = null; }
+  }
+  class PresenceSocket {
+    attachment: unknown = null;
+    closed = false;
+    serializeAttachment(value: unknown) { this.attachment = structuredClone(value); }
+    deserializeAttachment() { return this.attachment; }
+    send() {}
+    close() { this.closed = true; }
+  }
+
+  const storage = new PresenceStorage();
+  const sockets: PresenceSocket[] = [];
+  const state = {
+    storage,
+    waitUntil() {},
+    acceptWebSocket() {},
+    getWebSockets(tag?: string) {
+      if (tag && tag !== `owner:${DEV_OWNER_ID}`) return [];
+      return sockets.filter((socket) => !socket.closed);
+    },
+    getTags() { return [`owner:${DEV_OWNER_ID}`]; },
+  } as unknown as DurableObjectState;
+  const relay = new HandoffSocket(state, testEnv);
+  const control = relay as unknown as { reconcileOwnerPresence(ownerId: string, excluding?: WebSocket): Promise<void> };
+  const key = `presence:${DEV_OWNER_ID}`;
+  const expirePending = async () => {
+    const record = await storage.get<Record<string, unknown>>(key);
+    assert.ok(record);
+    record.dueAt = Date.now() - 1;
+    await storage.put(key, record);
+    storage.alarmAt = null;
+    await relay.alarm();
+  };
+
+  const originalFetch = globalThis.fetch;
+  const calls: Array<Record<string, unknown> | null> = [];
+  let failNext = false;
+  globalThis.fetch = async (_input, init) => {
+    calls.push(init?.body ? JSON.parse(String(init.body)) : null);
+    if (failNext) {
+      failNext = false;
+      return new Response(JSON.stringify({ error: "temporary" }), { status: 500 });
+    }
+    return new Response(JSON.stringify({ status: "QUEUED", message_handle: `presence-${calls.length}` }), { status: 200 });
+  };
+  try {
+    const first = new PresenceSocket();
+    first.serializeAttachment({ ownerId: DEV_OWNER_ID, lastHeartbeatAt: Date.now() - (5 * 60 * 1000), heartbeatCapable: false });
+    sockets.push(first);
+    await control.reconcileOwnerPresence(DEV_OWNER_ID);
+    await expirePending();
+    assert.equal(first.closed, false, "a v0.3.2 socket without heartbeat capability is never TTL-expired");
+    assert.deepEqual(outboundContents(calls), ["CODEX CONTROL · ONLINE\n\nCodex on your Mac is online."]);
+
+    const second = new PresenceSocket();
+    second.serializeAttachment({ ownerId: DEV_OWNER_ID, lastHeartbeatAt: Date.now() });
+    sockets.push(second);
+    first.closed = true;
+    await control.reconcileOwnerPresence(DEV_OWNER_ID, first as unknown as WebSocket);
+    assert.equal((await storage.get<Record<string, unknown>>(key))?.pendingState, null,
+      "one remaining socket keeps the Mac online");
+
+    second.closed = true;
+    await control.reconcileOwnerPresence(DEV_OWNER_ID, second as unknown as WebSocket);
+    const replacement = new PresenceSocket();
+    replacement.serializeAttachment({ ownerId: DEV_OWNER_ID, lastHeartbeatAt: Date.now() });
+    sockets.push(replacement);
+    await control.reconcileOwnerPresence(DEV_OWNER_ID);
+    assert.equal((await storage.get<Record<string, unknown>>(key))?.pendingState, null,
+      "a reconnect inside the grace period cancels offline");
+    assert.equal(outboundContents(calls).length, 1);
+
+    replacement.closed = true;
+    await control.reconcileOwnerPresence(DEV_OWNER_ID, replacement as unknown as WebSocket);
+    await expirePending();
+    assert.equal(outboundContents(calls).at(-1),
+      "CODEX CONTROL · OFFLINE\n\nCodex on your Mac is offline. New task messages won’t run until it reconnects.");
+
+    db.phoneBindings.get("+15551234567")!.last_user_message_at = "2026-01-01T00:00:00.000Z";
+    const staleReconnect = new PresenceSocket();
+    staleReconnect.serializeAttachment({ ownerId: DEV_OWNER_ID, lastHeartbeatAt: Date.now() });
+    sockets.push(staleReconnect);
+    await control.reconcileOwnerPresence(DEV_OWNER_ID);
+    await expirePending();
+    assert.equal(outboundContents(calls).length, 2, "inactive users do not receive presence notices");
+
+    db.phoneBindings.get("+15551234567")!.last_user_message_at = new Date(Date.now() - 1000).toISOString();
+    staleReconnect.closed = true;
+    await control.reconcileOwnerPresence(DEV_OWNER_ID, staleReconnect as unknown as WebSocket);
+    failNext = true;
+    await expirePending();
+    assert.equal((await storage.get<Record<string, unknown>>(key))?.noticeState, "offline",
+      "a transient provider failure remains retryable");
+    const retryRecord = await storage.get<Record<string, unknown>>(key);
+    assert.ok(retryRecord);
+    retryRecord.noticeNextAt = Date.now() - 1;
+    await storage.put(key, retryRecord);
+    storage.alarmAt = null;
+    await relay.alarm();
+    assert.equal((await storage.get<Record<string, unknown>>(key))?.noticeState, null);
+
+    const heartbeatSocket = new PresenceSocket();
+    heartbeatSocket.serializeAttachment({ ownerId: DEV_OWNER_ID, lastHeartbeatAt: Date.now(), heartbeatCapable: false });
+    sockets.push(heartbeatSocket);
+    await relay.webSocketMessage(heartbeatSocket as unknown as WebSocket, JSON.stringify({ type: "service-heartbeat" }));
+    const heartbeatAttachment = heartbeatSocket.deserializeAttachment() as { heartbeatCapable: boolean; lastHeartbeatAt: number };
+    assert.equal(heartbeatAttachment.heartbeatCapable, true, "an explicit v0.3.3 heartbeat opts into TTL checks");
+    heartbeatSocket.serializeAttachment({ ...heartbeatAttachment, ownerId: DEV_OWNER_ID, lastHeartbeatAt: Date.now() - (2 * 60 * 1000) });
+    storage.alarmAt = null;
+    await relay.alarm();
+    assert.equal(heartbeatSocket.closed, true, "a heartbeat-capable stale socket is expired");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });
 
 test("installation socket receives every offline pending reply and claim advances the queue", async () => {
@@ -2870,6 +3058,162 @@ test("service outbound labels model output with its source thread", async () => 
     }), testEnv);
     assert.equal(response.status, 200);
     assert.deepEqual(outboundContents(calls), ["CODEX THREAD · CODEX\nMusic crawler\n\nAll tests pass."]);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("proactive completions use the 24-hour inbound activity gate without affecting requested output", async () => {
+  const testEnv = env();
+  await registerService(testEnv);
+  const db = testEnv.DB as unknown as FakeD1Database;
+  const fixedNow = Date.parse("2026-07-12T12:00:00.000Z");
+  const originalNow = Date.now;
+  Date.now = () => fixedNow;
+  db.phoneBindings.set("+15551234567", {
+    phone_number: "+15551234567", owner_id: DEV_OWNER_ID, active_thread_id: "thread-1",
+    contact_card_sent_at: null,
+    last_user_message_at: new Date(fixedNow - (24 * 60 * 60 * 1000) + 1).toISOString(),
+    created_at: "2026-07-12T00:00:00.000Z", updated_at: "2026-07-12T00:00:00.000Z",
+  });
+  const originalFetch = globalThis.fetch;
+  const calls: Array<{ url: string; body: Record<string, unknown> | null }> = [];
+  globalThis.fetch = async (input, init) => {
+    calls.push({ url: String(input), body: init?.body ? JSON.parse(String(init.body)) : null });
+    return new Response(JSON.stringify({ status: "QUEUED", message_handle: `notice-${calls.length}` }), { status: 200 });
+  };
+  try {
+    const status = await handleRequest(req("/service/notifications", { headers: { authorization: "Bearer dev-token" } }), testEnv);
+    assert.equal((await json(status)).active, true);
+
+    const completion = await handleRequest(req("/service/events/outbound", {
+      method: "POST",
+      headers: { authorization: "Bearer dev-token" },
+      body: JSON.stringify({ event: {
+        kind: "thread.completed",
+        completionId: "completion-recent",
+        thread: { title: "Local task", projectLabel: "iMessage handoff" },
+        completedAt: new Date().toISOString(),
+        body: "Exact local final.",
+      } }),
+    }), testEnv);
+    assert.equal((await notification(completion)).sent, true);
+    assert.deepEqual(outboundContents(calls.map((call) => call.body)), [
+      "CODEX THREAD · IMESSAGE HANDOFF\nLocal task\n\nCOMPLETED · now\n\nExact local final.",
+    ]);
+    assert.equal(calls.some((call) => call.url.includes("send-typing-indicator")), false,
+      "an unrelated proactive completion must not clear another task's typing state");
+
+    const duplicateCompletion = await handleRequest(req("/service/events/outbound", {
+      method: "POST",
+      headers: { authorization: "Bearer dev-token" },
+      body: JSON.stringify({ event: {
+        kind: "thread.completed",
+        completionId: "completion-recent",
+        thread: { title: "Local task", projectLabel: "iMessage handoff" },
+        completedAt: new Date().toISOString(),
+        body: "Exact local final.",
+      } }),
+    }), testEnv);
+    assert.deepEqual(await notification(duplicateCompletion), { sent: true, status: "DUPLICATE", parts: 1 });
+    assert.equal(outboundContents(calls.map((call) => call.body)).length, 1);
+
+    calls.length = 0;
+    db.phoneBindings.get("+15551234567")!.last_user_message_at = new Date(fixedNow - (24 * 60 * 60 * 1000)).toISOString();
+    const stale = await handleRequest(req("/service/events/outbound", {
+      method: "POST",
+      headers: { authorization: "Bearer dev-token" },
+      body: JSON.stringify({ event: { kind: "thread.completed", completionId: "completion-stale", thread: { title: "Stale task" }, body: "Do not send." } }),
+    }), testEnv);
+    assert.deepEqual(await notification(stale), { sent: false, status: "INACTIVE" });
+    assert.equal(calls.length, 0);
+
+    const requested = await handleRequest(req("/service/events/outbound", {
+      method: "POST",
+      headers: { authorization: "Bearer dev-token" },
+      body: JSON.stringify({ event: { kind: "thread.output", thread: { title: "Requested task" }, body: "Always return requested work." } }),
+    }), testEnv);
+    assert.equal((await notification(requested)).sent, true);
+    assert.match(String(outboundContents(calls.map((call) => call.body)).at(-1)), /Always return requested work\./);
+
+    calls.length = 0;
+    db.phoneBindings.clear();
+    const unpaired = await handleRequest(req("/service/events/outbound", {
+      method: "POST",
+      headers: { authorization: "Bearer dev-token" },
+      body: JSON.stringify({ event: { kind: "thread.completed", completionId: "completion-unpaired", thread: { title: "Unpaired task" }, body: "Do not send." } }),
+    }), testEnv);
+    assert.deepEqual(await notification(unpaired), { sent: false, status: "NO_BINDING" });
+    assert.equal(calls.length, 0);
+  } finally {
+    Date.now = originalNow;
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("genuine paired inbound messages refresh activity while duplicate webhooks do not", async () => {
+  const testEnv = env();
+  const threadId = await register(testEnv);
+  const db = testEnv.DB as unknown as FakeD1Database;
+  await handleRequest(sendblueWebhook(inboundMessage(String(db.threads.get(threadId)?.pairing_code), "activity-pair")), testEnv);
+  const binding = db.phoneBindings.get("+15551234567")!;
+  assert.ok(Date.parse(String(binding.last_user_message_at)) > Date.now() - 5000, "pairing counts as user activity");
+
+  binding.last_user_message_at = "2026-01-01T00:00:00.000Z";
+  await handleRequest(sendblueWebhook(inboundMessage("Run the activity test.", "activity-prompt")), testEnv);
+  assert.ok(Date.parse(String(binding.last_user_message_at)) > Date.now() - 5000, "a prompt refreshes activity");
+
+  binding.last_user_message_at = "2026-01-02T00:00:00.000Z";
+  const duplicate = await handleRequest(sendblueWebhook(inboundMessage("Run the activity test.", "activity-prompt")), testEnv);
+  assert.equal((await json(duplicate)).duplicate, true);
+  assert.equal(binding.last_user_message_at, "2026-01-02T00:00:00.000Z");
+
+  await handleRequest(sendblueWebhook(inboundMessage("/help", "activity-command")), testEnv);
+  assert.ok(Date.parse(String(binding.last_user_message_at)) > Date.now() - 5000, "a command refreshes activity");
+});
+
+test("multipart completion retries resume after the last provider-accepted part", async () => {
+  const testEnv = env();
+  await registerService(testEnv);
+  const db = testEnv.DB as unknown as FakeD1Database;
+  db.phoneBindings.set("+15551234567", {
+    phone_number: "+15551234567", owner_id: DEV_OWNER_ID, active_thread_id: "thread-1",
+    contact_card_sent_at: null, last_user_message_at: new Date().toISOString(),
+    created_at: new Date().toISOString(), updated_at: new Date().toISOString(),
+  });
+  const event = {
+    kind: "thread.completed",
+    completionId: "completion-multipart",
+    thread: { title: "Long local task", projectLabel: "iMessage handoff" },
+    completedAt: new Date().toISOString(),
+    body: "A".repeat(9000),
+  };
+  const originalFetch = globalThis.fetch;
+  const calls: Array<Record<string, unknown> | null> = [];
+  let providerAttempts = 0;
+  globalThis.fetch = async (_input, init) => {
+    calls.push(init?.body ? JSON.parse(String(init.body)) : null);
+    providerAttempts += 1;
+    if (providerAttempts === 2) return new Response(JSON.stringify({ error: "temporary" }), { status: 500 });
+    return new Response(JSON.stringify({ status: "QUEUED", message_handle: `multipart-${providerAttempts}` }), { status: 200 });
+  };
+  try {
+    const first = await handleRequest(req("/service/events/outbound", {
+      method: "POST", headers: { authorization: "Bearer dev-token" }, body: JSON.stringify({ event }),
+    }), testEnv);
+    assert.equal(first.status, 400);
+    assert.equal(db.completionNotifications.get(`${DEV_OWNER_ID}:completion-multipart`)?.parts_sent, 1);
+
+    const retry = await handleRequest(req("/service/events/outbound", {
+      method: "POST", headers: { authorization: "Bearer dev-token" }, body: JSON.stringify({ event }),
+    }), testEnv);
+    assert.equal(retry.status, 200);
+    assert.equal((await notification(retry)).sent, true);
+    const contents = outboundContents(calls);
+    assert.equal(contents.length, 3, "the failed second part is retried without repeating the accepted first part");
+    assert.match(String(contents[0]), /· 1\/2/);
+    assert.match(String(contents[1]), /· 2\/2/);
+    assert.match(String(contents[2]), /· 2\/2/);
   } finally {
     globalThis.fetch = originalFetch;
   }

@@ -1,6 +1,6 @@
 {
   "name": "@gaberagland/imessage-handoff",
-  "version": "0.3.2",
+  "version": "0.3.3",
   "description": "Run a persistent iMessage service for continuing Codex threads from Messages.",
   "type": "module",
   "bin": {

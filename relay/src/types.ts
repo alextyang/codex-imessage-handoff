@@ -90,6 +90,7 @@ export interface PhoneBindingRow {
   owner_id: string;
   active_thread_id: string | null;
   contact_card_sent_at: string | null;
+  last_user_message_at?: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -101,4 +102,14 @@ export interface PairingAttemptLimitRow {
   window_start_at: string;
   blocked_until: string | null;
   updated_at: string;
+}
+
+export interface CompletionNotificationRow {
+  owner_id: string;
+  completion_id: string;
+  status: "sending" | "failed" | "delivered";
+  parts_sent: number;
+  started_at: string;
+  updated_at: string;
+  delivered_at: string | null;
 }

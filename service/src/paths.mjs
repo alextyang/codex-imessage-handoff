@@ -19,6 +19,7 @@ export function servicePaths() {
     globalState: process.env.IMESSAGE_HANDOFF_GLOBAL_STATE || path.join(codexHome(), ".codex-global-state.json"),
     attachments: path.join(home, "attachments"),
     runState: path.join(home, "run-state.json"),
+    completionState: path.join(home, "completion-state.json"),
     stdoutLog: path.join(home, "service.log"),
     stderrLog: path.join(home, "service-error.log"),
     plist: path.join(os.homedir(), "Library", "LaunchAgents", "com.codex.imessage-handoff.plist"),

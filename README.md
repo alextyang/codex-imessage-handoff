@@ -105,6 +105,26 @@ Use “2: message” to open and send.
 The service uses native typing indicators for ordinary work and sends bounded,
 deterministic progress only for longer runs.
 
+When the paired user has texted Codex within the previous 24 hours, the service
+also watches visible top-level tasks that finish locally and sends their exact
+final response with a distinct completion header:
+
+```text
+CODEX THREAD · MUSIC CRAWLER
+Fix album metadata
+
+COMPLETED · now
+
+All tests pass.
+```
+
+Existing task history is baselined silently on first start, and iMessage-started
+turns are deduplicated so their requested reply is never followed by a second
+completion notice. The same 24-hour activity window applies to debounced
+`CODEX CONTROL · ONLINE` and `CODEX CONTROL · OFFLINE` notices when the Mac's
+service connects or disconnects. Inbound prompts, commands, menu choices,
+media, and pairing all refresh the window; outbound notices do not.
+
 ## Service commands
 
 ```bash
@@ -136,7 +156,10 @@ without LaunchAgent support.
 6. Structured lifecycle events drive typing and safe progress.
 7. The final response is labeled outside Codex history and sent through
    Sendblue.
-8. The Codex child process exits; the small service returns to idle.
+8. A private incremental rollout watcher detects locally completed top-level
+   tasks without reinstalling Codex Stop hooks.
+9. The Codex child process exits; the small service returns to idle. A heartbeat
+   keeps relay presence accurate across sleep and network loss.
 
 ## Self-hosting
 
@@ -148,6 +171,10 @@ and redeploy the Worker before starting the service.
 ## Security model
 
 - Prompt and response bodies are not stored in D1.
+- D1 stores only the paired phone's last inbound timestamp plus opaque
+  completion IDs and multipart counters for idempotent delivery; it never
+  stores task content. Retryable completion output remains only in the local
+  mode-`0600` service state until it is sent or intentionally suppressed.
 - Inbound content lives in the relay only until the connected service
   immediately claims it into its mode-`0600` local queue.
 - Thread history, full local paths, and git remotes stay local. Directory

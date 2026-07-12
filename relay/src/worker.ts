@@ -1,5 +1,5 @@
 import { CODEX_CONTACT_IMAGE_BASE64 } from "./contact-card-image.ts";
-import { parseMenuSelection, parseSlashCommand, renderHelp, renderOutboundEvent, renderThreadDirectory, renderThreadMenu, threadHeader, threadTitle } from "../../protocol/presentation.ts";
+import { parseMenuSelection, parseSlashCommand, relativeTime, renderHelp, renderOutboundEvent, renderThreadDirectory, renderThreadMenu, threadHeader, threadTitle } from "../../protocol/presentation.ts";
 import type { OutboundEvent, MenuItem } from "../../protocol/presentation.ts";
 import type {
   Env,
@@ -10,6 +10,7 @@ import type {
   HandoffReplyRow,
   HandoffThreadRow,
   ServiceInstallationRow,
+  CompletionNotificationRow,
 } from "./types.ts";
 
 type WaitUntilContext = Pick<ExecutionContext, "waitUntil">;
@@ -70,6 +71,32 @@ const ALLOWED_GENERATED_IMAGE_MIME_TYPES = new Set(["image/png", "image/jpeg", "
 // Sendblue can deliver one image as several webhooks. Wait briefly before
 // surfacing grouped media so Codex receives one complete iMessage reply.
 const MEDIA_GROUP_QUIET_MS = 3000;
+const NOTIFICATION_ACTIVITY_WINDOW_MS = 24 * 60 * 60 * 1000;
+const PRESENCE_ONLINE_DEBOUNCE_MS = 3000;
+const PRESENCE_OFFLINE_DEBOUNCE_MS = 30 * 1000;
+const PRESENCE_HEARTBEAT_TTL_MS = 75 * 1000;
+const PRESENCE_STORAGE_PREFIX = "presence:";
+const PRESENCE_RETRY_BASE_MS = 30 * 1000;
+const PRESENCE_RETRY_MAX_MS = 5 * 60 * 1000;
+const COMPLETION_DELIVERY_LEASE_MS = 2 * 60 * 1000;
+
+interface PresenceRecord {
+  stableState: "unknown" | "online" | "offline";
+  pendingState?: "online" | "offline" | null;
+  dueAt?: number | null;
+  pendingSinceAt?: string | null;
+  changedAt?: string | null;
+  noticeState?: "online" | "offline" | null;
+  noticeStartedAt?: string | null;
+  noticeAttempts?: number;
+  noticeNextAt?: number | null;
+}
+
+interface OwnerSocketAttachment {
+  ownerId: string;
+  lastHeartbeatAt: number;
+  heartbeatCapable: boolean;
+}
 
 interface RegisterBody {
   cwd?: unknown;
@@ -140,6 +167,7 @@ interface ReplyMedia {
 
 export class HandoffSocket {
   private readonly state: DurableObjectState;
+  private readonly env?: Env;
   // This is the in-memory message buffer. When HANDOFF_SOCKET is bound,
   // inbound message text/media does not go to D1; it lives here until claim.
   private readonly replies = new Map<string, HandoffReplyRow>();
@@ -148,8 +176,9 @@ export class HandoffSocket {
   // which is fine for a lightweight abuse brake and avoids a D1 write per hit.
   private readonly requestLimits = new Map<string, { count: number; windowStartMs: number }>();
 
-  constructor(state: DurableObjectState) {
+  constructor(state: DurableObjectState, env?: Env) {
     this.state = state;
+    this.env = env;
   }
 
   async fetch(request: Request): Promise<Response> {
@@ -190,7 +219,7 @@ export class HandoffSocket {
         return json({ ok: delivered > 0, delivered }, delivered > 0 ? {} : { status: 409 });
       }
       if (request.method === "GET" && parts[0] === "owners" && parts[1] && parts[2] === "connected") {
-        return json({ connected: this.state.getWebSockets(`owner:${parts[1]}`).length > 0 });
+        return json({ connected: this.freshOwnerSockets(parts[1]).length > 0 });
       }
       return error(404, "Not found.");
     }
@@ -203,6 +232,8 @@ export class HandoffSocket {
     const socketTag = ownerId ? `owner:${ownerId}` : threadId;
     this.state.acceptWebSocket(server, socketTag ? [socketTag] : undefined);
     if (ownerId) {
+      this.writeOwnerAttachment(server, ownerId);
+      this.deferPresence(this.reconcileOwnerPresence(ownerId));
       this.notifyOwnerSocketOrSchedule(ownerId, server);
     } else if (threadId) {
       // A Stop hook may connect after a message already arrived, so send the
@@ -232,10 +263,266 @@ export class HandoffSocket {
       receivedAt: nowIso(),
       messageType: optionalString(parsed?.type),
     }));
+
+    const ownerId = this.ownerIdForSocket(ws);
+    if (ownerId) {
+      this.writeOwnerAttachment(ws, ownerId, optionalString(parsed?.type) === "service-heartbeat");
+      this.deferPresence(this.reconcileOwnerPresence(ownerId));
+    }
   }
 
   async webSocketClose(ws: WebSocket, code: number, reason: string) {
+    const ownerId = this.ownerIdForSocket(ws);
+    this.expireOwnerAttachment(ws);
     ws.close(code, reason);
+    if (ownerId) this.deferPresence(this.reconcileOwnerPresence(ownerId, ws));
+  }
+
+  async webSocketError(ws: WebSocket) {
+    const ownerId = this.ownerIdForSocket(ws);
+    this.expireOwnerAttachment(ws);
+    try { ws.close(1011, "Connection error"); } catch {}
+    if (ownerId) this.deferPresence(this.reconcileOwnerPresence(ownerId, ws));
+  }
+
+  async alarm() {
+    const storage = this.presenceStorage();
+    if (!storage) return;
+    const now = Date.now();
+    const records = await storage.list<PresenceRecord>({ prefix: PRESENCE_STORAGE_PREFIX });
+    const notifications: Array<{ ownerId: string; state: "online" | "offline"; startedAt: string | null }> = [];
+
+    for (const [key, stored] of records) {
+      const ownerId = key.slice(PRESENCE_STORAGE_PREFIX.length);
+      if (!ownerId) continue;
+      const record = this.normalizePresenceRecord(stored);
+      const sockets = this.state.getWebSockets(`owner:${ownerId}`);
+      for (const socket of sockets) {
+        const attachment = this.ownerAttachment(socket);
+        if (attachment?.heartbeatCapable && now - attachment.lastHeartbeatAt >= PRESENCE_HEARTBEAT_TTL_MS) {
+          this.expireOwnerAttachment(socket);
+          try { socket.close(1001, "Heartbeat expired"); } catch {}
+        }
+      }
+      const desired = this.freshOwnerSockets(ownerId, undefined, now).length > 0 ? "online" : "offline";
+      if (record.noticeState && record.noticeState !== desired) {
+        record.noticeState = null;
+        record.noticeStartedAt = null;
+        record.noticeAttempts = 0;
+        record.noticeNextAt = null;
+      }
+      if (record.pendingState && record.pendingState !== desired) {
+        record.pendingState = null;
+        record.dueAt = null;
+        record.pendingSinceAt = null;
+      }
+      if (record.stableState === desired) {
+        record.pendingState = null;
+        record.dueAt = null;
+        record.pendingSinceAt = null;
+      } else if (!record.pendingState) {
+        record.pendingState = desired;
+        record.dueAt = now + this.presenceDelay(desired);
+        record.pendingSinceAt = new Date(now).toISOString();
+      } else if ((record.dueAt ?? Number.POSITIVE_INFINITY) <= now) {
+        const previous = record.stableState;
+        const transitionStartedAt = record.pendingSinceAt ?? new Date(now).toISOString();
+        record.stableState = desired;
+        record.pendingState = null;
+        record.dueAt = null;
+        record.pendingSinceAt = null;
+        record.changedAt = new Date(now).toISOString();
+        if ((desired === "online" && (previous === "offline" || previous === "unknown")) || (desired === "offline" && previous === "online")) {
+          record.noticeState = desired;
+          record.noticeStartedAt = transitionStartedAt;
+          record.noticeAttempts = 0;
+          record.noticeNextAt = now;
+        }
+      }
+      if (record.noticeState && (record.noticeNextAt ?? 0) <= now) {
+        notifications.push({ ownerId, state: record.noticeState, startedAt: record.noticeStartedAt ?? null });
+      }
+      await storage.put(key, record);
+    }
+
+    for (const notification of notifications) {
+      let terminal = !this.env;
+      try {
+        if (this.env) {
+          const outcome = await sendPresenceNotification(this.env, notification.ownerId, notification.state);
+          terminal = outcome.terminal;
+        }
+      } catch {
+        console.warn("Sendblue presence notification failed; will retry.");
+      }
+      const key = `${PRESENCE_STORAGE_PREFIX}${notification.ownerId}`;
+      const current = this.normalizePresenceRecord(await storage.get<PresenceRecord>(key));
+      if (current.noticeState !== notification.state || current.noticeStartedAt !== notification.startedAt) continue;
+      if (terminal) {
+        current.noticeState = null;
+        current.noticeStartedAt = null;
+        current.noticeAttempts = 0;
+        current.noticeNextAt = null;
+      } else {
+        current.noticeAttempts = Math.max(0, Number(current.noticeAttempts) || 0) + 1;
+        const backoff = Math.min(PRESENCE_RETRY_MAX_MS, PRESENCE_RETRY_BASE_MS * (2 ** Math.min(6, current.noticeAttempts - 1)));
+        current.noticeNextAt = Date.now() + backoff;
+      }
+      await storage.put(key, current);
+    }
+    await this.reschedulePresenceAlarm();
+  }
+
+  private presenceStorage() {
+    const storage = (this.state as unknown as { storage?: DurableObjectStorage }).storage;
+    return storage && typeof storage.get === "function" ? storage : null;
+  }
+
+  private deferPresence(promise: Promise<unknown>) {
+    const waitUntil = (this.state as unknown as { waitUntil?: (value: Promise<unknown>) => void }).waitUntil;
+    if (typeof waitUntil === "function") waitUntil.call(this.state, promise);
+    else promise.catch(() => {});
+  }
+
+  private ownerAttachment(ws: WebSocket): OwnerSocketAttachment | null {
+    try {
+      const attachment = ws.deserializeAttachment?.() as unknown;
+      if (!isRecord(attachment) || typeof attachment.ownerId !== "string") return null;
+      const lastHeartbeatAt = Number(attachment.lastHeartbeatAt);
+      return Number.isFinite(lastHeartbeatAt)
+        ? { ownerId: attachment.ownerId, lastHeartbeatAt, heartbeatCapable: attachment.heartbeatCapable === true }
+        : null;
+    } catch {
+      return null;
+    }
+  }
+
+  private ownerIdForSocket(ws: WebSocket) {
+    const attachment = this.ownerAttachment(ws);
+    if (attachment?.ownerId) return attachment.ownerId;
+    try {
+      const getTags = (this.state as unknown as { getTags?: (socket: WebSocket) => string[] }).getTags;
+      const tag = typeof getTags === "function"
+        ? getTags.call(this.state, ws).find((value) => value.startsWith("owner:"))
+        : null;
+      return tag?.slice("owner:".length) || null;
+    } catch {
+      return null;
+    }
+  }
+
+  private writeOwnerAttachment(ws: WebSocket, ownerId: string, heartbeatCapable = false) {
+    const existing = this.ownerAttachment(ws);
+    try {
+      ws.serializeAttachment?.({
+        ownerId,
+        lastHeartbeatAt: Date.now(),
+        heartbeatCapable: heartbeatCapable || existing?.heartbeatCapable === true,
+      } satisfies OwnerSocketAttachment);
+    } catch {}
+  }
+
+  private expireOwnerAttachment(ws: WebSocket) {
+    const attachment = this.ownerAttachment(ws);
+    if (!attachment) return;
+    try { ws.serializeAttachment?.({ ...attachment, lastHeartbeatAt: 0 } satisfies OwnerSocketAttachment); } catch {}
+  }
+
+  private freshOwnerSockets(ownerId: string, excluding?: WebSocket, now = Date.now()) {
+    return this.state.getWebSockets(`owner:${ownerId}`).filter((socket) => {
+      if (socket === excluding) return false;
+      const attachment = this.ownerAttachment(socket);
+      // Older daemon versions never send heartbeats. Keep those sockets
+      // close-event-driven during rolling upgrades; a v0.3.3 heartbeat opts a
+      // socket into TTL freshness checks immediately.
+      return !attachment || !attachment.heartbeatCapable || now - attachment.lastHeartbeatAt < PRESENCE_HEARTBEAT_TTL_MS;
+    });
+  }
+
+  private normalizePresenceRecord(value: PresenceRecord | undefined): PresenceRecord {
+    const stableState = value?.stableState === "online" || value?.stableState === "offline"
+      ? value.stableState
+      : "unknown";
+    const pendingState = value?.pendingState === "online" || value?.pendingState === "offline"
+      ? value.pendingState
+      : null;
+    const dueAt = Number(value?.dueAt);
+    return {
+      stableState,
+      pendingState,
+      dueAt: Number.isFinite(dueAt) && dueAt > 0 ? dueAt : null,
+      pendingSinceAt: typeof value?.pendingSinceAt === "string" ? value.pendingSinceAt : null,
+      changedAt: typeof value?.changedAt === "string" ? value.changedAt : null,
+      noticeState: value?.noticeState === "online" || value?.noticeState === "offline" ? value.noticeState : null,
+      noticeStartedAt: typeof value?.noticeStartedAt === "string" ? value.noticeStartedAt : null,
+      noticeAttempts: Math.max(0, Number(value?.noticeAttempts) || 0),
+      noticeNextAt: Number.isFinite(Number(value?.noticeNextAt)) && Number(value?.noticeNextAt) > 0
+        ? Number(value?.noticeNextAt)
+        : null,
+    };
+  }
+
+  private presenceDelay(state: "online" | "offline") {
+    return state === "online" ? PRESENCE_ONLINE_DEBOUNCE_MS : PRESENCE_OFFLINE_DEBOUNCE_MS;
+  }
+
+  private async reconcileOwnerPresence(ownerId: string, excluding?: WebSocket) {
+    const storage = this.presenceStorage();
+    if (!storage) return;
+    const key = `${PRESENCE_STORAGE_PREFIX}${ownerId}`;
+    const record = this.normalizePresenceRecord(await storage.get<PresenceRecord>(key));
+    const desired = this.freshOwnerSockets(ownerId, excluding).length > 0 ? "online" : "offline";
+    if (record.noticeState && record.noticeState !== desired) {
+      record.noticeState = null;
+      record.noticeStartedAt = null;
+      record.noticeAttempts = 0;
+      record.noticeNextAt = null;
+    }
+    if (record.stableState === desired) {
+      record.pendingState = null;
+      record.dueAt = null;
+      record.pendingSinceAt = null;
+    } else if (record.pendingState !== desired) {
+      record.pendingState = desired;
+      record.dueAt = Date.now() + this.presenceDelay(desired);
+      record.pendingSinceAt = nowIso();
+    }
+    await storage.put(key, record);
+    const heartbeatExpiry = this.freshOwnerSockets(ownerId)
+      .flatMap((socket) => {
+        const attachment = this.ownerAttachment(socket);
+        return attachment?.heartbeatCapable ? [attachment.lastHeartbeatAt] : [];
+      })
+      .reduce((minimum, value) => Math.min(minimum, value + PRESENCE_HEARTBEAT_TTL_MS), Number.POSITIVE_INFINITY);
+    await this.ensurePresenceAlarm(Math.min(record.dueAt ?? Number.POSITIVE_INFINITY, heartbeatExpiry));
+  }
+
+  private async ensurePresenceAlarm(at: number) {
+    const storage = this.presenceStorage();
+    if (!storage || !Number.isFinite(at)) return;
+    const current = await storage.getAlarm();
+    if (current === null || at < current) await storage.setAlarm(Math.max(Date.now() + 1, at));
+  }
+
+  private async reschedulePresenceAlarm() {
+    const storage = this.presenceStorage();
+    if (!storage) return;
+    const records = await storage.list<PresenceRecord>({ prefix: PRESENCE_STORAGE_PREFIX });
+    let nextAt = Number.POSITIVE_INFINITY;
+    for (const record of records.values()) {
+      const dueAt = Number(record?.dueAt);
+      if (Number.isFinite(dueAt) && dueAt > 0) nextAt = Math.min(nextAt, dueAt);
+      const noticeNextAt = Number(record?.noticeNextAt);
+      if (record?.noticeState && Number.isFinite(noticeNextAt) && noticeNextAt > 0) nextAt = Math.min(nextAt, noticeNextAt);
+    }
+    for (const socket of this.state.getWebSockets()) {
+      const attachment = this.ownerAttachment(socket);
+      if (attachment?.heartbeatCapable && attachment.lastHeartbeatAt > 0) {
+        nextAt = Math.min(nextAt, attachment.lastHeartbeatAt + PRESENCE_HEARTBEAT_TTL_MS);
+      }
+    }
+    if (Number.isFinite(nextAt)) await storage.setAlarm(Math.max(Date.now() + 1, nextAt));
+    else await storage.deleteAlarm();
   }
 
   private pendingRows(threadId: string) {
@@ -416,7 +703,7 @@ export class HandoffSocket {
   private notifyOwner(ownerId: string, payload: JsonRecord) {
     const message = JSON.stringify(payload);
     let delivered = 0;
-    for (const socket of this.state.getWebSockets(`owner:${ownerId}`)) {
+    for (const socket of this.freshOwnerSockets(ownerId)) {
       try {
         socket.send(message);
         delivered += 1;
@@ -921,6 +1208,12 @@ async function handleServiceStatus(request: Request, env: Env) {
   });
 }
 
+async function handleServiceNotificationStatus(request: Request, env: Env) {
+  const ownerId = await requireOwnerId(request);
+  const binding = await findPhoneBindingForOwner(env, ownerId);
+  return json({ ok: true, ...notificationActivity(binding) });
+}
+
 async function handleServiceUnregister(request: Request, env: Env) {
   const ownerId = await requireOwnerId(request);
   await env.DB.prepare("DELETE FROM service_installations WHERE owner_id = ?").bind(ownerId).run();
@@ -943,6 +1236,53 @@ function outboundEvent(value: unknown) {
     throw new Error("event is required.");
   }
   return value as unknown as OutboundEvent;
+}
+
+async function findCompletionNotification(env: Env, ownerId: string, completionId: string) {
+  return env.DB.prepare(
+    "SELECT owner_id, completion_id, status, parts_sent, started_at, updated_at, delivered_at FROM completion_notifications WHERE owner_id = ? AND completion_id = ?",
+  ).bind(ownerId, completionId).first<CompletionNotificationRow>();
+}
+
+async function beginCompletionNotification(env: Env, ownerId: string, completionId: string) {
+  const now = nowIso();
+  let existing = await findCompletionNotification(env, ownerId, completionId);
+  if (!existing) {
+    const inserted = await env.DB.prepare(
+      `INSERT OR IGNORE INTO completion_notifications (
+        owner_id, completion_id, status, parts_sent, started_at, updated_at, delivered_at
+      ) VALUES (?, ?, 'sending', 0, ?, ?, NULL)`,
+    ).bind(ownerId, completionId, now, now).run();
+    if (Number(inserted.meta.changes) > 0) return { state: "claimed" as const, partsSent: 0 };
+    existing = await findCompletionNotification(env, ownerId, completionId);
+  }
+  if (existing?.status === "delivered") {
+    return { state: "delivered" as const, partsSent: Math.max(0, Number(existing.parts_sent) || 0) };
+  }
+  const updatedMs = Date.parse(existing?.updated_at ?? "");
+  if (existing?.status === "sending" && Number.isFinite(updatedMs) && Date.now() - updatedMs < COMPLETION_DELIVERY_LEASE_MS) {
+    return { state: "in-progress" as const, partsSent: Math.max(0, Number(existing.parts_sent) || 0) };
+  }
+  const partsSent = Math.max(0, Number(existing?.parts_sent) || 0);
+  await env.DB.prepare(
+    "UPDATE completion_notifications SET status = 'sending', updated_at = ? WHERE owner_id = ? AND completion_id = ?",
+  ).bind(now, ownerId, completionId).run();
+  return { state: "claimed" as const, partsSent };
+}
+
+async function updateCompletionNotification(
+  env: Env,
+  ownerId: string,
+  completionId: string,
+  status: "sending" | "failed" | "delivered",
+  partsSent: number,
+) {
+  const now = nowIso();
+  await env.DB.prepare(
+    `UPDATE completion_notifications
+      SET status = ?, parts_sent = ?, updated_at = ?, delivered_at = ?
+      WHERE owner_id = ? AND completion_id = ?`,
+  ).bind(status, partsSent, now, status === "delivered" ? now : null, ownerId, completionId).run();
 }
 
 async function serviceDirectoryReferences(env: Env, ownerId: string, event: Extract<OutboundEvent, { kind: "service.directory" }>) {
@@ -971,20 +1311,31 @@ async function serviceDirectoryReferences(env: Env, ownerId: string, event: Extr
 async function handleServiceOutbound(request: Request, env: Env) {
   const ownerId = await requireOwnerId(request);
   const body = await readJsonBody<OutboundBody>(request, SERVICE_OUTBOUND_JSON_BODY_MAX_BYTES);
+  const event = outboundEvent(body.event);
+  const completionId = event.kind === "thread.completed"
+    ? requireLimitedString(event.completionId, "completionId", 128)
+    : null;
   const binding = await findPhoneBindingForOwner(env, ownerId);
+  if (event.kind === "thread.completed") {
+    const activity = notificationActivity(binding);
+    if (!activity.active) {
+      return json({ ok: true, notification: { sent: false, status: activity.status } });
+    }
+  }
   if (!binding) {
     throw Object.assign(new Error("Phone is not paired."), { status: 409 });
   }
-  const event = outboundEvent(body.event);
   const directoryReferences = event.kind === "service.directory"
     ? await serviceDirectoryReferences(env, ownerId, event)
     : null;
   const rendered = renderOutboundEvent(event);
   const chunks: string[] = [];
-  if (event.kind === "thread.output" && rendered.length > 8000) {
-    const bodyChunks = splitText(event.body, 7800);
+  if ((event.kind === "thread.output" || event.kind === "thread.completed") && rendered.length > 8000) {
+    const bodyChunks = splitText(event.body, event.kind === "thread.completed" ? 7500 : 7800);
     for (let index = 0; index < bodyChunks.length; index += 1) {
-      chunks.push(`${threadHeader(event.thread, { index: index + 1, total: bodyChunks.length })}\n${threadTitle(event.thread)}\n\n${bodyChunks[index]}`);
+      const context = `${threadHeader(event.thread, { index: index + 1, total: bodyChunks.length })}\n${threadTitle(event.thread)}`;
+      const completion = event.kind === "thread.completed" ? `\n\nCOMPLETED · ${relativeTime(event.completedAt)}` : "";
+      chunks.push(`${context}${completion}\n\n${bodyChunks[index]}`);
     }
   } else if (rendered.length > 8000 && "thread" in event && event.thread) {
     const renderedChunks = splitText(rendered, 7600);
@@ -1004,10 +1355,23 @@ async function handleServiceOutbound(request: Request, env: Env) {
   } else {
     chunks.push(rendered);
   }
-  try {
-    await sendSendblueTypingIndicator(env, binding.phone_number, "stop");
-  } catch {
-    // Typing is best effort.
+  let completionStartPart = 0;
+  if (completionId) {
+    const claim = await beginCompletionNotification(env, ownerId, completionId);
+    if (claim.state === "delivered") {
+      return json({ ok: true, notification: { sent: true, status: "DUPLICATE", parts: claim.partsSent } });
+    }
+    if (claim.state === "in-progress") {
+      return json({ ok: true, notification: { sent: false, status: "IN_PROGRESS", parts: claim.partsSent } });
+    }
+    completionStartPart = Math.min(chunks.length, claim.partsSent);
+  }
+  if (event.kind !== "thread.completed") {
+    try {
+      await sendSendblueTypingIndicator(env, binding.phone_number, "stop");
+    } catch {
+      // Typing is best effort.
+    }
   }
   // A directory may span several provider messages. Replace any older mapping
   // with an empty, unexpired sentinel before part 1 so an immediate numeric
@@ -1015,9 +1379,23 @@ async function handleServiceOutbound(request: Request, env: Env) {
   // mapping only after every part is accepted by Sendblue.
   if (directoryReferences) await saveMenuSnapshot(env, binding, [], []);
   let result = null;
-  for (const chunk of chunks) {
-    if (chunk.length > MAX_ASSISTANT_MESSAGE_LENGTH) requestTooLarge("Rendered message is too large.");
-    result = await sendSendblueMessage(env, binding.phone_number, chunk);
+  let completionPartsSent = completionStartPart;
+  try {
+    for (let index = completionStartPart; index < chunks.length; index += 1) {
+      const chunk = chunks[index];
+      if (chunk.length > MAX_ASSISTANT_MESSAGE_LENGTH) requestTooLarge("Rendered message is too large.");
+      result = await sendSendblueMessage(env, binding.phone_number, chunk);
+      if (completionId) {
+        completionPartsSent = index + 1;
+        await updateCompletionNotification(env, ownerId, completionId, "sending", completionPartsSent);
+      }
+    }
+    if (completionId) await updateCompletionNotification(env, ownerId, completionId, "delivered", chunks.length);
+  } catch (caught) {
+    if (completionId) {
+      try { await updateCompletionNotification(env, ownerId, completionId, "failed", completionPartsSent); } catch {}
+    }
+    throw caught;
   }
   if (directoryReferences) await saveMenuSnapshot(env, binding, [], directoryReferences);
   if (event.kind === "thread.progress") {
@@ -1045,15 +1423,57 @@ function splitText(value: string, maxLength: number) {
 }
 
 async function findPhoneBinding(env: Env, phoneNumber: string) {
-  return env.DB.prepare("SELECT phone_number, owner_id, active_thread_id, contact_card_sent_at, created_at, updated_at FROM phone_bindings WHERE phone_number = ?")
+  return env.DB.prepare("SELECT phone_number, owner_id, active_thread_id, contact_card_sent_at, last_user_message_at, created_at, updated_at FROM phone_bindings WHERE phone_number = ?")
     .bind(phoneNumber)
     .first<PhoneBindingRow>();
 }
 
 async function findPhoneBindingForOwner(env: Env, ownerId: string) {
-  return env.DB.prepare("SELECT phone_number, owner_id, active_thread_id, contact_card_sent_at, created_at, updated_at FROM phone_bindings WHERE owner_id = ?")
+  return env.DB.prepare("SELECT phone_number, owner_id, active_thread_id, contact_card_sent_at, last_user_message_at, created_at, updated_at FROM phone_bindings WHERE owner_id = ?")
     .bind(ownerId)
     .first<PhoneBindingRow>();
+}
+
+function notificationActivity(binding: PhoneBindingRow | null, nowMs = Date.now()) {
+  if (!binding) {
+    return { active: false, status: "NO_BINDING", lastUserMessageAt: null, activeUntil: null };
+  }
+  const lastUserMessageAt = binding.last_user_message_at ?? null;
+  const lastUserMessageMs = lastUserMessageAt ? Date.parse(lastUserMessageAt) : Number.NaN;
+  const active = Number.isFinite(lastUserMessageMs)
+    && nowMs - lastUserMessageMs >= 0
+    && nowMs - lastUserMessageMs < NOTIFICATION_ACTIVITY_WINDOW_MS;
+  return {
+    active,
+    status: active ? "ACTIVE" : "INACTIVE",
+    lastUserMessageAt,
+    activeUntil: Number.isFinite(lastUserMessageMs)
+      ? new Date(lastUserMessageMs + NOTIFICATION_ACTIVITY_WINDOW_MS).toISOString()
+      : null,
+  };
+}
+
+async function recordUserMessageActivity(env: Env, binding: PhoneBindingRow) {
+  const receivedAt = nowIso();
+  await env.DB.prepare(
+    "UPDATE phone_bindings SET last_user_message_at = ?, updated_at = ? WHERE phone_number = ?",
+  ).bind(receivedAt, receivedAt, binding.phone_number).run();
+  binding.last_user_message_at = receivedAt;
+  binding.updated_at = receivedAt;
+}
+
+async function sendPresenceNotification(
+  env: Env,
+  ownerId: string,
+  state: "online" | "offline",
+) {
+  if (!await findServiceInstallation(env, ownerId)) return { terminal: true, status: "UNREGISTERED" };
+  const binding = await findPhoneBindingForOwner(env, ownerId);
+  const activity = notificationActivity(binding);
+  if (!binding) return { terminal: true, status: "NO_BINDING" };
+  if (!activity.active) return { terminal: true, status: "INACTIVE" };
+  await sendSendblueMessage(env, binding.phone_number, renderOutboundEvent({ kind: "service.presence", state }));
+  return { terminal: true, status: "SENT" };
 }
 
 async function findPairingThread(env: Env, pairingCode: string) {
@@ -1149,7 +1569,7 @@ async function findExternalReply(env: Env, externalId: string) {
 }
 
 async function findPhoneForThread(env: Env, threadId: string) {
-  return env.DB.prepare("SELECT phone_number, owner_id, active_thread_id, contact_card_sent_at, created_at, updated_at FROM phone_bindings WHERE active_thread_id = ?")
+  return env.DB.prepare("SELECT phone_number, owner_id, active_thread_id, contact_card_sent_at, last_user_message_at, created_at, updated_at FROM phone_bindings WHERE active_thread_id = ?")
     .bind(threadId)
     .first<PhoneBindingRow>();
 }
@@ -2168,13 +2588,14 @@ async function handleSendblueWebhook(request: Request, env: Env, ctx?: WaitUntil
     await env.DB.prepare("DELETE FROM phone_bindings WHERE owner_id = ? AND phone_number != ?")
       .bind(servicePairing.owner_id, fromNumber).run();
     await env.DB.prepare(
-      `INSERT INTO phone_bindings (phone_number, owner_id, active_thread_id, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?)
+      `INSERT INTO phone_bindings (phone_number, owner_id, active_thread_id, last_user_message_at, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?)
        ON CONFLICT(phone_number) DO UPDATE SET
          owner_id = excluded.owner_id,
          active_thread_id = excluded.active_thread_id,
+         last_user_message_at = excluded.last_user_message_at,
          updated_at = excluded.updated_at`,
-    ).bind(fromNumber, servicePairing.owner_id, activeThreadId, now, now).run();
+    ).bind(fromNumber, servicePairing.owner_id, activeThreadId, now, now, now).run();
     await env.DB.prepare(
       "UPDATE installation_pairings SET pairing_code = NULL, pairing_code_expires_at = NULL, updated_at = ? WHERE owner_id = ?",
     ).bind(now, servicePairing.owner_id).run();
@@ -2208,13 +2629,14 @@ async function handleSendblueWebhook(request: Request, env: Env, ctx?: WaitUntil
       "DELETE FROM phone_bindings WHERE owner_id = ? AND phone_number != ?",
     ).bind(pairingThread.owner_id, fromNumber).run();
     await env.DB.prepare(
-      `INSERT INTO phone_bindings (phone_number, owner_id, active_thread_id, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?)
+      `INSERT INTO phone_bindings (phone_number, owner_id, active_thread_id, last_user_message_at, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?)
         ON CONFLICT(phone_number) DO UPDATE SET
           owner_id = excluded.owner_id,
           active_thread_id = excluded.active_thread_id,
+          last_user_message_at = excluded.last_user_message_at,
           updated_at = excluded.updated_at`,
-    ).bind(fromNumber, pairingThread.owner_id, pairingThread.id, now, now).run();
+    ).bind(fromNumber, pairingThread.owner_id, pairingThread.id, now, now, now).run();
     await env.DB.prepare(
       "UPDATE handoff_threads SET pairing_code = NULL, pairing_code_expires_at = NULL, updated_at = ? WHERE id = ?",
     ).bind(now, pairingThread.id).run();
@@ -2261,6 +2683,7 @@ async function handleSendblueWebhook(request: Request, env: Env, ctx?: WaitUntil
     }
     return json({ ok: true, ignored: true });
   }
+  await recordUserMessageActivity(env, binding);
 
   const commandText = content?.trim().toLowerCase() ?? "";
   const slashCommand = content ? parseSlashCommand(content) : null;
@@ -2642,6 +3065,9 @@ export async function handleRequest(request: Request, env: Env, ctx?: WaitUntilC
     }
     if (url.pathname === "/service/status" && request.method === "GET") {
       return await handleServiceStatus(request, env);
+    }
+    if (url.pathname === "/service/notifications" && request.method === "GET") {
+      return await handleServiceNotificationStatus(request, env);
     }
     if (url.pathname === "/service/events/outbound" && request.method === "POST") {
       return await handleServiceOutbound(request, env);

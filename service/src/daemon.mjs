@@ -12,9 +12,12 @@ import { CodexRunner } from "./codex-runner.mjs";
 import { RunManager } from "./run-manager.mjs";
 import { FailureQueue } from "./failure-queue.mjs";
 import { loadClaimedJobs, markClaimedJobState, removeClaimedJob, saveClaimedJob } from "./claimed-store.mjs";
+import { CompletionMonitor } from "./completion-monitor.mjs";
+import { servicePaths } from "./paths.mjs";
 
 const config = readConfig();
 const relay = new RelayClient(config);
+const completions = new CompletionMonitor(servicePaths().completionState);
 const failedRuns = new FailureQueue();
 const pendingNotices = new Set();
 const claimingReplyIds = new Map();
@@ -30,6 +33,36 @@ let settingsWarningLogged = false;
 let lastCatalogSignature = null;
 let catalogById = new Map();
 let controlChain = Promise.resolve();
+let completionMonitoringStarted = false;
+let completionScanInFlight = null;
+
+async function deliverLocalCompletion(completion) {
+  const activity = await relay.notificationStatus({ signal: AbortSignal.timeout(10_000) });
+  if (activity?.active !== true) return { status: activity?.status || "INACTIVE" };
+  const thread = catalogById.get(String(completion.threadId || ""));
+  const label = thread
+    ? threadLabel(thread)
+    : { id: completion.threadId, title: "Codex task", projectLabel: "Codex" };
+  return relay.outbound({
+    kind: "thread.completed",
+    completionId: completion.completionId,
+    thread: label,
+    body: completion.body,
+    completedAt: completion.completedAt,
+  }, { signal: AbortSignal.timeout(15_000) });
+}
+
+async function scanKnownCompletions() {
+  if (catalogById.size === 0) return;
+  await completions.reconcile([...catalogById.values()], { deliver: deliverLocalCompletion });
+}
+
+function scheduleCompletionScan() {
+  if (!completionMonitoringStarted || completionScanInFlight) return;
+  completionScanInFlight = scanKnownCompletions()
+    .catch(() => log("Completion synchronization failed; will retry."))
+    .finally(() => { completionScanInFlight = null; });
+}
 
 function log(message) {
   process.stdout.write(`${new Date().toISOString()} ${message}\n`);
@@ -115,6 +148,7 @@ async function synchronizeNow() {
     await relay.syncCatalog(catalog);
     lastCatalogSignature = signature;
   }
+  scheduleCompletionScan();
   return threads;
 }
 
@@ -176,11 +210,16 @@ async function executeReply(event, context) {
   }
 
   if (event.delivery) {
+    const managedSince = event.queuedAt || new Date().toISOString();
+    completions.manage(thread.id, managedSince);
+    completions.suppressNext(thread.id, String(event.delivery.body || ""), managedSince);
     try {
       await deliverCompleted(event, thread);
     } catch {
       context.defer(15000);
       log(`Completed output for ${thread.id} could not be delivered; will retry.`);
+    } finally {
+      completions.unmanage(thread.id);
     }
     return;
   }
@@ -237,6 +276,8 @@ async function executeReply(event, context) {
   let lastProgressAt = Date.now();
   let lastPublishedPhase = null;
   let deferred = false;
+  let managedCompletion = false;
+  let runStartedAt = null;
 
   try {
     await relay.updateThreadStatus(thread, "working");
@@ -262,6 +303,9 @@ async function executeReply(event, context) {
     progressTimer.unref?.();
 
     markClaimedJobState(event.replyId, "running");
+    runStartedAt = new Date().toISOString();
+    completions.manage(thread.id, runStartedAt);
+    managedCompletion = true;
     const result = await runner.run({
       thread,
       prompt: String(reply.body || ""),
@@ -277,6 +321,7 @@ async function executeReply(event, context) {
     } else {
       event.delivery = { body: result.body, generatedImages: result.generatedImages || [], textDelivered: false };
       saveClaimedJob(event, "delivering");
+      completions.suppressNext(thread.id, result.body, runStartedAt);
       await deliverCompleted(event, thread);
     }
   } catch (error) {
@@ -308,6 +353,7 @@ async function executeReply(event, context) {
     }
   } finally {
     if (progressTimer) clearInterval(progressTimer);
+    if (managedCompletion) completions.unmanage(thread.id);
     if (!deferred) delete event.claimed;
     if (!deferred) pendingNotices.delete(event.replyId);
     scheduleSynchronize();
@@ -657,9 +703,17 @@ async function runControl(event) {
 function connect() {
   if (stopped) return;
   const socket = new WebSocket(relay.eventsUrl());
+  let heartbeatTimer = null;
   socket.on("open", () => {
     log("Connected to relay.");
     socket.send(JSON.stringify({ type: "service-connected", clientId: config.clientId }));
+    socket.send(JSON.stringify({ type: "service-heartbeat", clientId: config.clientId }));
+    heartbeatTimer = setInterval(() => {
+      if (socket.readyState === WebSocket.OPEN) {
+        socket.send(JSON.stringify({ type: "service-heartbeat", clientId: config.clientId }));
+      }
+    }, 20 * 1000);
+    heartbeatTimer.unref?.();
   });
   socket.on("message", (data) => {
     try {
@@ -677,6 +731,7 @@ function connect() {
     }
   });
   socket.on("close", () => {
+    if (heartbeatTimer) clearInterval(heartbeatTimer);
     if (!stopped) setTimeout(connect, 2000 + Math.floor(Math.random() * 2000)).unref();
   });
   socket.on("error", () => socket.close());
@@ -684,7 +739,11 @@ function connect() {
 
 async function main() {
   const restoredJobs = loadClaimedJobs();
+  for (const job of restoredJobs) {
+    if (job.delivery?.body) completions.suppressNext(job.threadId, job.delivery.body, job.queuedAt);
+  }
   const threads = await synchronize();
+  await completions.reconcile(threads, { deliver: deliverLocalCompletion, deliverPending: false });
   restoreClaimedState(restoredJobs);
   const registration = await relay.register();
   if (registration.pairingRequired) {
@@ -693,6 +752,9 @@ async function main() {
     log(`Ready on ${os.hostname()} with ${threads.length} top-level tasks.`);
   }
   connect();
+  completionMonitoringStarted = true;
+  scheduleCompletionScan();
+  setInterval(scheduleCompletionScan, 10 * 1000).unref();
   setInterval(() => synchronize().catch(() => log("Background synchronization failed; will retry.")), 30 * 1000).unref();
   setInterval(() => relay.register().catch(() => log("Service registration refresh failed; will retry.")), 5 * 60 * 1000).unref();
 }

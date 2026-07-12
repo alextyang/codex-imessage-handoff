@@ -29,7 +29,7 @@ export class RelayClient {
       method: "POST",
       body: JSON.stringify({
         clientId: this.clientId,
-        serviceVersion: "0.3.2",
+        serviceVersion: "0.3.3",
         capabilities: [
           "catalog-v2",
           "raw-prompts",
@@ -40,6 +40,8 @@ export class RelayClient {
           "reasoning-control",
           "cancel",
           "local-directory-v1",
+          "completion-notifications-v1",
+          "presence-notifications-v1",
         ],
       }),
     });
@@ -57,12 +59,16 @@ export class RelayClient {
     return this.request(`/threads/${encodeURIComponent(threadId)}/replies/${encodeURIComponent(replyId)}/claim`, { method: "POST" });
   }
 
-  outbound(event) {
-    return this.request("/service/events/outbound", { method: "POST", body: JSON.stringify({ event }) });
+  outbound(event, options = {}) {
+    return this.request("/service/events/outbound", { ...options, method: "POST", body: JSON.stringify({ event }) });
   }
 
   serviceStatus() {
     return this.request("/service/status");
+  }
+
+  notificationStatus(options = {}) {
+    return this.request("/service/notifications", options);
   }
 
   updateThreadStatus(thread, status) {

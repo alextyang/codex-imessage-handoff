@@ -67,6 +67,7 @@ export type NoticeCode = "connected" | "queued" | "cancelled" | "needs-attention
 
 export type OutboundEvent =
   | { kind: "thread.output"; thread: ThreadLabel; body: string }
+  | { kind: "thread.completed"; completionId: string; thread: ThreadLabel; body: string; completedAt?: string | null }
   | { kind: "thread.progress"; thread: ThreadLabel; phase: string }
   | {
     kind: "thread.detail";
@@ -95,6 +96,7 @@ export type OutboundEvent =
   | { kind: "service.menu"; label?: "THREADS" | "PROJECTS" | "COMMANDS"; items?: MenuItem[]; body?: string; note?: string }
   | { kind: "service.directory"; directory: ThreadDirectory }
   | { kind: "service.switched"; thread: ThreadLabel }
+  | { kind: "service.presence"; state: "online" | "offline" }
   | { kind: "service.notice"; code: NoticeCode; body: string; thread?: ThreadLabel };
 
 const CONTROL_PREFIX = "CODEX CONTROL · ";
@@ -346,6 +348,13 @@ export function renderOutboundEvent(event: OutboundEvent) {
   if (event.kind === "thread.output") {
     return [threadContext(event.thread), safeBody(event.body)].filter(Boolean).join("\n\n");
   }
+  if (event.kind === "thread.completed") {
+    return [
+      threadContext(event.thread),
+      `COMPLETED · ${relativeTime(event.completedAt)}`,
+      safeBody(event.body),
+    ].filter(Boolean).join("\n\n");
+  }
   if (event.kind === "thread.progress") {
     return [header("WORKING"), `${event.thread.projectLabel || "Codex"}\n${threadTitle(event.thread)}`, safeBody(event.phase)].join("\n\n");
   }
@@ -384,6 +393,11 @@ export function renderOutboundEvent(event: OutboundEvent) {
   }
   if (event.kind === "service.switched") {
     return [header("SWITCHED"), `${event.thread.projectLabel || "Codex"}\n${threadTitle(event.thread)}`, "Context selected."].join("\n\n");
+  }
+  if (event.kind === "service.presence") {
+    return event.state === "online"
+      ? [header("ONLINE"), "Codex on your Mac is online."].join("\n\n")
+      : [header("OFFLINE"), "Codex on your Mac is offline. New task messages won’t run until it reconnects."].join("\n\n");
   }
   if (event.kind === "service.menu") {
     if (event.label === "COMMANDS") return event.body ? [header("COMMANDS"), event.body, event.note].filter(Boolean).join("\n\n") : renderHelp();

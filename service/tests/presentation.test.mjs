@@ -201,3 +201,18 @@ test("relative recency and all local-control commands parse without consuming or
   assert.equal(parseSlashCommand("status"), null);
   assert.match(renderHelp(), /^CODEX CONTROL · COMMANDS/);
 });
+
+test("proactive completion and Mac presence notices have distinct compact headers", () => {
+  const completion = renderOutboundEvent({
+    kind: "thread.completed",
+    completionId: "completion-presentation",
+    thread: { title: "Ship the service", projectLabel: "iMessage handoff" },
+    completedAt: new Date().toISOString(),
+    body: "Deployed and verified.",
+  });
+  assert.match(completion, /^CODEX THREAD · IMESSAGE HANDOFF\nShip the service\n\nCOMPLETED · now\n\nDeployed and verified\.$/);
+  assert.equal(renderOutboundEvent({ kind: "service.presence", state: "online" }),
+    "CODEX CONTROL · ONLINE\n\nCodex on your Mac is online.");
+  assert.equal(renderOutboundEvent({ kind: "service.presence", state: "offline" }),
+    "CODEX CONTROL · OFFLINE\n\nCodex on your Mac is offline. New task messages won’t run until it reconnects.");
+});
