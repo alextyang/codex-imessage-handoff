@@ -24,7 +24,11 @@ export function activeDescendant(threads, activeThreadId, selectedAt) {
   if (!activeId) return null;
   const byId = new Map((threads || []).map((thread) => [String(thread?.id || ""), thread]));
   const active = byId.get(activeId);
-  if (!active || active.state === "running") return null;
+  // The desktop archives a parent when it forks into a new top-level task, so
+  // a remotely selected ancestor may no longer be present in the visible
+  // catalog. Exact full-lineage metadata still makes that descendant safe to
+  // follow. A visible running selection remains authoritative.
+  if (active?.state === "running") return null;
   const selectedMs = dateMs(selectedAt) ?? Date.now();
   return [...byId.values()]
     .filter((thread) => thread?.id !== activeId

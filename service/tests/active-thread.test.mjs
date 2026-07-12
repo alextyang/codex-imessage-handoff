@@ -55,3 +55,20 @@ test("follows a grandchild through a hidden parent without jumping to a sibling"
   assert.equal(activeDescendant(threads, "selected", selectedAt), null,
     "a newer running sibling must not be mistaken for a descendant");
 });
+
+test("follows a running fork when its selected parent has been archived out of the catalog", () => {
+  const threads = [
+    row("archived-parent-child", {
+      forkedFromId: "archived-parent",
+      lineageAncestorIds: ["archived-parent"],
+      state: "running",
+      activityAt: "2026-07-12T20:05:00.000Z",
+    }),
+    row("unrelated", {
+      lineageAncestorIds: ["other-root"],
+      state: "running",
+      activityAt: "2026-07-12T20:06:00.000Z",
+    }),
+  ];
+  assert.equal(activeDescendant(threads, "archived-parent", selectedAt)?.id, "archived-parent-child");
+});
