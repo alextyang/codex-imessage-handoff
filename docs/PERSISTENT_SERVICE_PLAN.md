@@ -48,16 +48,23 @@ The user must be able to distinguish three message classes immediately:
 - **Service state** — connection, switching, queueing, cancellation, or errors.
 - **Menus** — choices or short command help that require user input.
 
-The distinction is made by a compact header generated outside the model. No
-emoji, decorative boxes, signatures, or repeated instructional footers are used
-by default.
+The distinction is made by a compact semantic header generated outside the
+model. Unicode structure and a small symbol vocabulary improve scanning without
+pretending that plain text is rich text. Every symbol is paired with a word, and
+words stay in normal Unicode letters rather than faux mathematical bold.
+
+Every task receives one stable object emoji derived deterministically from its
+canonical thread ID. The emoji is identity, not state: it follows the task
+through menus, switches, live updates, results, and background completions.
 
 ### Quiet by default
 
 - Use the native typing indicator instead of sending “working” messages for
   ordinary turns.
 - Show commands only when requested or when the user needs to make a choice.
-- Do not append help text to normal thread responses.
+- Do not append general help text to normal thread responses.
+- Append the compact active-context footer to every outbound part so a user can
+  always tell where the next ordinary message will go.
 - Do not announce internal reconnects, catalog syncs, retries, or process IDs.
 - Send progress only for materially long work and only when state has changed.
 - Keep failures actionable and specific.
@@ -73,98 +80,166 @@ the service.
 
 ### Header grammar
 
-Use one consistent masthead and restrained divider:
+Use one consistent natural-case masthead. The leading symbol conveys category
+at a glance, while the following words preserve the meaning in every client:
 
 ```text
-CODEX CONTROL · <LABEL>
-────────────────────────
-
-CODEX THREAD · <PROJECT>
-────────────────────────
+✓ CODEX · Result
+◆ CODEX · Threads
+↪ CODEX · Context Switched
+◷ CODEX · Pending
+▲ CODEX · Needs Attention
 ```
 
-Labels are short and meaningful:
+Use symbols deliberately: `✓` completed or connected, `◆` neutral views, `↪`
+context changes, `●` active work, `◷` pending work, `○` idle, `▲` attention,
+and `×` cancellation or disconnection. Never show a symbol without its text
+label. Keep actual words in natural case; do not substitute mathematical
+alphanumeric glyphs to simulate bold.
 
-- `THREADS`, `PROJECTS`, or `COMMANDS` for menus;
-- `SWITCHED`, `CONNECTED`, `CANCELLED`, or
-  `NEEDS ATTENTION` for service messages.
+Headers are rendered by the presentation layer after model execution. They are
+never stored in Codex conversation history.
 
-Headers are rendered by the relay presentation layer after model execution.
-They are never stored in Codex conversation history.
+Every task reference starts with its stable generated object emoji. The footer
+is the only restrained rule and always names the selected destination:
+
+```text
+────────────
+⌁ Active context
+Music crawler › 🧭 Fix album metadata
+```
+
+Use `Now active` after an intentional switch and `Active context unchanged`
+for notifications about connectivity or a different task. If nothing is
+selected, render `⌁ No active task · /threads` instead.
 
 ### Thread output
 
 ```text
-CODEX CONTROL · SWITCHED
-────────────────────────
+↪ CODEX · Context Switched
 
-PROJECT · MUSIC CRAWLER
-Fix album metadata
+🧭 Fix album metadata
+Music crawler
 
-[SELECTED] Context is active.
+New messages now go to this task.
 
-ACTIONS
+Commands
 /thread · /threads
+
+────────────
+⌁ Now active
+Music crawler › 🧭 Fix album metadata
 ```
 
-The control header is immediately followed by the local task view:
+The result view uses the same identity:
 
 ```text
-CODEX THREAD · MUSIC CRAWLER
-────────────────────────
+✓ CODEX · Result
 
-Fix album metadata
+🧭 Fix album metadata
+Music crawler
 
-RESULT
 The scraper now retries failed artist pages and all 42 tests pass.
+
+────────────
+⌁ Active context
+Music crawler › 🧭 Fix album metadata
 ```
 
 The assistant body is otherwise unchanged except for surrounding-whitespace
 normalization and message-length splitting. Plain-text hierarchy is transport
 chrome and is never injected into the Codex task.
 
-If a response requires multiple bubbles, every continuation is identifiable:
+If a response requires multiple bubbles, every part repeats both its part count
+and its context footer:
 
 ```text
-CODEX THREAD · MUSIC CRAWLER · 2/3
-────────────────────────
+✓ CODEX · Result · 2/3
+
+…continued response…
+
+────────────
+⌁ Active context
+Music crawler › 🧭 Fix album metadata
+```
+
+Live mirroring stays conversational instead of repeating a full masthead on
+every update. The speaker, phase, and provenance remain explicit:
+
+```text
+You · Mirrored from Mac · now
+
+Please rerun the tests after that change.
+
+────────────
+⌁ Active context
+Music crawler › 🧭 Fix album metadata
+```
+
+```text
+Codex · Update · now
+
+I found the failing assertion and I’m checking its callers.
+
+────────────
+⌁ Active context
+Music crawler › 🧭 Fix album metadata
+```
+
+A background completion names both the source task and the still-selected
+destination. It must not imply that completing another task changed context:
+
+```text
+✓ CODEX · Completed Elsewhere
+
+📦 Retry failed imports
+Music crawler
+✓ Completed · now
+
+All import checks pass.
+
+────────────
+⌁ Active context unchanged
+Music crawler › 🧭 Fix album metadata
 ```
 
 ### Thread menu
 
 ```text
-CODEX CONTROL · THREADS
-────────────────────────
+◆ CODEX · Threads
 
-12 TASKS · UPDATED NOW
-Pending + activity in last 48h
+12 tasks · pending + activity in last 48h · updated now
 
-PROJECT · MUSIC CRAWLER · 2 TASKS
+▾ Music crawler · 2 tasks
 
-1. Fix album metadata
-   [SELECTED] [IDLE] 5m ago
-   › Normalize the album dates.
+1  🧭 Fix album metadata
+   ⌁ Active · ○ Idle · 5m ago
+   “Normalize the album dates.”
 
-2. Retry failed imports
-   [WORKING] 2m
-   › Retry the failed artist imports.
+2  📦 Retry failed imports
+   ● Working · for 2m
+   “Retry the failed artist imports.”
 
-PROJECT · IMESSAGE HANDOFF · 1 TASK
+▾ iMessage handoff · 1 task
 
-3. Improve thread menu
-   [PENDING] 1m ago
-   › Improve message hierarchy.
+3  📐 Improve thread menu
+   ◷ Pending · waiting 1m
+   “Improve message hierarchy.”
 
-RECENT PROJECTS
+Recent projects
 
-4. Portfolio
-   4 tasks · [IDLE] 1h ago
+4  ▸ Portfolio · 4 tasks
+   ○ Idle · 1h ago
 
-REPLY
+Reply
 Reply with a number to open.
 
-OPTIONS
+Commands
 /refresh · /projects · /search
+
+────────────
+⌁ Active context
+Music crawler › 🧭 Fix album metadata
 ```
 
 The menu is a stable snapshot. Its numbering must not reorder while the user is
@@ -174,7 +249,7 @@ local service for a fresh menu rather than switching to the wrong thread.
 Build the directory locally on demand. For each project, show every task with
 pending work first, then every remaining task whose actual latest rollout turn
 is within 48 hours. Omit projects without a qualifying task. Codex tasks listed
-in `projectless-thread-ids` share a final `OTHER TASKS` section. Every task row
+in `projectless-thread-ids` share a final `Other tasks` section. Every task row
 shows a short, single-line preview of its newest user request. Send that preview
 transiently for delivery and persist only the ordered task IDs used by numeric
 selection.
@@ -185,17 +260,27 @@ unless the user explicitly asks for diagnostic information.
 ### Context switch
 
 ```text
-CODEX THREAD · MUSIC CRAWLER
-Fix album metadata
-Idle · 5m ago · Reasoning high
+◆ CODEX · Thread
+
+🧭 Fix album metadata
+Music crawler
+
+○ Idle · 5m ago · Reasoning: High
+
+Commands
 /request · /turn · /history · /reasoning
 
-YOU · 7m ago
+You · 7m ago
 Please normalize the album metadata…
-/request shows the full message
 
-CODEX · 5m ago
+Note · /request shows the full message.
+
+Codex · Result · 5m ago
 The complete final response from the last turn appears here.
+
+────────────
+⌁ Active context
+Music crawler › 🧭 Fix album metadata
 ```
 
 The second line is a short project label only when it disambiguates the thread.
@@ -213,16 +298,19 @@ only in `/help` initially, not in every thread menu.
 Existing paired users see one migration confirmation:
 
 ```text
-CODEX CONTROL · CONNECTED
+◆ CODEX · Connected
 
 iMessage is linked to Codex on Alex’s Mac.
 12 recent threads are available.
 
 Text /threads to choose one.
+
+────────────
+⌁ No active task · /threads
 ```
 
 Fresh installs retain the current six-character pairing flow. After the code is
-accepted, the same `CONNECTED` message is used. Pairing codes, relay URLs,
+accepted, the same `Connected` message is used. Pairing codes, relay URLs,
 tokens, hook details, and setup commands are not mixed into normal conversation.
 
 ### Progress
@@ -233,10 +321,13 @@ progress bubble is necessary.
 For longer work, the service may send:
 
 ```text
-CODEX CONTROL · WORKING
+● CODEX · Still Working
 
-Music crawler
 Running the test suite after updating the retry logic.
+
+────────────
+⌁ Active context
+Music crawler › 🧭 Fix album metadata
 ```
 
 Progress policy:
@@ -257,10 +348,19 @@ categories. It is not authored by a hidden model prompt.
 ### Queue and busy state
 
 ```text
-CODEX CONTROL · PENDING
+◷ CODEX · Pending
 
-Music crawler is already running in Codex.
-Your message will start when the thread is available.
+About
+🧭 Fix album metadata
+Music crawler
+
+Details
+This task is already running in Codex.
+Your message will start when it is available.
+
+────────────
+⌁ Active context
+Music crawler › 🧭 Fix album metadata
 ```
 
 Only send this when execution cannot begin promptly. Claim each notified relay
@@ -271,28 +371,48 @@ an execution slot. A user can inspect it with `/status` or remove it with
 ### Cancellation
 
 ```text
-CODEX CONTROL · CANCELLED
+× CODEX · Cancelled
 
-Music crawler stopped at your request.
+About
+🧭 Fix album metadata
+Music crawler
+
+Details
+The run stopped at your request.
+
+────────────
+⌁ Active context
+Music crawler › 🧭 Fix album metadata
 ```
 
 If nothing is running:
 
 ```text
-CODEX CONTROL · NEEDS ATTENTION
+▲ CODEX · Needs Attention
 
+Details
 There is no active Codex run to cancel.
+
+────────────
+⌁ Active context
+Music crawler › 🧭 Fix album metadata
 ```
 
 ### Errors
 
-Errors use `NEEDS ATTENTION`, a one-sentence explanation, and one next action.
+Errors use `Needs Attention`, a one-sentence explanation, and one next action.
 
 ```text
-CODEX CONTROL · NEEDS ATTENTION
+▲ CODEX · Needs Attention
 
-Music crawler no longer exists on this Mac.
-Text /threads to choose another thread.
+Details
+The selected task no longer exists on this Mac.
+
+Commands
+/threads · Choose another task
+
+────────────
+⌁ No active task · /threads
 ```
 
 Do not expose stack traces, HTTP codes, database terminology, Cloudflare
@@ -328,21 +448,33 @@ Initial commands:
 `/help` renders:
 
 ```text
-CODEX CONTROL · COMMANDS
+◆ CODEX · Commands
 
-/threads       Choose a recent thread
-/search words  Find a thread
-/projects      Browse by project
-/thread        Show the selected task
-/request       Show its full latest request
-/turn          Show its current or last turn
-/history 3     Show completed turn history
-/reasoning     Show or change reasoning
-/dismiss       Dismiss the oldest failed request
-/cancel        Stop current work
+Browse
+/threads · Tasks by project
+/refresh · Refresh the task list
+/search words · Find a task
+/projects · Browse all projects
 
+Active task
+/thread · Status and latest response
+/request · Full latest request
+/turn · Current or last turn
+/history 3 · Completed turn history
+/reasoning · View or change reasoning
+
+Work
+/cancel · Stop iMessage-started work
+/retry · Retry the oldest failed request
+/dismiss · Clear the oldest failed request
+
+Menu replies
 In a thread menu, reply with a number to switch.
 You can also send “2: your message” to switch and continue.
+
+────────────
+⌁ Active context
+Music crawler › 🧭 Fix album metadata
 ```
 
 Unknown `/commands` show a concise correction and this menu. Unknown ordinary

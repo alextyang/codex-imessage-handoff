@@ -1,6 +1,6 @@
 import { CODEX_CONTACT_IMAGE_BASE64 } from "./contact-card-image.ts";
-import { parseMenuSelection, parseSlashCommand, relativeTime, renderHelp, renderOutboundEvent, renderThreadDirectory, renderThreadMenu, threadHeader, threadTitle } from "../../protocol/presentation.ts";
-import type { OutboundEvent, MenuItem } from "../../protocol/presentation.ts";
+import { parseMenuSelection, parseSlashCommand, renderContextFooter, renderHelp, renderOutboundEvent, renderThreadDirectory, renderThreadMenu } from "../../protocol/presentation.ts";
+import type { OutboundEvent, MenuItem, ThreadLabel } from "../../protocol/presentation.ts";
 import type {
   Env,
   InstallationPairingRow,
@@ -892,6 +892,12 @@ async function findThread(env: Env, threadId: string) {
     .first<HandoffThreadRow>();
 }
 
+async function activeThreadLabel(env: Env, binding: PhoneBindingRow | null): Promise<ThreadLabel | null> {
+  if (!binding?.active_thread_id) return null;
+  const thread = await findThread(env, binding.active_thread_id);
+  return thread?.owner_id === binding.owner_id ? threadLabel(thread) : null;
+}
+
 function assertAuthorized(thread: HandoffThreadRow | null, ownerId: string) {
   if (!thread) {
     throw Object.assign(new Error("Thread not found."), { status: 404 });
@@ -1437,49 +1443,20 @@ async function handleServiceOutbound(request: Request, env: Env) {
   const directoryReferences = event.kind === "service.directory"
     ? await serviceDirectoryReferences(env, ownerId, event)
     : null;
-  const rendered = renderOutboundEvent(event);
+  const resolvedActiveThread = await activeThreadLabel(env, binding);
+  const activeThread = resolvedActiveThread
+    ?? (binding.active_thread_id && "thread" in event && event.thread?.id === binding.active_thread_id ? event.thread : null);
+  const presentation = { context: { activeThread } };
+  const rendered = renderOutboundEvent(event, presentation);
   const chunks: string[] = [];
-  if (event.kind === "thread.live-message" && rendered.length > SENDBLUE_TEXT_LIMIT) {
-    const bodyChunks = splitText(event.body, SENDBLUE_CHUNK_BODY_LIMIT);
+  if ((event.kind === "thread.live-message" || event.kind === "thread.output" || event.kind === "thread.completed") && rendered.length > SENDBLUE_TEXT_LIMIT) {
+    const bodyChunks = splitText(event.body, multipartBodyLimit(activeThread));
     for (let index = 0; index < bodyChunks.length; index += 1) {
-      const renderedPart = renderOutboundEvent({ ...event, body: bodyChunks[index] });
-      const baseHeader = renderedPart.slice(0, renderedPart.indexOf("\n\n"));
-      chunks.push(`${multipartHeader(baseHeader, index + 1, bodyChunks.length)}${renderedPart.slice(baseHeader.length)}`);
-    }
-  } else if ((event.kind === "thread.output" || event.kind === "thread.completed") && rendered.length > SENDBLUE_TEXT_LIMIT) {
-    const bodyChunks = splitText(event.body, SENDBLUE_CHUNK_BODY_LIMIT);
-    for (let index = 0; index < bodyChunks.length; index += 1) {
-      const context = `${threadHeader(event.thread, { index: index + 1, total: bodyChunks.length })}\n\n${threadTitle(event.thread)}`;
-      const completion = event.kind === "thread.completed" ? `\n[COMPLETED] ${relativeTime(event.completedAt)}` : "";
-      chunks.push(`${context}${completion}\n\nRESULT\n${bodyChunks[index]}`);
-    }
-  } else if (rendered.length > SENDBLUE_TEXT_LIMIT && "thread" in event && event.thread) {
-    const renderedChunks = splitText(rendered, SENDBLUE_CHUNK_BODY_LIMIT, true);
-    const baseHeader = rendered.slice(0, rendered.indexOf("\n\n"));
-    for (let index = 0; index < renderedChunks.length; index += 1) {
-      const partHeader = multipartHeader(baseHeader, index + 1, renderedChunks.length);
-      if (index === 0) {
-        chunks.push(renderedChunks[index].startsWith(baseHeader)
-          ? `${partHeader}${renderedChunks[index].slice(baseHeader.length)}`
-          : renderedChunks[index]);
-      } else {
-        const continuation = `${partHeader}\n\n${threadTitle(event.thread)}\n\nCONTINUED\n`;
-        chunks.push(`${continuation}${renderedChunks[index]}`);
-      }
+      const part = { index: index + 1, total: bodyChunks.length };
+      chunks.push(ensurePartLabel(renderOutboundEvent({ ...event, body: bodyChunks[index] }, { ...presentation, part }), part));
     }
   } else if (rendered.length > SENDBLUE_TEXT_LIMIT) {
-    const renderedChunks = splitText(rendered, SENDBLUE_CHUNK_BODY_LIMIT, true);
-    const baseHeader = rendered.slice(0, rendered.indexOf("\n\n"));
-    for (let index = 0; index < renderedChunks.length; index += 1) {
-      const partHeader = multipartHeader(baseHeader, index + 1, renderedChunks.length);
-      if (index === 0) {
-        chunks.push(renderedChunks[index].startsWith(baseHeader)
-          ? `${partHeader}${renderedChunks[index].slice(baseHeader.length)}`
-          : renderedChunks[index]);
-      } else {
-        chunks.push(`${partHeader}\n\n${renderedChunks[index]}`);
-      }
-    }
+    chunks.push(...splitRenderedEvent(event, rendered, activeThread));
   } else {
     chunks.push(rendered);
   }
@@ -1547,12 +1524,49 @@ async function handleServiceOutbound(request: Request, env: Env) {
   return json({ ok: true, notification: { sent: true, status: result?.status, messageHandle: result?.messageHandle, parts: chunks.length } });
 }
 
-const STRUCTURED_BLOCK_START = /^(?:\d+\. |ACTIONS$|CODEX(?: · .+)?$|CURRENT(?: \/ LAST TURN)?$|DETAILS$|LATEST REQUEST$|MENU REPLIES$|NOTE$|OPTIONS$|PROGRESS$|PROJECT · .+$|RECENT PROJECTS$|REPLY$|RESULT$|TIP(?: · .+)?$|TURN \d+(?: · .+)?$|YOU(?: · .+)?$)/;
+const STRUCTURED_BLOCK_START = /^(?:[◆✓●↪×▲◷] CODEX · |\d+\s{2}|▾ |About$|Active task$|Browse$|Codex(?: · .+)?$|Commands$|Current(?: \/ last turn)?$|Details$|Menu replies$|Note$|Options$|Recent projects$|Reply$|Turn \d+(?: · .+)?$|You(?: · .+)?$)/i;
 
-function multipartHeader(baseHeader: string, index: number, total: number) {
-  const lineEnd = baseHeader.indexOf("\n");
-  if (lineEnd < 0) return `${baseHeader} · ${index}/${total}`;
-  return `${baseHeader.slice(0, lineEnd)} · ${index}/${total}${baseHeader.slice(lineEnd)}`;
+function multipartBodyLimit(activeThread: ThreadLabel | null) {
+  // Leave room for the per-part header and context footer while keeping each
+  // provider payload comfortably below Sendblue's documented text ceiling.
+  return Math.max(1_000, SENDBLUE_CHUNK_BODY_LIMIT - renderContextFooter(activeThread).length - 240);
+}
+
+function ensurePartLabel(rendered: string, part: { index: number; total: number }) {
+  const firstLineEnd = rendered.indexOf("\n");
+  const firstLine = firstLineEnd < 0 ? rendered : rendered.slice(0, firstLineEnd);
+  const marker = ` · ${part.index}/${part.total}`;
+  if (firstLine.includes(marker)) return rendered;
+  return `${firstLine}${marker}${firstLineEnd < 0 ? "" : rendered.slice(firstLineEnd)}`;
+}
+
+function renderedContentAndFooter(rendered: string) {
+  const marker = "\n\n────────────\n";
+  const index = rendered.lastIndexOf(marker);
+  if (index < 0) return { content: rendered.trim(), footer: "" };
+  return { content: rendered.slice(0, index).trim(), footer: rendered.slice(index + 2).trim() };
+}
+
+function splitRenderedEvent(event: OutboundEvent, rendered: string, activeThread: ThreadLabel | null) {
+  const { content, footer } = renderedContentAndFooter(rendered);
+  const contentChunks = splitText(content, multipartBodyLimit(activeThread), true);
+  const total = contentChunks.length;
+  return contentChunks.map((contentChunk, index) => {
+    const part = { index: index + 1, total };
+    const renderedPart = renderOutboundEvent(event, { context: { activeThread }, part });
+    const partFirstLine = ensurePartLabel(renderedPart, part).split("\n", 1)[0];
+    const firstLineEnd = contentChunk.indexOf("\n");
+    const chunkFirstLine = firstLineEnd < 0 ? contentChunk : contentChunk.slice(0, firstLineEnd);
+    const contentWithHeader = index === 0
+      ? `${partFirstLine}${firstLineEnd < 0 ? "" : contentChunk.slice(firstLineEnd)}`
+      : `${partFirstLine}\n\nContinued\n${contentChunk}`;
+    // If a structured split unexpectedly starts on a header, do not carry two
+    // headers into part one.
+    const normalized = index === 0 && chunkFirstLine === partFirstLine
+      ? contentChunk
+      : contentWithHeader;
+    return `${ensurePartLabel(normalized, part)}${footer ? `\n\n${footer}` : ""}`;
+  });
 }
 
 function keepStructuredBlockTogether(value: string, index: number, minimum: number) {
@@ -1571,15 +1585,35 @@ function splitText(value: string, maxLength: number, keepStructure = false) {
   const chunks: string[] = [];
   let remaining = value.trim();
   while (remaining.length > maxLength) {
+    const minimum = Math.floor(maxLength * 0.6);
     let index = remaining.lastIndexOf("\n", maxLength);
-    if (index < Math.floor(maxLength * 0.6)) index = remaining.lastIndexOf(" ", maxLength);
-    if (index < 1) index = maxLength;
-    if (keepStructure) index = keepStructuredBlockTogether(remaining, index, Math.floor(maxLength * 0.6));
+    if (index < minimum) {
+      const space = remaining.lastIndexOf(" ", maxLength);
+      index = space >= minimum ? space : safeGraphemeBoundary(remaining, maxLength);
+    }
+    if (keepStructure) index = keepStructuredBlockTogether(remaining, index, minimum);
     chunks.push(remaining.slice(0, index).trim());
     remaining = remaining.slice(index).trim();
   }
   if (remaining) chunks.push(remaining);
   return chunks.length ? chunks : [""];
+}
+
+function safeGraphemeBoundary(value: string, requestedIndex: number) {
+  const Segmenter = (Intl as unknown as { Segmenter?: new (...args: unknown[]) => { segment(input: string): Iterable<{ index: number }> } }).Segmenter;
+  if (Segmenter) {
+    const segmenter = new Segmenter(undefined, { granularity: "grapheme" });
+    let boundary = 0;
+    for (const segment of segmenter.segment(value)) {
+      if (segment.index > requestedIndex) break;
+      boundary = segment.index;
+    }
+    if (boundary > 0) return boundary;
+  }
+  let boundary = Math.min(requestedIndex, value.length);
+  const code = value.charCodeAt(boundary);
+  if (boundary > 0 && code >= 0xdc00 && code <= 0xdfff) boundary -= 1;
+  return Math.max(1, boundary);
 }
 
 async function findPhoneBinding(env: Env, phoneNumber: string) {
@@ -1632,7 +1666,10 @@ async function sendPresenceNotification(
   const activity = notificationActivity(binding);
   if (!binding) return { terminal: true, status: "NO_BINDING" };
   if (!activity.active) return { terminal: true, status: "INACTIVE" };
-  await sendSendblueMessage(env, binding.phone_number, renderOutboundEvent({ kind: "service.presence", state }));
+  await sendSendblueMessage(env, binding.phone_number, renderOutboundEvent(
+    { kind: "service.presence", state },
+    { context: { activeThread: await activeThreadLabel(env, binding) } },
+  ));
   return { terminal: true, status: "SENT" };
 }
 
@@ -1763,21 +1800,12 @@ function threadDisplayName(thread: HandoffThreadRow) {
   return cwdName || thread.id;
 }
 
-function quotedThreadDisplayName(thread: HandoffThreadRow) {
-  return `"${threadDisplayName(thread).replaceAll('"', "'")}"`;
-}
-
 function handoffActivationMessage(thread: HandoffThreadRow) {
-  // This is sent to iMessage when a paired user starts or switches a thread.
-  // Keep it short because it appears as a normal chat message.
-  const connectionLine = thread.title?.trim()
-    ? `You’re connected to ${quotedThreadDisplayName(thread)} on Codex.`
-    : "You’re connected to this Codex thread.";
-  return [
-    connectionLine,
-    thread.handoff_summary?.trim() || null,
-    "What do you want to do next?",
-  ].filter(Boolean).join("\n\n");
+  const activeThread = threadLabel(thread);
+  return renderOutboundEvent(
+    { kind: "service.switched", thread: activeThread },
+    { context: { activeThread } },
+  );
 }
 
 function threadLabel(thread: HandoffThreadRow) {
@@ -2147,11 +2175,14 @@ async function startTypingAndSendOwnerControl(
 ) {
   const delivered = await sendOwnerControl(env, binding.owner_id, command, binding.active_thread_id, argument);
   if (!delivered) {
-    await sendControlMessage(env, binding.phone_number, renderOutboundEvent({
-      kind: "service.notice",
-      code: "needs-attention",
-      body: "The local Codex service is offline. Try again after it reconnects.",
-    }));
+    await sendControlMessage(env, binding.phone_number, renderOutboundEvent(
+      {
+        kind: "service.notice",
+        code: "needs-attention",
+        body: "The local Codex service is offline. Try again after it reconnects.",
+      },
+      { context: { activeThread: await activeThreadLabel(env, binding) } },
+    ));
     return false;
   }
   try {
@@ -2590,14 +2621,21 @@ async function handleStatus(request: Request, env: Env, threadId: string) {
     const binding = await findDeliveryBinding(env, thread);
     if (binding) {
       try {
+        const subject = threadLabel(thread);
+        const active = await activeThreadLabel(env, binding);
         if (generatedImages.length > 0 && thread.catalog_source === "service") {
-          await sendSendblueMessage(env, binding.phone_number, [
-            threadHeader(threadLabel(thread)),
-            threadDisplayName(thread),
-            "Generated output follows.",
-          ].join("\n\n"));
+          await sendSendblueMessage(env, binding.phone_number, renderOutboundEvent(
+            { kind: "service.notice", code: "updated", body: "Generated output follows.", thread: subject },
+            { context: { activeThread: active } },
+          ));
         }
-        const sendResult = await sendStatusNotification(env, binding.phone_number, lastAssistantMessage, generatedImages);
+        const presentedAssistantMessage = lastAssistantMessage
+          ? renderOutboundEvent(
+            { kind: "thread.output", thread: subject, body: lastAssistantMessage },
+            { context: { activeThread: active } },
+          )
+          : null;
+        const sendResult = await sendStatusNotification(env, binding.phone_number, presentedAssistantMessage, generatedImages);
         if (sendResult) {
           notification = {
             sent: true,
@@ -2773,11 +2811,13 @@ async function handleSendblueWebhook(request: Request, env: Env, ctx?: WaitUntil
         console.warn("Sendblue contact card failed.");
       }
     }
+    const active = activeThreadId ? threads.find((thread) => thread.id === activeThreadId) ?? null : null;
+    const activeLabel = active ? threadLabel(active) : null;
     await sendControlMessage(env, fromNumber, renderOutboundEvent({
       kind: "service.notice",
       code: "connected",
       body: `${threads.length} recent thread${threads.length === 1 ? " is" : "s are"} available.\n\nText /threads to choose one.`,
-    }));
+    }, { context: { activeThread: activeLabel } }));
     return json({ ok: true, paired: true, threadId: activeThreadId, service: true });
   }
   if (pairingThread) {
@@ -2844,6 +2884,8 @@ async function handleSendblueWebhook(request: Request, env: Env, ctx?: WaitUntil
     return json({ ok: true, ignored: true });
   }
   await recordUserMessageActivity(env, binding);
+  const activeContext = await activeThreadLabel(env, binding);
+  const contextOptions = { context: { activeThread: activeContext } };
 
   const commandText = content?.trim().toLowerCase() ?? "";
   const slashCommand = content ? parseSlashCommand(content) : null;
@@ -2874,7 +2916,7 @@ async function handleSendblueWebhook(request: Request, env: Env, ctx?: WaitUntil
       ? { rowLimit: 10, collapsedLimit: 10, expandedProjectLimit: 4, extended: true }
       : {});
     await saveMenuSnapshot(env, binding, [], planned.references);
-    await sendControlMessage(env, fromNumber, renderThreadDirectory(planned.directory, { now: new Date() }));
+    await sendControlMessage(env, fromNumber, renderThreadDirectory(planned.directory, { now: new Date(), ...contextOptions }));
     if (externalId && binding.active_thread_id) {
       await insertHandoffReply(env, binding.active_thread_id, content ?? "", externalId, "applied");
     }
@@ -2887,7 +2929,7 @@ async function handleSendblueWebhook(request: Request, env: Env, ctx?: WaitUntil
   }
 
   if (!mediaUrl && slashCommand?.command === "help") {
-    await sendControlMessage(env, fromNumber, renderHelp());
+    await sendControlMessage(env, fromNumber, renderHelp(contextOptions));
     await recordAppliedControl(env, binding, content, externalId);
     return json({ ok: true, command: "help" });
   }
@@ -2909,7 +2951,7 @@ async function handleSendblueWebhook(request: Request, env: Env, ctx?: WaitUntil
         kind: "service.notice",
         code: "needs-attention",
         body: "No thread is selected.\nText /threads to choose one.",
-      }));
+      }, contextOptions));
       return json({ ok: true, command: slashCommand.command, routed: false });
     }
     const argument = slashCommand.command === "status"
@@ -2926,7 +2968,7 @@ async function handleSendblueWebhook(request: Request, env: Env, ctx?: WaitUntil
       .filter((thread) => !query || `${thread.title ?? ""} ${thread.project_label ?? ""}`.toLowerCase().includes(query))
       .slice(0, 8);
     await saveMenuSnapshot(env, binding, [], threads.map((thread) => `thread:${thread.id}`));
-    await sendControlMessage(env, fromNumber, renderThreadMenu(menuItems(threads, binding.active_thread_id)));
+    await sendControlMessage(env, fromNumber, renderThreadMenu(menuItems(threads, binding.active_thread_id), contextOptions));
     await recordAppliedControl(env, binding, content, externalId);
     return json({ ok: true, command: "search", threadCount: threads.length });
   }
@@ -2944,6 +2986,7 @@ async function handleSendblueWebhook(request: Request, env: Env, ctx?: WaitUntil
     await sendControlMessage(env, fromNumber, renderThreadMenu(items, {
       label: "PROJECTS",
       note: "Reply with a number to browse that project.\n\n/threads · /search · /help",
+      ...contextOptions,
     }));
     await recordAppliedControl(env, binding, content, externalId);
     return json({ ok: true, command: "projects", projectCount: groups.length });
@@ -2956,17 +2999,18 @@ async function handleSendblueWebhook(request: Request, env: Env, ctx?: WaitUntil
         kind: "service.notice",
         code: "needs-attention",
         body: "The local Codex service is offline. There is no connected run to cancel.",
-      }));
+      }, contextOptions));
     }
     await recordAppliedControl(env, binding, content, externalId);
     return json({ ok: true, command: "cancel", routed });
   }
 
   if (!mediaUrl && content?.trim().startsWith("/") && !slashCommand) {
-    await sendControlMessage(env, fromNumber, [
-      renderOutboundEvent({ kind: "service.notice", code: "needs-attention", body: "That command is not available." }),
-      renderHelp(),
-    ].join("\n\n"));
+    await sendControlMessage(env, fromNumber, renderOutboundEvent(
+      { kind: "service.notice", code: "needs-attention", body: "That command is not available." },
+      contextOptions,
+    ));
+    await sendControlMessage(env, fromNumber, renderHelp(contextOptions));
     await recordAppliedControl(env, binding, content, externalId);
     return json({ ok: true, command: "unknown" });
   }
@@ -2980,7 +3024,7 @@ async function handleSendblueWebhook(request: Request, env: Env, ctx?: WaitUntil
         kind: "service.notice",
         code: "needs-attention",
         body: "That menu expired. A fresh directory is on the way; reply with a new number.",
-      }));
+      }, contextOptions));
       const routed = await startTypingAndSendOwnerControl(env, binding, "threads", "refresh");
       await recordAppliedControl(env, binding, content, externalId);
       return json({ ok: true, command: "stale-menu", refreshed: routed });
@@ -2992,8 +3036,8 @@ async function handleSendblueWebhook(request: Request, env: Env, ctx?: WaitUntil
       kind: "service.notice",
       code: "needs-attention",
       body: "That menu expired. Here is a fresh directory; reply with a new number.",
-    }));
-    await sendControlMessage(env, fromNumber, renderThreadDirectory(planned.directory, { now: new Date() }));
+    }, contextOptions));
+    await sendControlMessage(env, fromNumber, renderThreadDirectory(planned.directory, { now: new Date(), ...contextOptions }));
     if (externalId && binding.active_thread_id) {
       await insertHandoffReply(env, binding.active_thread_id, content, externalId, "applied", null, binding.owner_id);
     }
@@ -3010,14 +3054,14 @@ async function handleSendblueWebhook(request: Request, env: Env, ctx?: WaitUntil
           kind: "service.notice",
           code: "needs-attention",
           body: "That project is no longer available.\nText /threads for a fresh list.",
-        }));
+        }, contextOptions));
         return json({ ok: true, command: "project", projectKey, threadCount: 0 });
       }
       await saveMenuSnapshot(env, binding, [], planned.references);
       if (selection.prompt) {
         planned.directory.note = "Choose a task first. The text after the project number was not sent; use “N: your message” on this task list.";
       }
-      await sendControlMessage(env, fromNumber, renderThreadDirectory(planned.directory, { now: new Date() }));
+      await sendControlMessage(env, fromNumber, renderThreadDirectory(planned.directory, { now: new Date(), ...contextOptions }));
       await recordAppliedControl(env, binding, content, externalId);
       return json({ ok: true, command: "project", projectKey, threadCount: planned.references.length, promptNotSent: Boolean(selection.prompt) });
     }
@@ -3034,7 +3078,7 @@ async function handleSendblueWebhook(request: Request, env: Env, ctx?: WaitUntil
         kind: "service.notice",
         code: "needs-attention",
         body: "That menu has changed.\nText /threads for a fresh list.",
-      }));
+      }, contextOptions));
       if (externalId && binding.active_thread_id) {
         await insertHandoffReply(env, binding.active_thread_id, content, externalId, "applied");
       }
@@ -3044,8 +3088,9 @@ async function handleSendblueWebhook(request: Request, env: Env, ctx?: WaitUntil
     const serviceOnline = Boolean(persistentService) && await isServiceSocketConnected(env, binding.owner_id);
     const contextChanged = binding.active_thread_id !== selected.id;
     await setActiveThreadForOwner(env, binding.owner_id, selected.id);
+    const selectedContext = { context: { activeThread: threadLabel(selected) } };
     if (contextChanged && persistentService) {
-      await sendControlMessage(env, fromNumber, renderOutboundEvent({ kind: "service.switched", thread: threadLabel(selected) }));
+      await sendControlMessage(env, fromNumber, renderOutboundEvent({ kind: "service.switched", thread: threadLabel(selected) }, selectedContext));
     }
     if (selection.prompt) {
       if ((persistentService || selected.catalog_source === "service") && !serviceOnline) {
@@ -3053,7 +3098,7 @@ async function handleSendblueWebhook(request: Request, env: Env, ctx?: WaitUntil
           kind: "service.notice",
           code: "needs-attention",
           body: "The local Codex service is offline. Your message was not queued; try again after it reconnects.",
-        }));
+        }, selectedContext));
         return json({ ok: true, command: "switch-and-send", switched: true, threadId: selected.id, serviceOffline: true });
       }
       const replyId = await insertHandoffReply(env, selected.id, selection.prompt, externalId, "pending", null, serviceOnline ? binding.owner_id : null);
@@ -3068,14 +3113,14 @@ async function handleSendblueWebhook(request: Request, env: Env, ctx?: WaitUntil
   }
 
   if (!binding.active_thread_id) {
-    await sendControlMessage(env, fromNumber, renderOutboundEvent({ kind: "service.notice", code: "needs-attention", body: "No thread is selected.\nText /threads to choose one." }));
+    await sendControlMessage(env, fromNumber, renderOutboundEvent({ kind: "service.notice", code: "needs-attention", body: "No thread is selected.\nText /threads to choose one." }, { context: { activeThread: null } }));
     return json({ ok: true, ignored: true, noActiveThread: true });
   }
 
   const activeThread = await findThread(env, binding.active_thread_id);
   if (!activeThread || activeThread.handoff_enabled !== 1 || activeThread.visible === 0 || activeThread.archived === 1) {
     await setActiveThreadForOwner(env, binding.owner_id, null);
-    await sendControlMessage(env, fromNumber, renderOutboundEvent({ kind: "service.notice", code: "needs-attention", body: "The selected thread is no longer available.\nText /threads to choose another." }));
+    await sendControlMessage(env, fromNumber, renderOutboundEvent({ kind: "service.notice", code: "needs-attention", body: "The selected thread is no longer available.\nText /threads to choose another." }, { context: { activeThread: null } }));
     return json({ ok: true, ignored: true, noActiveThread: true });
   }
 
@@ -3086,7 +3131,7 @@ async function handleSendblueWebhook(request: Request, env: Env, ctx?: WaitUntil
       kind: "service.notice",
       code: "needs-attention",
       body: "The local Codex service is offline. Restart iMessage Handoff before sending task messages.",
-    }));
+    }, { context: { activeThread: threadLabel(activeThread) } }));
     return json({ ok: true, ignored: true, serviceOffline: true });
   }
   const replyId = await insertHandoffReply(

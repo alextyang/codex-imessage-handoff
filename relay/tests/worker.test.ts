@@ -942,9 +942,8 @@ test("Mac presence notices are debounced transitions, respect multiple sockets, 
     await control.reconcileOwnerPresence(DEV_OWNER_ID);
     await expirePending();
     assert.equal(first.closed, false, "a v0.3.2 socket without heartbeat capability is never TTL-expired");
-    assert.deepEqual(outboundContents(calls), [
-      "CODEX CONTROL · ONLINE\n────────────────────────\n\n[ONLINE] MAC CONNECTED\n\nReady for new task messages.",
-    ]);
+    assert.match(String(outboundContents(calls)[0]), /^✓ CODEX · Mac Connected/);
+    assert.match(String(outboundContents(calls)[0]), /⌁ No active task · \/threads$/);
 
     const second = new PresenceSocket();
     second.serializeAttachment({ ownerId: DEV_OWNER_ID, lastHeartbeatAt: Date.now() });
@@ -967,8 +966,8 @@ test("Mac presence notices are debounced transitions, respect multiple sockets, 
     replacement.closed = true;
     await control.reconcileOwnerPresence(DEV_OWNER_ID, replacement as unknown as WebSocket);
     await expirePending();
-    assert.equal(outboundContents(calls).at(-1),
-      "CODEX CONTROL · OFFLINE\n────────────────────────\n\n[OFFLINE] MAC DISCONNECTED\n\nNew task messages will wait until it reconnects.");
+    assert.match(String(outboundContents(calls).at(-1)), /^× CODEX · Mac Disconnected/);
+    assert.match(String(outboundContents(calls).at(-1)), /⌁ No active task · \/threads$/);
 
     db.phoneBindings.get("+15551234567")!.last_user_message_at = "2026-01-01T00:00:00.000Z";
     const staleReconnect = new PresenceSocket();
@@ -1122,7 +1121,7 @@ test("pairs a phone by code without enqueueing a pending reply", async () => {
       "https://api.sendblue.test/api/send-message",
       "https://api.sendblue.test/api/send-message",
     ]);
-    assert.deepEqual(calls.map((call) => call.body), [{
+    assert.deepEqual(calls.map((call) => call.body).slice(0, 3), [{
       number: "+15551234567",
       from_number: "+12344198201",
     }, {
@@ -1133,11 +1132,9 @@ test("pairs a phone by code without enqueueing a pending reply", async () => {
       number: "+15551234567",
       from_number: "+12344198201",
       media_url: "https://imessage-handoff.test/contact.vcf",
-    }, {
-      number: "+15551234567",
-      from_number: "+12344198201",
-      content: 'You’re connected to "iMessage test" on Codex.\n\nYou were deciding what the first playable prototype should include.\n\nWhat do you want to do next?',
     }]);
+    assert.match(String(calls[3]?.body?.content), /^↪ CODEX · Context Switched/);
+    assert.match(String(calls[3]?.body?.content), /Other tasks › .+ iMessage test$/);
     assert.equal(typeof db.phoneBindings.get("+15551234567")?.contact_card_sent_at, "string");
 
     assert.deepEqual(pendingReplies(testEnv, threadId), []);
@@ -1174,9 +1171,9 @@ test("sends the pairing contact card only once per phone", async () => {
     globalThis.fetch = originalFetch;
   }
 
-  assert.deepEqual(outboundContents(calls), [
-    'You’re connected to "iMessage test" on Codex.\n\nWhat do you want to do next?',
-  ]);
+  assert.equal(outboundContents(calls).length, 1);
+  assert.match(String(outboundContents(calls)[0]), /^↪ CODEX · Context Switched/);
+  assert.match(String(outboundContents(calls)[0]), /Other tasks › .+ iMessage test$/);
   assert.equal(db.phoneBindings.get("+15551234567")?.owner_id, DEV_OWNER_ID);
   assert.equal(db.phoneBindings.get("+15551234567")?.contact_card_sent_at, "2026-01-01T00:00:00.000Z");
 });
@@ -1200,10 +1197,9 @@ test("activation message omits the summary paragraph when no summary exists", as
   } finally {
     globalThis.fetch = originalFetch;
   }
-  assert.deepEqual(outboundContents(calls), [
-    "Add me as a contact so you remember who I am.",
-    'You’re connected to "iMessage test" on Codex.\n\nWhat do you want to do next?',
-  ]);
+  assert.equal(outboundContents(calls)[0], "Add me as a contact so you remember who I am.");
+  assert.match(String(outboundContents(calls)[1]), /^↪ CODEX · Context Switched/);
+  assert.match(String(outboundContents(calls)[1]), /Other tasks › .+ iMessage test$/);
 });
 
 test("activation message uses generic copy when no title exists", async () => {
@@ -1225,10 +1221,9 @@ test("activation message uses generic copy when no title exists", async () => {
   } finally {
     globalThis.fetch = originalFetch;
   }
-  assert.deepEqual(outboundContents(calls), [
-    "Add me as a contact so you remember who I am.",
-    "You’re connected to this Codex thread.\n\nWhat do you want to do next?",
-  ]);
+  assert.equal(outboundContents(calls)[0], "Add me as a contact so you remember who I am.");
+  assert.match(String(outboundContents(calls)[1]), /^↪ CODEX · Context Switched/);
+  assert.match(String(outboundContents(calls)[1]), /Other tasks › .+ project$/);
 });
 
 test("pairing allows SMS numbers so Sendblue can use SMS fallback", async () => {
@@ -1261,7 +1256,7 @@ test("pairing allows SMS numbers so Sendblue can use SMS fallback", async () => 
       "https://api.sendblue.test/api/send-message",
       "https://api.sendblue.test/api/send-message",
     ]);
-    assert.deepEqual(calls.map((call) => call.body), [{
+    assert.deepEqual(calls.map((call) => call.body).slice(0, 3), [{
       number: "+15551234567",
       from_number: "+12344198201",
     }, {
@@ -1272,11 +1267,8 @@ test("pairing allows SMS numbers so Sendblue can use SMS fallback", async () => 
       number: "+15551234567",
       from_number: "+12344198201",
       media_url: "https://imessage-handoff.test/contact.vcf",
-    }, {
-      number: "+15551234567",
-      from_number: "+12344198201",
-      content: 'You’re connected to "iMessage test" on Codex.\n\nWhat do you want to do next?',
     }]);
+    assert.match(String(calls[3]?.body?.content), /^↪ CODEX · Context Switched/);
     assert.deepEqual(pendingReplies(testEnv, threadId), []);
   } finally {
     globalThis.fetch = originalFetch;
@@ -1463,7 +1455,9 @@ test("starting another thread for a paired user makes it active", async () => {
   assert.equal(secondBody.paired, true);
   assert.equal(secondBody.pairingCode, null);
   assert.equal(secondBody.skipNextStatusSend, true);
-  assert.deepEqual(outboundContents(calls), ['You’re connected to "Second" on Codex.\n\nYou were choosing the next iMessage task.\n\nWhat do you want to do next?']);
+  assert.equal(outboundContents(calls).length, 1);
+  assert.match(String(outboundContents(calls)[0]), /^↪ CODEX · Context Switched/);
+  assert.match(String(outboundContents(calls)[0]), /Other tasks › .+ Second$/);
   assert.equal(db.phoneBindings.get("+15551234567")?.active_thread_id, secondThreadId);
   assert.equal(db.threads.get(secondThreadId)?.pairing_code, null);
 
@@ -1498,10 +1492,11 @@ test("list command returns a numbered grouped directory with live status", async
     const response = await handleRequest(sendblueWebhook(inboundMessage("list", "list_msg_1")), testEnv);
     assert.equal(response.status, 200);
     const directory = String(outboundContents(calls).at(-1));
-    assert.match(directory, /^CODEX CONTROL · THREADS/);
-    assert.match(directory, /OTHER TASKS · 2 TASKS\n\n1\. Second/);
-    assert.match(directory, /\[SELECTED\] \[IDLE\]/);
-    assert.match(directory, /2\. iMessage test/);
+    assert.match(directory, /^◆ CODEX · Threads/);
+    assert.match(directory, /▾ Other tasks · 2 tasks\n\n1  .+ Second/);
+    assert.match(directory, /⌁ Active · ○ Idle/);
+    assert.match(directory, /2  .+ iMessage test/);
+    assert.match(directory, /⌁ Active context\nOther tasks › .+ Second$/);
     assert.doesNotMatch(directory, /enabled|stopped/i);
     const pending = pendingReplies(testEnv);
     assert.deepEqual(pending, []);
@@ -1527,7 +1522,9 @@ test("list command reports when the paired phone has no iMessage handoff threads
   try {
     const response = await handleRequest(sendblueWebhook(inboundMessage("list", "list_msg_empty")), testEnv);
     assert.equal(response.status, 200);
-    assert.deepEqual(outboundContents(calls), ["CODEX CONTROL · THREADS\n────────────────────────\n\n0 TASKS · UPDATED NOW\n\nNo pending or recently active tasks."]);
+    assert.match(String(outboundContents(calls)[0]), /^◆ CODEX · Threads/);
+    assert.match(String(outboundContents(calls)[0]), /0 tasks · updated now/);
+    assert.match(String(outboundContents(calls)[0]), /⌁ No active task · \/threads$/);
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -1550,7 +1547,9 @@ test("normal text reports when there is no active thread to forward to", async (
   try {
     const response = await handleRequest(sendblueWebhook(inboundMessage("What is 2 + 2?", "msg_no_thread")), testEnv);
     assert.equal(response.status, 200);
-    assert.deepEqual(outboundContents(calls), ["CODEX CONTROL · NEEDS ATTENTION\n────────────────────────\n\nDETAILS\nNo thread is selected.\nText /threads to choose one."]);
+    assert.match(String(outboundContents(calls)[0]), /^▲ CODEX · Needs Attention/);
+    assert.match(String(outboundContents(calls)[0]), /No thread is selected/);
+    assert.match(String(outboundContents(calls)[0]), /⌁ No active task · \/threads$/);
     const pending = pendingReplies(testEnv);
     assert.deepEqual(pending, []);
   } finally {
@@ -1615,7 +1614,9 @@ test("out-of-range menu selection does not change the active thread or enqueue a
     const response = await handleRequest(sendblueWebhook(inboundMessage("2", "switch_msg_bad")), testEnv);
     assert.equal(response.status, 200);
     assert.equal(db.phoneBindings.get("+15551234567")?.active_thread_id, threadId);
-    assert.deepEqual(outboundContents(calls), ["CODEX CONTROL · NEEDS ATTENTION\n────────────────────────\n\nDETAILS\nThat menu has changed.\nText /threads for a fresh list."]);
+    assert.match(String(outboundContents(calls)[0]), /^▲ CODEX · Needs Attention/);
+    assert.match(String(outboundContents(calls)[0]), /That menu has changed/);
+    assert.match(String(outboundContents(calls)[0]), /⌁ Active context\nOther tasks ›/);
     assert.deepEqual(pendingReplies(testEnv, threadId), []);
   } finally {
     globalThis.fetch = originalFetch;
@@ -1641,7 +1642,7 @@ test("expired numeric menu replies refresh the directory instead of reaching Cod
     assert.equal((await json(response)).command, "stale-menu");
     assert.equal(pendingReplies(testEnv, threadId).length, 0);
     assert.match(String(outboundContents(calls)[0]), /menu expired/i);
-    assert.match(String(outboundContents(calls)[1]), /^CODEX CONTROL · THREADS/);
+    assert.match(String(outboundContents(calls)[1]), /^◆ CODEX · Threads/);
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -1682,9 +1683,9 @@ test("stopping a thread disables it and switches to the newest remaining thread"
 
     await handleRequest(sendblueWebhook(inboundMessage("list", "list_after_stop")), testEnv);
     const directory = String(outboundContents(calls).at(-1));
-    assert.match(directory, /^CODEX CONTROL · THREADS/);
-    assert.match(directory, /1\. iMessage test/);
-    assert.match(directory, /\[SELECTED\] \[IDLE\]/);
+    assert.match(directory, /^◆ CODEX · Threads/);
+    assert.match(directory, /1  .+ iMessage test/);
+    assert.match(directory, /⌁ Active · ○ Idle/);
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -2039,11 +2040,11 @@ test("publishes every non-empty status to sendblue", async () => {
     assert.equal(calls[0]?.url, "https://api.sendblue.test/api/send-message");
     assert.equal(calls[0]?.headers.get("sb-api-key-id"), "sendblue-key");
     assert.equal(calls[0]?.headers.get("sb-api-secret-key"), "sendblue-secret");
-    assert.deepEqual(calls[0]?.body, {
-      number: "+15551234567",
-      from_number: "+12344198201",
-      content: "Created TEMP.",
-    });
+    assert.equal(calls[0]?.body.number, "+15551234567");
+    assert.equal(calls[0]?.body.from_number, "+12344198201");
+    assert.match(String(calls[0]?.body.content), /^✓ CODEX · Result/);
+    assert.match(String(calls[0]?.body.content), /Created TEMP\./);
+    assert.match(String(calls[0]?.body.content), /⌁ Active context\nOther tasks › .+ iMessage test$/);
     assert.equal((await notification(duplicate)).messageHandle, "message-2");
   } finally {
     globalThis.fetch = originalFetch;
@@ -2084,7 +2085,10 @@ test("publishes each changed assistant message", async () => {
       assert.equal(response.status, 200);
     }
 
-    assert.deepEqual(outboundContents(calls), ["81", "Created TEMP."]);
+    assert.equal(outboundContents(calls).length, 2);
+    assert.match(String(outboundContents(calls)[0]), /\n\n81\n\n/);
+    assert.match(String(outboundContents(calls)[1]), /Created TEMP\./);
+    assert.ok(outboundContents(calls).every((content) => String(content).includes("⌁ Active context")));
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -2240,15 +2244,10 @@ test("sends text and one generated image together", async () => {
       }),
     }), testEnv);
     assert.equal(status.status, 200);
-    assert.deepEqual(calls[1], {
-      url: "https://api.sendblue.test/api/send-message",
-      body: {
-        number: "+15551234567",
-        from_number: "+12344198201",
-        content: "Here is a cow.",
-        media_url: "https://cdn.sendblue.test/cow.png",
-      },
-    });
+    assert.equal(calls[1]?.url, "https://api.sendblue.test/api/send-message");
+    assert.match(String((calls[1]?.body as Record<string, unknown>)?.content), /^✓ CODEX · Result/);
+    assert.match(String((calls[1]?.body as Record<string, unknown>)?.content), /Here is a cow\./);
+    assert.equal((calls[1]?.body as Record<string, unknown>)?.media_url, "https://cdn.sendblue.test/cow.png");
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -2366,11 +2365,8 @@ test("sends text before carousel for iMessage users with multiple generated imag
       "https://api.sendblue.test/api/send-message",
       "https://api.sendblue.test/api/send-carousel",
     ]);
-    assert.deepEqual(calls[3]?.body, {
-      number: "+15551234567",
-      from_number: "+12344198201",
-      content: "Two cow options.",
-    });
+    assert.match(String((calls[3]?.body as Record<string, unknown>)?.content), /^✓ CODEX · Result/);
+    assert.match(String((calls[3]?.body as Record<string, unknown>)?.content), /Two cow options\./);
     assert.deepEqual(calls[4]?.body, {
       number: "+15551234567",
       from_number: "+12344198201",
@@ -2887,7 +2883,7 @@ test("older persistent clients keep the relay-rendered directory during a rollin
     const list = await handleRequest(sendblueWebhook(inboundMessage("/threads", "old-client-list")), testEnv);
     assert.equal(list.status, 200);
     assert.equal(controls.length, 0);
-    assert.match(String(outboundContents(calls).at(-1)), /^CODEX CONTROL · THREADS/);
+    assert.match(String(outboundContents(calls).at(-1)), /^◆ CODEX · Threads/);
     assert.match(String(outboundContents(calls).at(-1)), /Compatible task/);
   } finally {
     globalThis.fetch = originalFetch;
@@ -2962,9 +2958,10 @@ test("local directory previews stay transient and numeric thread opens use its e
     }), testEnv);
     assert.equal(delivered.status, 200);
     const rendered = String(outboundContents(calls).at(-1));
-    assert.match(rendered, /SAME LABEL · 1/);
-    assert.match(rendered, /› Private preview never in D1/);
-    assert.match(rendered, /OTHER TASKS/);
+    assert.match(rendered, /▾ Same label · 1/);
+    assert.match(rendered, /“Private preview never in D1”/);
+    assert.match(rendered, /▾ Other tasks/);
+    assert.match(rendered, /⌁ Active context\nSame label › .+ Task 2$/);
     assert.doesNotMatch(rendered, /Task 4/);
     const db = testEnv.DB as unknown as FakeD1Database;
     const snapshot = JSON.parse(String(db.menuSnapshots.get("+15551234567")?.items_json)) as string[];
@@ -2994,7 +2991,8 @@ test("local directory previews stay transient and numeric thread opens use its e
     assert.equal(controls.at(-1)?.type, "control");
     assert.equal(controls.at(-1)?.command, "open");
     assert.equal(controls.at(-1)?.threadId, "thread-1");
-    assert.match(String(outboundContents(calls).at(0)), /^CODEX CONTROL · SWITCHED/);
+    assert.match(String(outboundContents(calls).at(0)), /^↪ CODEX · Context Switched/);
+    assert.match(String(outboundContents(calls).at(0)), /Same label › .+ Task 1$/);
 
     db.menuSnapshots.get("+15551234567")!.expires_at = "2026-01-01T00:00:00.000Z";
     const stale = await handleRequest(sendblueWebhook(inboundMessage("1", "directory-stale")), testEnv);
@@ -3051,7 +3049,8 @@ test("installation pairing reuses the phone binding and renders a clean connecte
     const body = await json(response);
     assert.equal(body.service, true);
     assert.equal((testEnv.DB as unknown as FakeD1Database).phoneBindings.get("+15551234567")?.active_thread_id, "service-thread-1");
-    assert.match(String(outboundContents(calls).at(-1)), /^CODEX CONTROL · CONNECTED/);
+    assert.match(String(outboundContents(calls).at(-1)), /^◆ CODEX · Connected/);
+    assert.match(String(outboundContents(calls).at(-1)), /imessage › .+ Service redesign$/);
     assert.doesNotMatch(String(outboundContents(calls).at(-1)), /hook|relay|token/i);
   } finally {
     globalThis.fetch = originalFetch;
@@ -3078,7 +3077,10 @@ test("service outbound labels model output with its source thread", async () => 
       body: JSON.stringify({ event: { kind: "thread.output", thread: { title: "Music crawler" }, body: "All tests pass." } }),
     }), testEnv);
     assert.equal(response.status, 200);
-    assert.deepEqual(outboundContents(calls), ["CODEX THREAD · CODEX\n────────────────────────\n\nMusic crawler\n\nRESULT\nAll tests pass."]);
+    assert.equal(outboundContents(calls).length, 1);
+    assert.match(String(outboundContents(calls)[0]), /^✓ CODEX · Result/);
+    assert.match(String(outboundContents(calls)[0]), /All tests pass\./);
+    assert.match(String(outboundContents(calls)[0]), /⌁ No active task · \/threads$/);
     assert.equal(calls.some((call) => call && "send_style" in call), false,
       "routine task UI stays plain text so SMS fallback keeps the same meaning");
   } finally {
@@ -3121,8 +3123,9 @@ test("live mirroring sends only the currently selected available task and mainta
     ["send-message", null],
     ["send-typing-indicator", null],
   ]);
-  assert.match(String(outboundContents(calls.map((call) => call.body))[0]), /^CODEX LIVE · YOU/);
-  assert.match(String(outboundContents(calls.map((call) => call.body))[0]), /\[MESSAGE\] now[\s\S]*This local request should be mirrored\.$/);
+  assert.match(String(outboundContents(calls.map((call) => call.body))[0]), /^You · Mirrored from Mac · now/);
+  assert.match(String(outboundContents(calls.map((call) => call.body))[0]), /This local request should be mirrored\./);
+  assert.match(String(outboundContents(calls.map((call) => call.body))[0]), /Live project › .+ Selected task$/);
 
   calls.length = 0;
   const commentary = await sendLive({
@@ -3136,8 +3139,8 @@ test("live mirroring sends only the currently selected available task and mainta
     ["send-message", null],
     ["send-typing-indicator", null],
   ]);
-  assert.match(String(outboundContents(calls.map((call) => call.body))[0]), /^CODEX LIVE · CODEX/);
-  assert.match(String(outboundContents(calls.map((call) => call.body))[0]), /\[COMMENTARY\] now/);
+  assert.match(String(outboundContents(calls.map((call) => call.body))[0]), /^Codex · Update · now/);
+  assert.match(String(outboundContents(calls.map((call) => call.body))[0]), /Live project › .+ Selected task$/);
 
   calls.length = 0;
   const stale = await sendLive({
@@ -3235,7 +3238,8 @@ test("fork context is selected-task gated, content-free, and idempotent", async 
   }), testEnv);
 
   assert.equal((await notification(await send())).sent, true);
-  assert.match(String(outboundContents(calls)[0]), /^CODEX CONTROL · FOLLOWING FORK/);
+  assert.match(String(outboundContents(calls)[0]), /^↪ CODEX · Following Fork/);
+  assert.match(String(outboundContents(calls)[0]), /Follow project › .+ Followed fork$/);
   assert.equal(calls.filter((call) => call && !("content" in call) && call.state === undefined).length, 1,
     "working fork context resumes the native typing indicator");
   assert.deepEqual(await notification(await send()), { sent: true, status: "DUPLICATE", parts: 1 });
@@ -3287,10 +3291,11 @@ test("multipart live mirroring resumes after the last provider-accepted part", a
   assert.equal((await notification(retry)).sent, true);
   const contents = outboundContents(calls.map((call) => call.body));
   assert.equal(contents.length, 3, "the retry sends only the failed second part");
-  assert.match(String(contents[0]), /^CODEX LIVE · CODEX · 1\/2/);
-  assert.match(String(contents[1]), /^CODEX LIVE · CODEX · 2\/2/);
-  assert.match(String(contents[2]), /^CODEX LIVE · CODEX · 2\/2/);
+  assert.match(String(contents[0]), /^Codex · Update · now · 1\/2/);
+  assert.match(String(contents[1]), /^Codex · Update · now · 2\/2/);
+  assert.match(String(contents[2]), /^Codex · Update · now · 2\/2/);
   assert.ok(contents.every((content) => String(content).length <= 8000));
+  assert.ok(contents.every((content) => String(content).includes("⌁ Active context")));
   assert.equal(calls.filter((call) => call.url.includes("send-typing-indicator") && !call.body?.state).length, 1,
     "typing restarts only after the successful resumed delivery");
 });
@@ -3409,9 +3414,10 @@ test("proactive completions use the 24-hour inbound activity gate without affect
       } }),
     }), testEnv);
     assert.equal((await notification(completion)).sent, true);
-    assert.deepEqual(outboundContents(calls.map((call) => call.body)), [
-      "CODEX THREAD · IMESSAGE HANDOFF\n────────────────────────\n\nLocal task\n[COMPLETED] now\n\nRESULT\nExact local final.",
-    ]);
+    assert.equal(outboundContents(calls.map((call) => call.body)).length, 1);
+    assert.match(String(outboundContents(calls.map((call) => call.body))[0]), /^✓ CODEX · Completed/);
+    assert.match(String(outboundContents(calls.map((call) => call.body))[0]), /Exact local final\./);
+    assert.match(String(outboundContents(calls.map((call) => call.body))[0]), /⌁ No active task · \/threads$/);
     assert.equal(calls.some((call) => call.url.includes("send-typing-indicator")), false,
       "an unrelated proactive completion must not clear another task's typing state");
 
@@ -3526,7 +3532,7 @@ test("multipart completion retries resume after the last provider-accepted part"
     assert.match(String(contents[1]), /· 2\/2/);
     assert.match(String(contents[2]), /· 2\/2/);
     assert.ok(contents.every((content) => String(content).length <= 8000));
-    assert.ok(contents.every((content) => String(content).includes("\n\nRESULT\n")));
+    assert.ok(contents.every((content) => String(content).includes("⌁ No active task · /threads")));
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -3552,16 +3558,18 @@ test("service outbound splits long thread output with source headers", async () 
       body: JSON.stringify({ event: {
         kind: "thread.output",
         thread: { title: "T".repeat(80), projectLabel: "P".repeat(80) },
-        body: "A".repeat(9000),
+        body: "👨‍👩‍👧‍👦".repeat(900),
       } }),
     }), testEnv);
     assert.equal(response.status, 200);
     const contents = outboundContents(calls);
     assert.equal(contents.length, 2);
-    assert.match(String(contents[0]), /^CODEX THREAD · P+ · 1\/2/);
-    assert.match(String(contents[1]), /^CODEX THREAD · P+ · 2\/2/);
+    assert.match(String(contents[0]), /^✓ CODEX · Result · 1\/2/);
+    assert.match(String(contents[1]), /^✓ CODEX · Result · 2\/2/);
     assert.ok(contents.every((content) => String(content).length <= 8000));
-    assert.ok(contents.every((content) => String(content).includes("\n\nRESULT\n")));
+    assert.ok(contents.every((content) => String(content).includes("⌁ No active task · /threads")));
+    assert.ok(contents.every((content) => !/\u200d(?:\n|$)|\n\u200d/.test(String(content))),
+      "multipart boundaries do not split a joined emoji grapheme");
     assert.equal(((await json(response)).notification as Record<string, unknown>).parts, 2);
   } finally {
     globalThis.fetch = originalFetch;
@@ -3630,11 +3638,11 @@ test("partial multi-part directory delivery cannot leave an older numeric mappin
     }), testEnv);
     assert.equal(response.status, 400);
     assert.equal(sends, 2, "the fixture must fail after at least one visible directory part");
-    assert.match(chunkContents[0] || "", /^CODEX CONTROL · THREADS · 1\//);
-    assert.match(chunkContents[1] || "", /^CODEX CONTROL · THREADS · 2\//);
+    assert.match(chunkContents[0] || "", /^◆ CODEX · Threads · 1\//);
+    assert.match(chunkContents[1] || "", /^◆ CODEX · Threads · 2\//);
     assert.ok(chunkContents.every((content) => content.length <= 8000));
-    assert.ok(chunkContents.every((content) => !/(?:PROJECT · .+|OTHER TASKS · \d+ TASKS?|RECENT PROJECTS|REPLY|OPTIONS|\d+\. [^\n]+)$/.test(content)),
-      "a directory part does not end with an orphaned section label or task title");
+    assert.ok(chunkContents.every((content) => /────────────\n⌁ Active context\nLarge project ›/.test(content)),
+      "each directory part ends with its exact active context");
     assert.deepEqual(JSON.parse(String(db.menuSnapshots.get("+15551234567")?.items_json)), []);
     assert.ok(Date.parse(String(db.menuSnapshots.get("+15551234567")?.expires_at)) > Date.now());
   } finally {
@@ -3680,9 +3688,12 @@ test("service outbound chunks long detail and history views with continuation he
       assert.equal(response.status, 200);
       const contents = outboundContents(calls);
       assert.ok(contents.length >= 3);
-      assert.match(String(contents[0]), /^CODEX THREAD · INTERACTION SERVICE · 1\//);
-      assert.match(String(contents[1]), /^CODEX THREAD · INTERACTION SERVICE · 2\//);
+      assert.match(String(contents[0]), /^◆ CODEX · (?:Thread|History) · 1\//);
+      assert.match(String(contents[1]), /^◆ CODEX · (?:Thread|History) · 2\//);
       assert.ok(contents.every((content) => String(content).length <= 8000));
+      assert.ok(contents.every((content) => String(content).includes("────────────\n⌁ No active task · /threads")));
+      assert.ok(contents.every((content) => !/(?:Codex|You) · [^\n]+\n\n────────────/.test(String(content))),
+        "a speaker label is never stranded immediately before a context footer");
       assert.equal(((await json(response)).notification as Record<string, unknown>).parts, contents.length);
     }
   } finally {
