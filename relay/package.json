@@ -1,10 +1,10 @@
 {
   "name": "@gaberagland/imessage-handoff-relay",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "private": true,
   "type": "module",
   "scripts": {
-    "db:migrate:remote": "wrangler d1 migrations apply imessage-handoff --remote",
+    "db:migrate:remote": "wrangler d1 migrations apply DB --remote",
     "dev": "wrangler dev",
     "build": "tsc --noEmit",
     "typecheck": "tsc --noEmit",

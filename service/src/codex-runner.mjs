@@ -45,13 +45,17 @@ export class CodexRunner {
     return true;
   }
 
-  async run({ thread, prompt, images = [], onPhase = () => {} }) {
+  async run({ thread, prompt, images = [], reasoningEffort, onPhase = () => {} }) {
     if (this.active) throw Object.assign(new Error("Another Codex run is active."), { code: "BUSY" });
     if (!existsSync(thread.cwd)) throw Object.assign(new Error("Thread working directory no longer exists."), { code: "MISSING_CWD" });
     const temporary = path.join(os.tmpdir(), `imessage-handoff-${process.pid}-${Date.now()}`);
     mkdirSync(temporary, { recursive: true, mode: 0o700 });
     const outputFile = path.join(temporary, "last-message.txt");
-    const args = ["exec", "resume", "--json", "--output-last-message", outputFile];
+    const args = ["exec"];
+    if (typeof reasoningEffort === "string" && /^[a-z][a-z0-9_-]{0,31}$/i.test(reasoningEffort)) {
+      args.push("--config", `model_reasoning_effort=${JSON.stringify(reasoningEffort)}`);
+    }
+    args.push("resume", "--json", "--output-last-message", outputFile);
     for (const image of images) args.push("--image", image);
     args.push(thread.id, "-");
     const child = spawn(this.codexPath, args, {
@@ -82,8 +86,20 @@ export class CodexRunner {
     child.stderr.on("data", (chunk) => {
       if (stderr.length < 8192) stderr += String(chunk);
     });
+    child.stdin.on("error", () => {});
     child.stdin.end(String(prompt));
-    const exit = await new Promise((resolve) => child.once("exit", (code, signal) => resolve({ code, signal })));
+    let exit;
+    try {
+      exit = await new Promise((resolve, reject) => {
+        child.once("error", reject);
+        child.once("close", (code, signal) => resolve({ code, signal }));
+      });
+    } catch (error) {
+      lines.close();
+      this.active = null;
+      rmSync(temporary, { recursive: true, force: true });
+      throw Object.assign(new Error("Codex could not be started.", { cause: error }), { code: "CODEX_UNAVAILABLE" });
+    }
     lines.close();
     this.active = null;
     const cancelled = active.cancelled;

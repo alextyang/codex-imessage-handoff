@@ -1,5 +1,5 @@
 import { CODEX_CONTACT_IMAGE_BASE64 } from "./contact-card-image.ts";
-import { parseMenuSelection, parseSlashCommand, renderHelp, renderOutboundEvent, renderThreadMenu, threadHeader } from "../../protocol/presentation.ts";
+import { parseMenuSelection, parseSlashCommand, renderHelp, renderOutboundEvent, renderThreadDirectory, renderThreadMenu, threadHeader, threadTitle } from "../../protocol/presentation.ts";
 import type { OutboundEvent, MenuItem } from "../../protocol/presentation.ts";
 import type {
   Env,
@@ -22,7 +22,7 @@ type WaitUntilContext = Pick<ExecutionContext, "waitUntil">;
 const JSON_HEADERS = {
   "content-type": "application/json; charset=utf-8",
   "access-control-allow-origin": "*",
-  "access-control-allow-methods": "GET,POST,PUT,OPTIONS",
+  "access-control-allow-methods": "GET,POST,PUT,DELETE,OPTIONS",
   "access-control-allow-headers": "authorization,content-type",
 };
 const CONTACT_CARD_MESSAGE = "Add me as a contact so you remember who I am.";
@@ -46,21 +46,23 @@ const INVALID_PAIRING_CODE_MESSAGE = "That pairing code is invalid or expired. S
 // D1 growth, or media upload work can run away.
 const DEFAULT_JSON_BODY_MAX_BYTES = 128 * 1024;
 const WEBHOOK_JSON_BODY_MAX_BYTES = 256 * 1024;
+const CATALOG_JSON_BODY_MAX_BYTES = 1024 * 1024;
+const SERVICE_OUTBOUND_JSON_BODY_MAX_BYTES = 2 * 1024 * 1024;
 const STATUS_JSON_BODY_MAX_BYTES = 72 * 1024 * 1024;
 const REQUEST_RATE_LIMIT_WINDOW_MS = 60 * 60 * 1000;
 const MAX_INSTALLATIONS_PER_IP_PER_WINDOW = 30;
 const MAX_THREAD_REQUESTS_PER_IP_PER_WINDOW = 1000;
 const MAX_OWNER_REQUESTS_PER_WINDOW = 1000;
 const MAX_CWD_LENGTH = 512;
-const MAX_TITLE_LENGTH = 120;
+const MAX_TITLE_LENGTH = 160;
 const MAX_HANDOFF_SUMMARY_LENGTH = 1000;
 const MAX_STATUS_LENGTH = 40;
 const MAX_ASSISTANT_MESSAGE_LENGTH = 20_000;
 const MAX_WEBHOOK_CONTENT_LENGTH = 20_000;
 const MAX_URL_LENGTH = 2048;
 const MAX_ENABLED_THREADS_PER_OWNER = 25;
-const MAX_CATALOG_THREADS_PER_OWNER = 100;
-const MAX_CATALOG_BATCH = 100;
+const MAX_CATALOG_THREADS_PER_OWNER = 500;
+const MAX_CATALOG_BATCH = 500;
 const MAX_GENERATED_IMAGES = 5;
 const MAX_GENERATED_IMAGE_BYTES = 10 * 1024 * 1024;
 const MAX_GENERATED_IMAGE_TOTAL_BYTES = MAX_GENERATED_IMAGES * MAX_GENERATED_IMAGE_BYTES;
@@ -86,14 +88,20 @@ interface CatalogThreadInput {
   title?: unknown;
   cwd?: unknown;
   projectLabel?: unknown;
+  projectKey?: unknown;
   createdAt?: unknown;
   updatedAt?: unknown;
+  activityAt?: unknown;
+  stateSince?: unknown;
+  status?: unknown;
+  reasoningEffort?: unknown;
   archived?: unknown;
   visible?: unknown;
 }
 
 interface ServiceCatalogBody {
   threads?: unknown;
+  complete?: unknown;
 }
 
 interface OutboundBody {
@@ -173,8 +181,16 @@ export class HandoffSocket {
       }
       if (request.method === "POST" && parts[0] === "owners" && parts[1] && parts[2] === "control") {
         const body = await readJsonBody<JsonRecord>(request);
-        this.notifyOwner(parts[1], { type: "control", command: optionalString(body.command), threadId: optionalString(body.threadId) });
-        return json({ ok: true });
+        const delivered = this.notifyOwner(parts[1], {
+          type: "control",
+          command: optionalString(body.command),
+          threadId: optionalString(body.threadId),
+          argument: optionalString(body.argument),
+        });
+        return json({ ok: delivered > 0, delivered }, delivered > 0 ? {} : { status: 409 });
+      }
+      if (request.method === "GET" && parts[0] === "owners" && parts[1] && parts[2] === "connected") {
+        return json({ connected: this.state.getWebSockets(`owner:${parts[1]}`).length > 0 });
       }
       return error(404, "Not found.");
     }
@@ -228,7 +244,6 @@ export class HandoffSocket {
       .sort((a, b) => (
         (a.media_index ?? 0) - (b.media_index ?? 0)
         || a.created_at.localeCompare(b.created_at)
-        || a.id.localeCompare(b.id)
       ));
   }
 
@@ -297,7 +312,9 @@ export class HandoffSocket {
     });
     if (!isTombstone && !mediaGroupId) {
       // Plain text can be delivered as soon as it arrives.
-      this.notifyNextPending(threadId, ownerId);
+      const payload = { type: "reply-pending", threadId, replyId: id, createdAt };
+      if (ownerId) this.notifyOwner(ownerId, payload);
+      else this.notifyNextPending(threadId);
     } else if (!isTombstone) {
       // Media groups need the quiet window before they are safe to claim.
       this.scheduleMediaPendingNotification(threadId, ownerId);
@@ -332,23 +349,26 @@ export class HandoffSocket {
     const pending = [...this.replies.values()]
       .filter((reply) => reply.owner_id === ownerId && reply.status === "pending")
       .sort((a, b) => a.created_at.localeCompare(b.created_at));
-    for (const row of pending) {
-      const payload = this.nextPendingPayload(row.thread_id);
-      if (payload) {
-        socket.send(JSON.stringify(payload));
-        return;
-      }
+    const threadIds = [...new Set(pending.map((row) => row.thread_id))];
+    const payloads = threadIds.flatMap((threadId) => this.pendingPayloads(threadId))
+      .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+    for (const payload of payloads) {
+      socket.send(JSON.stringify(payload));
     }
+    for (const threadId of threadIds) this.scheduleMediaPendingNotification(threadId, ownerId);
   }
 
-  private nextPendingPayload(threadId: string) {
-    const pending = eligiblePendingReplies(this.pendingRows(threadId))[0];
-    return pending ? {
+  private pendingPayloads(threadId: string) {
+    return eligiblePendingReplies(this.pendingRows(threadId)).flatMap((pending) => pending ? [{
       type: "reply-pending",
       threadId,
       replyId: pending.id,
       createdAt: pending.createdAt,
-    } : null;
+    }] : []);
+  }
+
+  private nextPendingPayload(threadId: string) {
+    return this.pendingPayloads(threadId)[0] ?? null;
   }
 
   private scheduleMediaPendingNotification(threadId: string, ownerId?: string | null) {
@@ -356,7 +376,12 @@ export class HandoffSocket {
     if (waitMs === null) {
       return;
     }
-    setTimeout(() => this.notifyNextPending(threadId, ownerId), waitMs);
+    setTimeout(() => {
+      for (const payload of this.pendingPayloads(threadId)) {
+        if (ownerId) this.notifyOwner(ownerId, payload);
+        else this.notifyThread(threadId, payload);
+      }
+    }, waitMs);
   }
 
   private nextMediaPendingWaitMs(threadId: string) {
@@ -390,13 +415,16 @@ export class HandoffSocket {
 
   private notifyOwner(ownerId: string, payload: JsonRecord) {
     const message = JSON.stringify(payload);
+    let delivered = 0;
     for (const socket of this.state.getWebSockets(`owner:${ownerId}`)) {
       try {
         socket.send(message);
+        delivered += 1;
       } catch {
         // The runtime will clean up dead sockets.
       }
     }
+    return delivered;
   }
 
   private handleClaimReply(threadId: string, replyId: string) {
@@ -422,6 +450,8 @@ export class HandoffSocket {
         applied_at: appliedAt,
       });
     }
+
+    this.notifyNextPending(threadId, selectedReply.owner_id);
 
     return json({ ok: true, reply });
   }
@@ -591,6 +621,11 @@ function publicThread(thread: HandoffThreadRow) {
     lastStopAt: thread.last_stop_at,
     createdAt: thread.created_at,
     updatedAt: thread.updated_at,
+    projectKey: thread.project_key ?? null,
+    projectLabel: thread.project_label ?? null,
+    activityAt: thread.activity_at ?? thread.updated_at,
+    stateSince: thread.state_since ?? thread.updated_at,
+    reasoningEffort: thread.reasoning_effort ?? null,
   };
 }
 
@@ -622,8 +657,9 @@ async function handleRegister(request: Request, env: Env, threadId: string) {
   await env.DB.prepare(
     `INSERT INTO handoff_threads (
       id, owner_id, cwd, title, handoff_summary, status, handoff_enabled, pairing_code,
-      pairing_code_expires_at, last_stop_at, created_at, updated_at
-    ) VALUES (?, ?, ?, ?, ?, 'enabled', 1, ?, ?, NULL, ?, ?)
+      pairing_code_expires_at, last_stop_at, created_at, updated_at, catalog_source,
+      archived, visible
+    ) VALUES (?, ?, ?, ?, ?, 'enabled', 1, ?, ?, NULL, ?, ?, 'legacy', 0, 1)
     ON CONFLICT(id) DO UPDATE SET
       owner_id = excluded.owner_id,
       cwd = excluded.cwd,
@@ -631,6 +667,9 @@ async function handleRegister(request: Request, env: Env, threadId: string) {
       handoff_summary = excluded.handoff_summary,
       status = 'enabled',
       handoff_enabled = 1,
+      catalog_source = 'legacy',
+      archived = 0,
+      visible = 1,
       pairing_code = excluded.pairing_code,
       pairing_code_expires_at = excluded.pairing_code_expires_at,
       updated_at = excluded.updated_at`,
@@ -669,6 +708,19 @@ async function findServiceInstallation(env: Env, ownerId: string) {
   return env.DB.prepare("SELECT * FROM service_installations WHERE owner_id = ?")
     .bind(ownerId)
     .first<ServiceInstallationRow>();
+}
+
+async function isServiceSocketConnected(env: Env, ownerId: string) {
+  if (!env.HANDOFF_SOCKET) return false;
+  try {
+    const response = await env.HANDOFF_SOCKET.get(env.HANDOFF_SOCKET.idFromName("global"))
+      .fetch(new Request(`https://imessage-handoff.internal/owners/${ownerId}/connected`));
+    if (!response.ok) return false;
+    const body = await response.json() as { connected?: boolean };
+    return body.connected === true;
+  } catch {
+    return false;
+  }
 }
 
 async function findInstallationPairingByCode(env: Env, pairingCode: string) {
@@ -739,13 +791,26 @@ function catalogThread(value: unknown) {
   if (!isRecord(value)) {
     throw new Error("Each catalog thread must be an object.");
   }
+  const status = optionalLimitedString(value.status, "thread.status", MAX_STATUS_LENGTH) ?? "idle";
+  if (!["working", "pending", "idle", "error"].includes(status)) {
+    throw new Error("thread.status must be working, pending, idle, or error.");
+  }
+  const updatedAt = optionalLimitedString(value.updatedAt, "thread.updatedAt", 64) ?? nowIso();
+  const activityAt = optionalLimitedString(value.activityAt, "thread.activityAt", 64) ?? updatedAt;
   return {
     id: requireLimitedString(value.id, "thread.id", 160),
     title: optionalLimitedString(value.title, "thread.title", MAX_TITLE_LENGTH),
     cwd: optionalLimitedString(value.cwd, "thread.cwd", MAX_CWD_LENGTH) ?? "Codex",
     projectLabel: optionalLimitedString(value.projectLabel, "thread.projectLabel", 120),
+    projectKey: optionalLimitedString(value.projectKey, "thread.projectKey", 160)
+      ?? optionalLimitedString(value.projectLabel, "thread.projectLabel", 120)
+      ?? "codex",
     createdAt: optionalLimitedString(value.createdAt, "thread.createdAt", 64) ?? nowIso(),
-    updatedAt: optionalLimitedString(value.updatedAt, "thread.updatedAt", 64) ?? nowIso(),
+    updatedAt,
+    activityAt,
+    stateSince: optionalLimitedString(value.stateSince, "thread.stateSince", 64) ?? activityAt,
+    status,
+    reasoningEffort: optionalLimitedString(value.reasoningEffort, "thread.reasoningEffort", 40),
     archived: value.archived === true ? 1 : 0,
     visible: value.visible === false ? 0 : 1,
   };
@@ -753,43 +818,80 @@ function catalogThread(value: unknown) {
 
 async function handleServiceCatalog(request: Request, env: Env) {
   const ownerId = await requireOwnerId(request);
-  const body = await readJsonBody<ServiceCatalogBody>(request);
+  const body = await readJsonBody<ServiceCatalogBody>(request, CATALOG_JSON_BODY_MAX_BYTES);
+  if (body.complete !== true) {
+    throw new Error("complete must be true for a full catalog snapshot.");
+  }
   if (!Array.isArray(body.threads) || body.threads.length > MAX_CATALOG_BATCH) {
     throw new Error(`threads must be an array of at most ${MAX_CATALOG_BATCH} items.`);
   }
   const items = body.threads.map(catalogThread);
-  const now = nowIso();
-  for (const item of items) {
-    await env.DB.prepare(
-      `INSERT INTO handoff_threads (
-        id, owner_id, cwd, title, handoff_summary, status, handoff_enabled, pairing_code,
-        pairing_code_expires_at, last_stop_at, created_at, updated_at, project_label,
-        catalog_source, archived, visible, last_seen_at
-      ) VALUES (?, ?, ?, ?, NULL, 'idle', 1, NULL, NULL, NULL, ?, ?, ?, 'service', ?, ?, ?)
-      ON CONFLICT(id) DO UPDATE SET
-        owner_id = excluded.owner_id,
-        cwd = excluded.cwd,
-        title = excluded.title,
-        project_label = excluded.project_label,
-        catalog_source = 'service',
-        archived = excluded.archived,
-        visible = excluded.visible,
-        handoff_enabled = 1,
-        last_seen_at = excluded.last_seen_at,
-        updated_at = excluded.updated_at`,
-    ).bind(
-      item.id,
-      ownerId,
-      item.cwd,
-      item.title,
-      item.createdAt,
-      item.updatedAt,
-      item.projectLabel,
-      item.archived,
-      item.visible,
-      now,
-    ).run();
+  if (new Set(items.map((item) => item.id)).size !== items.length) {
+    throw new Error("Catalog thread ids must be unique.");
   }
+  const now = nowIso();
+  const generation = makeId("catalog");
+  const write = await env.DB.prepare(
+    `WITH incoming AS (
+      SELECT
+        json_extract(value, '$.id') AS id,
+        json_extract(value, '$.cwd') AS cwd,
+        json_extract(value, '$.title') AS title,
+        json_extract(value, '$.status') AS status,
+        json_extract(value, '$.createdAt') AS created_at,
+        json_extract(value, '$.updatedAt') AS updated_at,
+        json_extract(value, '$.projectLabel') AS project_label,
+        json_extract(value, '$.projectKey') AS project_key,
+        json_extract(value, '$.archived') AS archived,
+        json_extract(value, '$.visible') AS visible,
+        json_extract(value, '$.activityAt') AS activity_at,
+        json_extract(value, '$.stateSince') AS state_since,
+        json_extract(value, '$.reasoningEffort') AS reasoning_effort
+      FROM json_each(?)
+    )
+    INSERT INTO handoff_threads (
+      id, owner_id, cwd, title, handoff_summary, status, handoff_enabled, pairing_code,
+      pairing_code_expires_at, last_stop_at, created_at, updated_at, project_label,
+      project_key, catalog_source, archived, visible, last_seen_at, catalog_generation,
+      activity_at, state_since, reasoning_effort
+    )
+    SELECT
+      id, ?, cwd, title, NULL, status, 1, NULL, NULL, NULL, created_at, updated_at,
+      project_label, project_key, 'service', archived, visible, ?, ?, activity_at,
+      state_since, reasoning_effort
+    FROM incoming
+    WHERE 1
+    ON CONFLICT(id) DO UPDATE SET
+      owner_id = excluded.owner_id,
+      cwd = excluded.cwd,
+      title = excluded.title,
+      status = excluded.status,
+      project_label = excluded.project_label,
+      project_key = excluded.project_key,
+      catalog_source = 'service',
+      archived = excluded.archived,
+      visible = excluded.visible,
+      handoff_enabled = 1,
+      last_seen_at = excluded.last_seen_at,
+      catalog_generation = excluded.catalog_generation,
+      activity_at = excluded.activity_at,
+      state_since = excluded.state_since,
+      reasoning_effort = excluded.reasoning_effort,
+      updated_at = excluded.updated_at
+    WHERE handoff_threads.owner_id = excluded.owner_id`,
+  ).bind(JSON.stringify(items), ownerId, now, generation).run();
+  if (Number(write.meta?.changes) !== items.length) {
+    throw Object.assign(new Error("Catalog contains an unavailable task id."), { status: 409 });
+  }
+  await env.DB.prepare(
+    `UPDATE handoff_threads
+      SET visible = 0, last_seen_at = ?
+      WHERE owner_id = ?
+        AND (
+          COALESCE(catalog_source, '') != 'service'
+          OR COALESCE(catalog_generation, '') != ?
+        )`,
+  ).bind(now, ownerId, generation).run();
   return json({ ok: true, synchronized: items.length, limit: MAX_CATALOG_THREADS_PER_OWNER });
 }
 
@@ -800,11 +902,30 @@ async function handleServiceStatus(request: Request, env: Env) {
   const activeThread = binding?.active_thread_id ? await findThread(env, binding.active_thread_id) : null;
   return json({
     ok: true,
-    connected: Boolean(installation),
+    connected: Boolean(installation) && await isServiceSocketConnected(env, ownerId),
     paired: Boolean(binding),
     activeThread: activeThread ? publicThread(activeThread) : null,
     lastSeenAt: installation?.last_seen_at ?? null,
+    clientId: installation?.client_id ?? null,
+    serviceVersion: installation?.service_version ?? null,
   });
+}
+
+async function handleServiceUnregister(request: Request, env: Env) {
+  const ownerId = await requireOwnerId(request);
+  await env.DB.prepare("DELETE FROM service_installations WHERE owner_id = ?").bind(ownerId).run();
+  await env.DB.prepare(
+    `UPDATE handoff_threads
+      SET visible = 0, handoff_enabled = 0, status = 'stopped', updated_at = ?
+      WHERE owner_id = ? AND catalog_source = 'service'`,
+  ).bind(nowIso(), ownerId).run();
+  const binding = await findPhoneBindingForOwner(env, ownerId);
+  let activeThreadId = binding?.active_thread_id ?? null;
+  if (binding) {
+    activeThreadId = (await listEnabledThreadsForOwner(env, ownerId))[0]?.id ?? null;
+    await setActiveThreadForOwner(env, ownerId, activeThreadId);
+  }
+  return json({ ok: true, deliveryMode: "legacy", activeThreadId });
 }
 
 function outboundEvent(value: unknown) {
@@ -816,7 +937,7 @@ function outboundEvent(value: unknown) {
 
 async function handleServiceOutbound(request: Request, env: Env) {
   const ownerId = await requireOwnerId(request);
-  const body = await readJsonBody<OutboundBody>(request);
+  const body = await readJsonBody<OutboundBody>(request, SERVICE_OUTBOUND_JSON_BODY_MAX_BYTES);
   const binding = await findPhoneBindingForOwner(env, ownerId);
   if (!binding) {
     throw Object.assign(new Error("Phone is not paired."), { status: 409 });
@@ -827,7 +948,15 @@ async function handleServiceOutbound(request: Request, env: Env) {
   if (event.kind === "thread.output" && rendered.length > 8000) {
     const bodyChunks = splitText(event.body, 7800);
     for (let index = 0; index < bodyChunks.length; index += 1) {
-      chunks.push(`${threadHeader(event.thread, { index: index + 1, total: bodyChunks.length })}\n\n${bodyChunks[index]}`);
+      chunks.push(`${threadHeader(event.thread, { index: index + 1, total: bodyChunks.length })}\n${threadTitle(event.thread)}\n\n${bodyChunks[index]}`);
+    }
+  } else if (rendered.length > 8000 && "thread" in event && event.thread) {
+    const renderedChunks = splitText(rendered, 7600);
+    for (let index = 0; index < renderedChunks.length; index += 1) {
+      const continuation = index === 0
+        ? ""
+        : `${threadHeader(event.thread, { index: index + 1, total: renderedChunks.length })}\n${threadTitle(event.thread)}\n\n`;
+      chunks.push(`${continuation}${renderedChunks[index]}`);
     }
   } else {
     chunks.push(rendered);
@@ -841,6 +970,13 @@ async function handleServiceOutbound(request: Request, env: Env) {
   for (const chunk of chunks) {
     if (chunk.length > MAX_ASSISTANT_MESSAGE_LENGTH) requestTooLarge("Rendered message is too large.");
     result = await sendSendblueMessage(env, binding.phone_number, chunk);
+  }
+  if (event.kind === "thread.progress") {
+    try {
+      await sendSendblueTypingIndicator(env, binding.phone_number, "start");
+    } catch {
+      // A progress bubble should not fail just because typing cannot resume.
+    }
   }
   return json({ ok: true, notification: { sent: true, status: result?.status, messageHandle: result?.messageHandle, parts: chunks.length } });
 }
@@ -969,12 +1105,23 @@ async function findPhoneForThread(env: Env, threadId: string) {
     .first<PhoneBindingRow>();
 }
 
+async function findDeliveryBinding(env: Env, thread: HandoffThreadRow) {
+  return await findServiceInstallation(env, thread.owner_id)
+    ? await findPhoneBindingForOwner(env, thread.owner_id)
+    : await findPhoneForThread(env, thread.id);
+}
+
 async function listEnabledThreadsForOwner(env: Env, ownerId: string) {
   const { results } = await env.DB.prepare(
     `SELECT *
       FROM handoff_threads
       WHERE owner_id = ? AND handoff_enabled = 1 AND visible = 1 AND archived = 0
-      ORDER BY updated_at DESC, created_at DESC, id DESC`,
+      ORDER BY
+        CASE status WHEN 'working' THEN 0 WHEN 'pending' THEN 1 WHEN 'error' THEN 2 ELSE 3 END,
+        COALESCE(activity_at, updated_at) DESC,
+        updated_at DESC,
+        created_at DESC,
+        id DESC`,
   ).bind(ownerId).all<HandoffThreadRow>();
   return results;
 }
@@ -1008,12 +1155,194 @@ function threadLabel(thread: HandoffThreadRow) {
   return {
     id: thread.id,
     title: threadDisplayName(thread),
+    projectKey: thread.project_key ?? thread.project_label ?? "codex",
     projectLabel: thread.project_label ?? null,
+    status: threadStatus(thread),
+    activityAt: thread.activity_at ?? thread.updated_at,
+    stateSince: thread.state_since ?? thread.activity_at ?? thread.updated_at,
+    reasoningEffort: thread.reasoning_effort ?? null,
   };
 }
 
 function menuItems(threads: HandoffThreadRow[], activeThreadId: string | null): MenuItem[] {
   return threads.map((thread) => ({ ...threadLabel(thread), current: thread.id === activeThreadId }));
+}
+
+type DirectoryStatus = "working" | "pending" | "idle" | "error";
+
+interface DirectoryProject {
+  projectKey: string;
+  projectLabel: string;
+  status: DirectoryStatus;
+  activityAt: string;
+  current: boolean;
+  threads: HandoffThreadRow[];
+}
+
+function threadStatus(thread: HandoffThreadRow): DirectoryStatus {
+  return thread.status === "working" || thread.status === "pending" || thread.status === "error"
+    ? thread.status
+    : "idle";
+}
+
+function statusRank(status: DirectoryStatus) {
+  return status === "working" ? 0 : status === "pending" ? 1 : status === "error" ? 2 : 3;
+}
+
+function projectStatus(threads: HandoffThreadRow[]): DirectoryStatus {
+  return threads.map(threadStatus).sort((a, b) => statusRank(a) - statusRank(b))[0] ?? "idle";
+}
+
+function projectGroups(threads: HandoffThreadRow[], activeThreadId: string | null) {
+  const byProject = new Map<string, HandoffThreadRow[]>();
+  for (const thread of threads) {
+    const key = thread.project_key?.trim() || thread.project_label?.trim() || "codex";
+    byProject.set(key, [...(byProject.get(key) ?? []), thread]);
+  }
+  const groups: DirectoryProject[] = [...byProject.entries()].map(([projectKey, rows]) => {
+    const sorted = [...rows].sort((a, b) => (
+      Number(b.id === activeThreadId) - Number(a.id === activeThreadId)
+      || statusRank(threadStatus(a)) - statusRank(threadStatus(b))
+      || String(b.activity_at ?? b.updated_at).localeCompare(String(a.activity_at ?? a.updated_at))
+      || b.id.localeCompare(a.id)
+    ));
+    return {
+      projectKey,
+      projectLabel: sorted[0]?.project_label?.trim() || "Other",
+      status: projectStatus(sorted),
+      activityAt: sorted.reduce((latest, row) => {
+        const value = row.activity_at ?? row.updated_at;
+        return value > latest ? value : latest;
+      }, ""),
+      current: sorted.some((row) => row.id === activeThreadId),
+      threads: sorted,
+    };
+  });
+  const byLabel = new Map<string, DirectoryProject[]>();
+  for (const group of groups) {
+    const label = group.projectLabel.toLocaleLowerCase();
+    byLabel.set(label, [...(byLabel.get(label) ?? []), group]);
+  }
+  for (const duplicates of byLabel.values()) {
+    if (duplicates.length < 2) continue;
+    [...duplicates].sort((left, right) => left.projectKey.localeCompare(right.projectKey)).forEach((group, index) => {
+      group.projectLabel = `${group.projectLabel} · ${index + 1}`;
+    });
+  }
+  return groups.sort((a, b) => (
+    Number(b.current) - Number(a.current)
+    || statusRank(a.status) - statusRank(b.status)
+    || b.activityAt.localeCompare(a.activityAt)
+    || a.projectLabel.localeCompare(b.projectLabel)
+  ));
+}
+
+function buildThreadDirectory(
+  threads: HandoffThreadRow[],
+  activeThreadId: string | null,
+  options: { rowLimit?: number; collapsedLimit?: number; expandedProjectLimit?: number; extended?: boolean } = {},
+) {
+  const rowLimit = options.rowLimit ?? 8;
+  const collapsedLimit = options.collapsedLimit ?? 5;
+  const expandedProjectLimit = options.expandedProjectLimit ?? 3;
+  const groups = projectGroups(threads, activeThreadId);
+  const important = groups.filter((group) => group.current || group.status !== "idle");
+  const expanded = [...important];
+  for (const group of groups) {
+    if (expanded.includes(group)) continue;
+    if (expanded.length >= Math.max(expandedProjectLimit, important.length)) break;
+    expanded.push(group);
+  }
+  expanded.splice(Math.max(expandedProjectLimit, Math.min(8, important.length || expandedProjectLimit)));
+
+  const visibleByProject = new Map<DirectoryProject, HandoffThreadRow[]>();
+  for (const group of expanded) visibleByProject.set(group, []);
+  let rowCount = 0;
+  while (rowCount < rowLimit) {
+    let added = false;
+    for (const group of expanded) {
+      if (rowCount >= rowLimit) break;
+      const selected = visibleByProject.get(group) ?? [];
+      const next = group.threads[selected.length];
+      if (!next) continue;
+      selected.push(next);
+      visibleByProject.set(group, selected);
+      rowCount += 1;
+      added = true;
+    }
+    if (!added) break;
+  }
+
+  let menuIndex = 1;
+  const references: string[] = [];
+  const renderedGroups = expanded.flatMap((group) => {
+    const selected = visibleByProject.get(group) ?? [];
+    if (selected.length === 0) return [];
+    const items = selected.map((thread) => {
+      references.push(`thread:${thread.id}`);
+      return { ...threadLabel(thread), current: thread.id === activeThreadId, index: menuIndex++ };
+    });
+    return [{
+      projectKey: group.projectKey,
+      projectLabel: group.projectLabel,
+      status: group.status,
+      activityAt: group.activityAt,
+      threadCount: group.threads.length,
+      hiddenCount: Math.max(0, group.threads.length - selected.length),
+      threads: items,
+    }];
+  });
+  const expandedKeys = new Set(expanded.map((group) => group.projectKey));
+  const collapsedProjects = groups.filter((group) => !expandedKeys.has(group.projectKey)).slice(0, collapsedLimit).map((group) => {
+    references.push(`project:${group.projectKey}`);
+    return {
+      projectKey: group.projectKey,
+      projectLabel: group.projectLabel,
+      status: group.status,
+      activityAt: group.activityAt,
+      threadCount: group.threads.length,
+      index: menuIndex++,
+    };
+  });
+  return {
+    directory: {
+      label: "THREADS" as const,
+      totalTasks: threads.length,
+      groups: renderedGroups,
+      collapsedProjects,
+      note: references.length > 0
+        ? options.extended
+          ? "Reply with a number to open.  /projects · /search · /help"
+          : "Reply with a number to open.  /recent · /search · /help"
+        : undefined,
+    },
+    references,
+  };
+}
+
+function buildProjectDirectory(threads: HandoffThreadRow[], activeThreadId: string | null, projectKey: string) {
+  const group = projectGroups(threads, activeThreadId).find((item) => item.projectKey === projectKey);
+  if (!group) return null;
+  const selected = group.threads.slice(0, 25);
+  const references = selected.map((thread) => `thread:${thread.id}`);
+  return {
+    directory: {
+      label: "THREADS" as const,
+      totalTasks: group.threads.length,
+      groups: [{
+        projectKey: group.projectKey,
+        projectLabel: group.projectLabel,
+        status: group.status,
+        activityAt: group.activityAt,
+        threadCount: group.threads.length,
+        hiddenCount: Math.max(0, group.threads.length - selected.length),
+        threads: selected.map((thread, index) => ({ ...threadLabel(thread), current: thread.id === activeThreadId, index: index + 1 })),
+      }],
+      collapsedProjects: [],
+      note: references.length > 0 ? "Reply with a number to open.  /threads · /search · /help" : undefined,
+    },
+    references,
+  };
 }
 
 async function saveMenuSnapshot(env: Env, binding: PhoneBindingRow, threads: HandoffThreadRow[], references?: string[]) {
@@ -1045,6 +1374,12 @@ async function findMenuSnapshot(env: Env, phoneNumber: string) {
   } catch {
     return null;
   }
+}
+
+async function hasMenuSnapshot(env: Env, phoneNumber: string) {
+  return Boolean(await env.DB.prepare(
+    "SELECT * FROM menu_snapshots WHERE phone_number = ?",
+  ).bind(phoneNumber).first<MenuSnapshotRow>());
 }
 
 function parseReplyMedia(value: string | null) {
@@ -1141,6 +1476,57 @@ async function sendControlMessage(env: Env, phoneNumber: string, message: string
   }
 }
 
+async function recordAppliedControl(
+  env: Env,
+  binding: PhoneBindingRow,
+  content: string | null,
+  externalId: string | null,
+) {
+  if (!externalId || !binding.active_thread_id) return;
+  await insertHandoffReply(env, binding.active_thread_id, content ?? "", externalId, "applied", null, binding.owner_id);
+}
+
+async function sendOwnerControl(
+  env: Env,
+  ownerId: string,
+  command: string,
+  threadId?: string | null,
+  argument?: string | null,
+) {
+  const response = await relaySocket(env).fetch(new Request(`https://imessage-handoff.internal/owners/${ownerId}/control`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ command, threadId: threadId ?? null, argument: argument ?? null }),
+  }));
+  if (response.status === 409) return false;
+  if (!response.ok) throw new Error("Local Codex service did not accept the command.");
+  const result = await response.json() as { delivered?: number };
+  return Number(result.delivered) > 0;
+}
+
+async function startTypingAndSendOwnerControl(
+  env: Env,
+  binding: PhoneBindingRow,
+  command: string,
+  argument?: string | null,
+) {
+  const delivered = await sendOwnerControl(env, binding.owner_id, command, binding.active_thread_id, argument);
+  if (!delivered) {
+    await sendControlMessage(env, binding.phone_number, renderOutboundEvent({
+      kind: "service.notice",
+      code: "needs-attention",
+      body: "The local Codex service is offline. Try again after it reconnects.",
+    }));
+    return false;
+  }
+  try {
+    await sendSendblueTypingIndicator(env, binding.phone_number, "start");
+  } catch {
+    // Typing is best effort; the local control still needs to run.
+  }
+  return true;
+}
+
 async function sendReadReceipt(env: Env, phoneNumber: string) {
   // Best effort: mark the inbound conversation as read as soon as the webhook is
   // accepted. Failure should not block pairing or prompt delivery.
@@ -1165,8 +1551,14 @@ async function setActiveThreadForOwner(env: Env, ownerId: string, threadId: stri
 }
 
 async function touchThread(env: Env, threadId: string) {
-  await env.DB.prepare("UPDATE handoff_threads SET updated_at = ? WHERE id = ?")
-    .bind(nowIso(), threadId)
+  const now = nowIso();
+  await env.DB.prepare(
+    `UPDATE handoff_threads
+      SET updated_at = ?, activity_at = ?, state_since = ?,
+          status = CASE WHEN catalog_source = 'service' THEN 'pending' ELSE status END
+      WHERE id = ?`,
+  )
+    .bind(now, now, now, threadId)
     .run();
 }
 
@@ -1553,14 +1945,23 @@ async function handleStatus(request: Request, env: Env, threadId: string) {
       SET cwd = ?,
           status = ?,
           last_stop_at = ?,
-          updated_at = ?
+          updated_at = ?,
+          activity_at = ?,
+          state_since = ?
       WHERE id = ?`,
-  ).bind(cwd, status, lastStopAt, updatedAt, threadId).run();
+  ).bind(cwd, status, lastStopAt, updatedAt, updatedAt, updatedAt, threadId).run();
 
   if (lastAssistantMessage || generatedImages.length > 0) {
-    const binding = await findPhoneForThread(env, threadId);
+    const binding = await findDeliveryBinding(env, thread);
     if (binding) {
       try {
+        if (generatedImages.length > 0 && thread.catalog_source === "service") {
+          await sendSendblueMessage(env, binding.phone_number, [
+            threadHeader(threadLabel(thread)),
+            threadDisplayName(thread),
+            "Generated output follows.",
+          ].join("\n\n"));
+        }
         const sendResult = await sendStatusNotification(env, binding.phone_number, lastAssistantMessage, generatedImages);
         if (sendResult) {
           notification = {
@@ -1604,7 +2005,8 @@ async function handleClaim(request: Request, env: Env, threadId: string, replyId
   }
   const body = await claim.json() as { ok?: boolean; reply?: unknown };
   const typingIndicator = (async () => {
-    const binding = await findPhoneForThread(env, threadId);
+    const thread = await findThread(env, threadId);
+    const binding = thread ? await findDeliveryBinding(env, thread) : null;
     if (!binding) {
       return;
     }
@@ -1807,30 +2209,62 @@ async function handleSendblueWebhook(request: Request, env: Env, ctx?: WaitUntil
 
   const commandText = content?.trim().toLowerCase() ?? "";
   const slashCommand = content ? parseSlashCommand(content) : null;
-  if (!mediaUrl && (THREAD_LIST_COMMANDS.has(commandText) || slashCommand?.command === "threads" || slashCommand?.command === "recent")) {
-    const threads = (await listEnabledThreadsForOwner(env, binding.owner_id)).slice(0, slashCommand?.command === "recent" ? 25 : 8);
-    await saveMenuSnapshot(env, binding, threads);
-    await sendControlMessage(env, fromNumber, renderThreadMenu(menuItems(threads, binding.active_thread_id), {
-      note: threads.length === 8 ? "Reply with a number to switch.\nMore: /recent or /search words" : undefined,
-    }));
+  if (!mediaUrl && (
+    THREAD_LIST_COMMANDS.has(commandText)
+    || slashCommand?.command === "threads"
+    || slashCommand?.command === "recent"
+    || slashCommand?.command === "refresh"
+  )) {
+    const threads = await listEnabledThreadsForOwner(env, binding.owner_id);
+    const extended = slashCommand?.command === "recent";
+    const planned = buildThreadDirectory(threads, binding.active_thread_id, extended
+      ? { rowLimit: 10, collapsedLimit: 10, expandedProjectLimit: 4, extended: true }
+      : {});
+    await saveMenuSnapshot(env, binding, [], planned.references);
+    await sendControlMessage(env, fromNumber, renderThreadDirectory(planned.directory, { now: new Date() }));
     if (externalId && binding.active_thread_id) {
       await insertHandoffReply(env, binding.active_thread_id, content ?? "", externalId, "applied");
     }
-    return json({ ok: true, command: "list", threadCount: threads.length });
+    return json({
+      ok: true,
+      command: slashCommand?.command === "refresh" ? "refresh" : "list",
+      threadCount: threads.length,
+      projectCount: projectGroups(threads, binding.active_thread_id).length,
+    });
   }
 
   if (!mediaUrl && slashCommand?.command === "help") {
     await sendControlMessage(env, fromNumber, renderHelp());
+    await recordAppliedControl(env, binding, content, externalId);
     return json({ ok: true, command: "help" });
   }
 
-  if (!mediaUrl && slashCommand?.command === "status") {
-    const active = binding.active_thread_id ? await findThread(env, binding.active_thread_id) : null;
-    const message = active
-      ? renderOutboundEvent({ kind: "service.notice", code: "connected", thread: threadLabel(active), body: `Status: ${active.status || "idle"}.` })
-      : renderOutboundEvent({ kind: "service.notice", code: "needs-attention", body: "No thread is selected.\nText /threads to choose one." });
-    await sendControlMessage(env, fromNumber, message);
-    return json({ ok: true, command: "status" });
+  const detailCommands: Record<string, string> = {
+    thread: "open",
+    status: "open",
+    request: "request",
+    message: "request",
+    turn: "turn",
+    history: "history",
+    reasoning: "reasoning",
+    retry: "retry",
+    dismiss: "dismiss",
+  };
+  if (!mediaUrl && slashCommand && detailCommands[slashCommand.command]) {
+    if (!binding.active_thread_id) {
+      await sendControlMessage(env, fromNumber, renderOutboundEvent({
+        kind: "service.notice",
+        code: "needs-attention",
+        body: "No thread is selected.\nText /threads to choose one.",
+      }));
+      return json({ ok: true, command: slashCommand.command, routed: false });
+    }
+    const argument = slashCommand.command === "status"
+      ? "status"
+      : slashCommand.argument;
+    const routed = await startTypingAndSendOwnerControl(env, binding, detailCommands[slashCommand.command], argument);
+    await recordAppliedControl(env, binding, content, externalId);
+    return json({ ok: true, command: slashCommand.command, routed, threadId: binding.active_thread_id });
   }
 
   if (!mediaUrl && slashCommand?.command === "search") {
@@ -1838,27 +2272,38 @@ async function handleSendblueWebhook(request: Request, env: Env, ctx?: WaitUntil
     const threads = (await listEnabledThreadsForOwner(env, binding.owner_id))
       .filter((thread) => !query || `${thread.title ?? ""} ${thread.project_label ?? ""}`.toLowerCase().includes(query))
       .slice(0, 8);
-    await saveMenuSnapshot(env, binding, threads);
+    await saveMenuSnapshot(env, binding, [], threads.map((thread) => `thread:${thread.id}`));
     await sendControlMessage(env, fromNumber, renderThreadMenu(menuItems(threads, binding.active_thread_id)));
+    await recordAppliedControl(env, binding, content, externalId);
     return json({ ok: true, command: "search", threadCount: threads.length });
   }
 
   if (!mediaUrl && slashCommand?.command === "projects") {
-    const labels = [...new Set((await listEnabledThreadsForOwner(env, binding.owner_id))
-      .map((thread) => thread.project_label?.trim() || "Other"))].slice(0, 8);
-    const items = labels.map((label) => ({ title: label }));
-    await saveMenuSnapshot(env, binding, [], labels.map((label) => `project:${label}`));
+    const groups = projectGroups(await listEnabledThreadsForOwner(env, binding.owner_id), binding.active_thread_id).slice(0, 25);
+    const items = groups.map((group) => ({
+      title: group.projectLabel,
+      projectKey: group.projectKey,
+      status: group.status,
+      activityAt: group.activityAt,
+      threadCount: group.threads.length,
+    }));
+    await saveMenuSnapshot(env, binding, [], groups.map((group) => `project:${group.projectKey}`));
     await sendControlMessage(env, fromNumber, renderThreadMenu(items, { label: "PROJECTS", note: "Reply with a number to browse that project." }));
-    return json({ ok: true, command: "projects", projectCount: labels.length });
+    await recordAppliedControl(env, binding, content, externalId);
+    return json({ ok: true, command: "projects", projectCount: groups.length });
   }
 
   if (!mediaUrl && slashCommand?.command === "cancel") {
-    await relaySocket(env).fetch(new Request(`https://imessage-handoff.internal/owners/${binding.owner_id}/control`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ command: "cancel", threadId: binding.active_thread_id }),
-    }));
-    return json({ ok: true, command: "cancel" });
+    const routed = await sendOwnerControl(env, binding.owner_id, "cancel", binding.active_thread_id);
+    if (!routed) {
+      await sendControlMessage(env, fromNumber, renderOutboundEvent({
+        kind: "service.notice",
+        code: "needs-attention",
+        body: "The local Codex service is offline. There is no connected run to cancel.",
+      }));
+    }
+    await recordAppliedControl(env, binding, content, externalId);
+    return json({ ok: true, command: "cancel", routed });
   }
 
   if (!mediaUrl && content?.trim().startsWith("/") && !slashCommand) {
@@ -1866,24 +2311,58 @@ async function handleSendblueWebhook(request: Request, env: Env, ctx?: WaitUntil
       renderOutboundEvent({ kind: "service.notice", code: "needs-attention", body: "That command is not available." }),
       renderHelp(),
     ].join("\n\n"));
+    await recordAppliedControl(env, binding, content, externalId);
     return json({ ok: true, command: "unknown" });
   }
 
   const selection = content ? parseMenuSelection(content) : null;
   const snapshotIds = !mediaUrl && selection ? await findMenuSnapshot(env, fromNumber) : null;
+  if (!mediaUrl && content && selection && !snapshotIds && await hasMenuSnapshot(env, fromNumber)) {
+    const threads = await listEnabledThreadsForOwner(env, binding.owner_id);
+    const planned = buildThreadDirectory(threads, binding.active_thread_id);
+    await saveMenuSnapshot(env, binding, [], planned.references);
+    await sendControlMessage(env, fromNumber, renderOutboundEvent({
+      kind: "service.notice",
+      code: "needs-attention",
+      body: "That menu expired. Here is a fresh directory; reply with a new number.",
+    }));
+    await sendControlMessage(env, fromNumber, renderThreadDirectory(planned.directory, { now: new Date() }));
+    if (externalId && binding.active_thread_id) {
+      await insertHandoffReply(env, binding.active_thread_id, content, externalId, "applied", null, binding.owner_id);
+    }
+    return json({ ok: true, command: "stale-menu", refreshed: true });
+  }
   if (!mediaUrl && content && selection && snapshotIds) {
     const selectedId = snapshotIds[selection.index];
     if (selectedId?.startsWith("project:")) {
-      const project = selectedId.slice("project:".length);
-      const threads = (await listEnabledThreadsForOwner(env, binding.owner_id))
-        .filter((thread) => (thread.project_label?.trim() || "Other") === project)
-        .slice(0, 8);
-      await saveMenuSnapshot(env, binding, threads);
-      await sendControlMessage(env, fromNumber, renderThreadMenu(menuItems(threads, binding.active_thread_id)));
-      return json({ ok: true, command: "project", project, threadCount: threads.length });
+      const projectKey = selectedId.slice("project:".length);
+      const threads = await listEnabledThreadsForOwner(env, binding.owner_id);
+      const planned = buildProjectDirectory(threads, binding.active_thread_id, projectKey);
+      if (!planned) {
+        await sendControlMessage(env, fromNumber, renderOutboundEvent({
+          kind: "service.notice",
+          code: "needs-attention",
+          body: "That project is no longer available.\nText /threads for a fresh list.",
+        }));
+        return json({ ok: true, command: "project", projectKey, threadCount: 0 });
+      }
+      await saveMenuSnapshot(env, binding, [], planned.references);
+      if (selection.prompt) {
+        planned.directory.note = "Choose a task first. The text after the project number was not sent; use “N: your message” on this task list.";
+      }
+      await sendControlMessage(env, fromNumber, renderThreadDirectory(planned.directory, { now: new Date() }));
+      await recordAppliedControl(env, binding, content, externalId);
+      return json({ ok: true, command: "project", projectKey, threadCount: planned.references.length, promptNotSent: Boolean(selection.prompt) });
     }
-    const selected = selectedId ? await findThread(env, selectedId) : null;
-    if (!selected) {
+    const threadId = selectedId?.startsWith("thread:") ? selectedId.slice("thread:".length) : selectedId;
+    const selected = threadId ? await findThread(env, threadId) : null;
+    if (
+      !selected
+      || selected.owner_id !== binding.owner_id
+      || selected.handoff_enabled !== 1
+      || selected.visible === 0
+      || selected.archived === 1
+    ) {
       await sendControlMessage(env, fromNumber, renderOutboundEvent({
         kind: "service.notice",
         code: "needs-attention",
@@ -1894,14 +2373,30 @@ async function handleSendblueWebhook(request: Request, env: Env, ctx?: WaitUntil
       }
       return json({ ok: true, command: "switch", switched: false });
     }
+    const persistentService = await findServiceInstallation(env, binding.owner_id);
+    const serviceOnline = Boolean(persistentService) && await isServiceSocketConnected(env, binding.owner_id);
+    const contextChanged = binding.active_thread_id !== selected.id;
     await setActiveThreadForOwner(env, binding.owner_id, selected.id);
-    await sendControlMessage(env, fromNumber, renderOutboundEvent({ kind: "service.switched", thread: threadLabel(selected) }));
+    if (contextChanged && persistentService) {
+      await sendControlMessage(env, fromNumber, renderOutboundEvent({ kind: "service.switched", thread: threadLabel(selected) }));
+    }
     if (selection.prompt) {
-      const replyId = await insertHandoffReply(env, selected.id, selection.prompt, externalId, "pending", null, binding.owner_id);
+      if ((persistentService || selected.catalog_source === "service") && !serviceOnline) {
+        await sendControlMessage(env, fromNumber, renderOutboundEvent({
+          kind: "service.notice",
+          code: "needs-attention",
+          body: "The local Codex service is offline. Your message was not queued; try again after it reconnects.",
+        }));
+        return json({ ok: true, command: "switch-and-send", switched: true, threadId: selected.id, serviceOffline: true });
+      }
+      const replyId = await insertHandoffReply(env, selected.id, selection.prompt, externalId, "pending", null, serviceOnline ? binding.owner_id : null);
+      await touchThread(env, selected.id);
       return json({ ok: true, command: "switch-and-send", switched: true, threadId: selected.id, replyId });
     } else if (externalId) {
       await insertHandoffReply(env, selected.id, content, externalId, "applied");
     }
+    const selectedBinding = { ...binding, active_thread_id: selected.id };
+    if (persistentService) await startTypingAndSendOwnerControl(env, selectedBinding, "open");
     return json({ ok: true, command: "switch", switched: true, threadId: selected.id });
   }
 
@@ -1911,13 +2406,22 @@ async function handleSendblueWebhook(request: Request, env: Env, ctx?: WaitUntil
   }
 
   const activeThread = await findThread(env, binding.active_thread_id);
-  if (!activeThread || activeThread.handoff_enabled !== 1) {
+  if (!activeThread || activeThread.handoff_enabled !== 1 || activeThread.visible === 0 || activeThread.archived === 1) {
     await setActiveThreadForOwner(env, binding.owner_id, null);
     await sendControlMessage(env, fromNumber, renderOutboundEvent({ kind: "service.notice", code: "needs-attention", body: "The selected thread is no longer available.\nText /threads to choose another." }));
     return json({ ok: true, ignored: true, noActiveThread: true });
   }
 
   const serviceDelivery = await findServiceInstallation(env, binding.owner_id);
+  const serviceOnline = Boolean(serviceDelivery) && await isServiceSocketConnected(env, binding.owner_id);
+  if ((serviceDelivery || activeThread.catalog_source === "service") && !serviceOnline) {
+    await sendControlMessage(env, fromNumber, renderOutboundEvent({
+      kind: "service.notice",
+      code: "needs-attention",
+      body: "The local Codex service is offline. Restart iMessage Handoff before sending task messages.",
+    }));
+    return json({ ok: true, ignored: true, serviceOffline: true });
+  }
   const replyId = await insertHandoffReply(
     env,
     binding.active_thread_id,
@@ -1925,7 +2429,7 @@ async function handleSendblueWebhook(request: Request, env: Env, ctx?: WaitUntil
     externalId,
     "pending",
     mediaUrl,
-    serviceDelivery?.delivery_mode === "service" ? binding.owner_id : null,
+    serviceOnline && serviceDelivery?.delivery_mode === "service" ? binding.owner_id : null,
   );
   await touchThread(env, binding.active_thread_id);
   return json({ ok: true, replyId });
@@ -2045,6 +2549,9 @@ export async function handleRequest(request: Request, env: Env, ctx?: WaitUntilC
 
     if (url.pathname === "/service/register" && request.method === "POST") {
       return await handleServiceRegister(request, env);
+    }
+    if (url.pathname === "/service/register" && request.method === "DELETE") {
+      return await handleServiceUnregister(request, env);
     }
     if (url.pathname === "/service/catalog" && request.method === "PUT") {
       return await handleServiceCatalog(request, env);

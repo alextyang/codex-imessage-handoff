@@ -15,6 +15,7 @@ test("runner passes the exact user message through stdin", async () => {
 import { readFileSync, writeFileSync } from "node:fs";
 const input = readFileSync(0, "utf8");
 writeFileSync(process.env.IMESSAGE_TEST_CAPTURE, input);
+writeFileSync(process.env.IMESSAGE_TEST_CAPTURE + ".args", JSON.stringify(process.argv.slice(2)));
 const index = process.argv.indexOf("--output-last-message");
 writeFileSync(process.argv[index + 1], "A clean answer.");
 console.log(JSON.stringify({type:"turn.started"}));
@@ -32,9 +33,15 @@ console.log(JSON.stringify({type:"turn.completed"}));
     const result = await new CodexRunner({ codexPath: fake }).run({
       thread: { id: "thread-1", cwd: directory },
       prompt,
+      reasoningEffort: "high",
       onPhase: (phase) => phases.push(phase),
     });
     assert.equal(readFileSync(capture, "utf8"), prompt);
+    assert.deepEqual(JSON.parse(readFileSync(`${capture}.args`, "utf8")).slice(0, 3), [
+      "exec",
+      "--config",
+      'model_reasoning_effort="high"',
+    ]);
     assert.equal(result.body, "A clean answer.");
     assert.deepEqual(result.generatedImages, [image]);
     assert.deepEqual(phases, ["Starting work.", "Finishing the response."]);
@@ -44,4 +51,14 @@ console.log(JSON.stringify({type:"turn.completed"}));
     if (previousImage === undefined) delete process.env.IMESSAGE_TEST_IMAGE;
     else process.env.IMESSAGE_TEST_IMAGE = previousImage;
   }
+});
+
+test("runner reports a missing Codex executable without hanging", async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "imessage-runner-missing-"));
+  const runner = new CodexRunner({ codexPath: path.join(directory, "missing-codex") });
+  await assert.rejects(
+    runner.run({ thread: { id: "thread-missing", cwd: directory }, prompt: "Hello" }),
+    (error) => error.code === "CODEX_UNAVAILABLE",
+  );
+  assert.equal(runner.isRunning(), false);
 });

@@ -66,25 +66,38 @@ class FakeD1Database {
   serviceInstallations = new Map<string, ServiceInstallationRow>();
   installationPairings = new Map<string, InstallationPairingRow>();
   menuSnapshots = new Map<string, MenuSnapshotRow>();
+  runCount = 0;
 
   prepare(sql: string) {
     return new FakeStatement(this, sql);
   }
 
   run(sql: string, values: unknown[]) {
+    this.runCount += 1;
     if (sql.includes("INSERT INTO handoff_threads")) {
-      if (sql.includes("catalog_source")) {
-        const [id, ownerId, cwd, title, createdAt, updatedAt, projectLabel, archived, visible, lastSeenAt] = values as Array<string | number | null>;
-        const existing = this.threads.get(String(id));
-        this.threads.set(String(id), {
-          id: String(id), owner_id: String(ownerId), cwd: String(cwd), title: title ? String(title) : null,
-          handoff_summary: existing?.handoff_summary ?? null, status: existing?.status ?? "idle", handoff_enabled: 1,
-          pairing_code: null, pairing_code_expires_at: null, last_stop_at: existing?.last_stop_at ?? null,
-          created_at: existing?.created_at ?? String(createdAt), updated_at: String(updatedAt),
-          project_label: projectLabel ? String(projectLabel) : null, catalog_source: "service",
-          archived: Number(archived), visible: Number(visible), last_seen_at: String(lastSeenAt),
-        });
-        return { meta: { changes: 1 } };
+      if (sql.includes("json_each")) {
+        const [itemsJson, ownerId, lastSeenAt, catalogGeneration] = values as string[];
+        const items = JSON.parse(itemsJson) as Array<Record<string, unknown>>;
+        let changes = 0;
+        for (const item of items) {
+          const id = String(item.id);
+          const existing = this.threads.get(id);
+          if (existing && existing.owner_id !== String(ownerId)) continue;
+          this.threads.set(id, {
+            id, owner_id: String(ownerId), cwd: String(item.cwd), title: item.title ? String(item.title) : null,
+            handoff_summary: existing?.handoff_summary ?? null, status: String(item.status), handoff_enabled: 1,
+            pairing_code: null, pairing_code_expires_at: null, last_stop_at: existing?.last_stop_at ?? null,
+            created_at: existing?.created_at ?? String(item.createdAt), updated_at: String(item.updatedAt),
+            project_label: item.projectLabel ? String(item.projectLabel) : null, catalog_source: "service",
+            project_key: item.projectKey ? String(item.projectKey) : null,
+            archived: Number(item.archived), visible: Number(item.visible), last_seen_at: String(lastSeenAt),
+            catalog_generation: String(catalogGeneration),
+            activity_at: String(item.activityAt), state_since: String(item.stateSince),
+            reasoning_effort: item.reasoningEffort ? String(item.reasoningEffort) : null,
+          });
+          changes += 1;
+        }
+        return { meta: { changes } };
       }
       const [id, ownerId, cwd, title, handoffSummary, pairingCode, pairingCodeExpiresAt, createdAt, updatedAt] = values as string[];
       const existing = this.threads.get(id);
@@ -101,6 +114,9 @@ class FakeD1Database {
         last_stop_at: existing?.last_stop_at ?? null,
         created_at: existing?.created_at ?? createdAt,
         updated_at: updatedAt,
+        catalog_source: "legacy",
+        archived: 0,
+        visible: 1,
       });
       return { meta: { changes: 1 } };
     }
@@ -112,6 +128,10 @@ class FakeD1Database {
         delivery_mode: "service", last_seen_at: lastSeenAt, created_at: this.serviceInstallations.get(ownerId)?.created_at ?? createdAt, updated_at: updatedAt,
       });
       return { meta: { changes: 1 } };
+    }
+
+    if (sql.includes("DELETE FROM service_installations")) {
+      return { meta: { changes: this.serviceInstallations.delete(String(values[0])) ? 1 : 0 } };
     }
 
     if (sql.includes("INSERT INTO installation_pairings")) {
@@ -154,6 +174,54 @@ class FakeD1Database {
       return { meta: { changes: binding ? 1 : 0 } };
     }
 
+    if (sql.includes("SET visible = 0, handoff_enabled = 0") && sql.includes("catalog_source = 'service'")) {
+      const [updatedAt, ownerId] = values as string[];
+      let changes = 0;
+      for (const thread of this.threads.values()) {
+        if (thread.owner_id === ownerId && thread.catalog_source === "service") {
+          thread.visible = 0;
+          thread.handoff_enabled = 0;
+          thread.status = "stopped";
+          thread.updated_at = updatedAt;
+          changes += 1;
+        }
+      }
+      return { meta: { changes } };
+    }
+
+    if (sql.includes("UPDATE handoff_threads") && sql.includes("SET visible = 0") && sql.includes("catalog_source = 'service'")) {
+      const [lastSeenAt, ownerId, catalogGeneration] = values as string[];
+      let changes = 0;
+      for (const thread of this.threads.values()) {
+        if (
+          thread.owner_id === ownerId
+          && thread.catalog_source === "service"
+          && (thread.catalog_generation ?? "") !== catalogGeneration
+        ) {
+          thread.visible = 0;
+          thread.last_seen_at = lastSeenAt;
+          changes += 1;
+        }
+      }
+      return { meta: { changes } };
+    }
+
+    if (sql.includes("UPDATE handoff_threads") && sql.includes("SET visible = 0") && sql.includes("COALESCE(catalog_source")) {
+      const [lastSeenAt, ownerId, catalogGeneration] = values as string[];
+      let changes = 0;
+      for (const thread of this.threads.values()) {
+        if (
+          thread.owner_id === ownerId
+          && (thread.catalog_source !== "service" || (thread.catalog_generation ?? "") !== catalogGeneration)
+        ) {
+          thread.visible = 0;
+          thread.last_seen_at = lastSeenAt;
+          changes += 1;
+        }
+      }
+      return { meta: { changes } };
+    }
+
     if (sql.includes("UPDATE handoff_threads") && sql.includes("pairing_code = NULL") && !sql.includes("handoff_enabled = 0")) {
       if (sql.includes("WHERE owner_id = ?")) {
         const [updatedAt, ownerId, excludedId] = values as string[];
@@ -191,18 +259,21 @@ class FakeD1Database {
       return { meta: { changes: 1 } };
     }
 
-    if (sql.includes("UPDATE handoff_threads SET updated_at = ? WHERE id = ?")) {
-      const [updatedAt, id] = values as string[];
+    if (sql.includes("status = CASE WHEN catalog_source = 'service' THEN 'pending'")) {
+      const [updatedAt, activityAt, stateSince, id] = values as string[];
       const thread = this.threads.get(id);
       if (!thread) {
         return { meta: { changes: 0 } };
       }
       thread.updated_at = updatedAt;
+      thread.activity_at = activityAt;
+      thread.state_since = stateSince;
+      if (thread.catalog_source === "service") thread.status = "pending";
       return { meta: { changes: 1 } };
     }
 
-    if (sql.includes("UPDATE handoff_threads")) {
-      const [cwd, status, lastStopAt, updatedAt, id] = values as Array<string | null>;
+    if (sql.includes("UPDATE handoff_threads") && sql.includes("SET cwd = ?")) {
+      const [cwd, status, lastStopAt, updatedAt, activityAt, stateSince, id] = values as Array<string | null>;
       const thread = this.threads.get(String(id));
       if (!thread) {
         return { meta: { changes: 0 } };
@@ -211,6 +282,8 @@ class FakeD1Database {
       thread.status = String(status);
       thread.last_stop_at = String(lastStopAt);
       thread.updated_at = String(updatedAt);
+      thread.activity_at = String(activityAt);
+      thread.state_since = String(stateSince);
       return { meta: { changes: 1 } };
     }
 
@@ -281,6 +354,7 @@ class FakeD1Database {
 
     if (sql.includes("FROM menu_snapshots WHERE phone_number = ?")) {
       const row = this.menuSnapshots.get(String(values[0]));
+      if (!sql.includes("expires_at > ?")) return (row ?? null) as T | null;
       return (row && row.expires_at > String(values[1]) ? row : null) as T | null;
     }
     if (sql.includes("FROM phone_bindings WHERE phone_number = ?")) {
@@ -323,12 +397,15 @@ class FakeD1Database {
     if (sql.includes("FROM handoff_threads") && sql.includes("handoff_enabled = 1")) {
       const ownerId = String(values[0]);
       const results = [...this.threads.values()]
-        .filter((thread) => thread.owner_id === ownerId && thread.handoff_enabled === 1)
-        .sort((a, b) => (
-          b.updated_at.localeCompare(a.updated_at)
-          || b.created_at.localeCompare(a.created_at)
-          || b.id.localeCompare(a.id)
-        )) as T[];
+        .filter((thread) => thread.owner_id === ownerId && thread.handoff_enabled === 1 && thread.visible !== 0 && thread.archived !== 1)
+        .sort((a, b) => {
+          const rank = (status: string) => status === "working" ? 0 : status === "pending" ? 1 : status === "error" ? 2 : 3;
+          return rank(a.status) - rank(b.status)
+            || String(b.activity_at ?? b.updated_at).localeCompare(String(a.activity_at ?? a.updated_at))
+            || b.updated_at.localeCompare(a.updated_at)
+            || b.created_at.localeCompare(a.created_at)
+            || b.id.localeCompare(a.id);
+        }) as T[];
       return { results };
     }
 
@@ -365,6 +442,24 @@ function attachRelayBuffer(testEnv: Env) {
         id,
         fetch: (request: Request) => relay.fetch(request),
       } as unknown as DurableObjectStub;
+    },
+  } as unknown as DurableObjectNamespace;
+  relayBuffers.set(testEnv, relay);
+  return relay;
+}
+
+function attachOwnerControlCapture(testEnv: Env, sent: Array<Record<string, unknown>>) {
+  const relay = new HandoffSocket({
+    acceptWebSocket() {},
+    getWebSockets(tag?: string) {
+      if (tag !== `owner:${DEV_OWNER_ID}`) return [];
+      return [{ send(message: string) { sent.push(JSON.parse(message)); } }];
+    },
+  } as unknown as DurableObjectState);
+  testEnv.HANDOFF_SOCKET = {
+    idFromName(name: string) { return { name } as unknown as DurableObjectId; },
+    get(id: DurableObjectId) {
+      return { id, fetch: (request: Request) => relay.fetch(request) } as unknown as DurableObjectStub;
     },
   } as unknown as DurableObjectNamespace;
   relayBuffers.set(testEnv, relay);
@@ -698,6 +793,39 @@ test("relay buffer sends queued replies to a socket on connect", async () => {
   assert.equal(message.type, "reply-pending");
   assert.equal(message.threadId, "thread-test-1");
   assert.match(message.replyId, /^reply_/);
+});
+
+test("installation socket receives every offline pending reply and claim advances the queue", async () => {
+  const sent: string[] = [];
+  let connected = false;
+  const relay = new HandoffSocket({
+    acceptWebSocket() {},
+    getWebSockets(tag?: string) {
+      return connected && tag === "owner:owner-all"
+        ? [{ send(message: string) { sent.push(message); } }]
+        : [];
+    },
+  } as unknown as DurableObjectState);
+  const insert = async (externalId: string) => {
+    const response = await relay.fetch(new Request("https://imessage-handoff.internal/threads/thread-all/replies", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ body: externalId, externalId, status: "pending", ownerId: "owner-all" }),
+    }));
+    return String((await response.json() as { id: string }).id);
+  };
+  const first = await insert("offline-1");
+  const second = await insert("offline-2");
+  connected = true;
+  (relay as unknown as {
+    notifyOwnerSocketOrSchedule(ownerId: string, socket: { send(message: string): void }): void;
+  }).notifyOwnerSocketOrSchedule("owner-all", { send(message: string) { sent.push(message); } });
+  assert.deepEqual(sent.map((value) => JSON.parse(value).replyId), [first, second]);
+
+  sent.length = 0;
+  const claim = await relay.fetch(new Request(`https://imessage-handoff.internal/threads/thread-all/replies/${first}/claim`, { method: "POST" }));
+  assert.equal(claim.status, 200);
+  assert.equal(JSON.parse(sent.at(-1) || "{}").replyId, second);
 });
 
 test("relay buffer waits for media group quiet window before websocket notification", async () => {
@@ -1131,7 +1259,7 @@ test("starting another thread for a paired user makes it active", async () => {
   assert.equal(pendingReplies(testEnv, secondThreadId).length, 1);
 });
 
-test("list command returns numbered enabled threads without status labels", async () => {
+test("list command returns a numbered grouped directory with live status", async () => {
   const testEnv = env();
   const firstThreadId = await register(testEnv);
   const db = testEnv.DB as unknown as FakeD1Database;
@@ -1156,10 +1284,12 @@ test("list command returns numbered enabled threads without status labels", asyn
 
     const response = await handleRequest(sendblueWebhook(inboundMessage("list", "list_msg_1")), testEnv);
     assert.equal(response.status, 200);
-    assert.deepEqual(outboundContents(calls), [
-      "CODEX · THREADS\n\n1  Second  • current\n2  iMessage test\n\nReply with a number to switch.",
-    ]);
-    assert.doesNotMatch(String(calls[0]?.content), /enabled|stopped/i);
+    const directory = String(outboundContents(calls).at(-1));
+    assert.match(directory, /^CODEX CONTROL · THREADS/);
+    assert.match(directory, /OTHER\n1\. Second/);
+    assert.match(directory, /Selected · Idle/);
+    assert.match(directory, /2\. iMessage test/);
+    assert.doesNotMatch(directory, /enabled|stopped/i);
     const pending = pendingReplies(testEnv);
     assert.deepEqual(pending, []);
   } finally {
@@ -1184,7 +1314,7 @@ test("list command reports when the paired phone has no iMessage handoff threads
   try {
     const response = await handleRequest(sendblueWebhook(inboundMessage("list", "list_msg_empty")), testEnv);
     assert.equal(response.status, 200);
-    assert.deepEqual(outboundContents(calls), ["CODEX · THREADS\n\nNo available threads."]);
+    assert.deepEqual(outboundContents(calls), ["CODEX CONTROL · THREADS\n\n0 tasks · refreshed now\n\nNo available tasks."]);
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -1207,7 +1337,7 @@ test("normal text reports when there is no active thread to forward to", async (
   try {
     const response = await handleRequest(sendblueWebhook(inboundMessage("What is 2 + 2?", "msg_no_thread")), testEnv);
     assert.equal(response.status, 200);
-    assert.deepEqual(outboundContents(calls), ["CODEX · NEEDS ATTENTION\n\nNo thread is selected.\nText /threads to choose one."]);
+    assert.deepEqual(outboundContents(calls), ["CODEX CONTROL · NEEDS ATTENTION\n\nNo thread is selected.\nText /threads to choose one."]);
     const pending = pendingReplies(testEnv);
     assert.deepEqual(pending, []);
   } finally {
@@ -1243,7 +1373,7 @@ test("number command switches the active thread using the current list order", a
     const response = await handleRequest(sendblueWebhook(inboundMessage("2", "switch_msg_1")), testEnv);
     assert.equal(response.status, 200);
     assert.equal(db.phoneBindings.get("+15551234567")?.active_thread_id, firstThreadId);
-    assert.deepEqual(outboundContents(calls), ["CODEX · SWITCHED\n\niMessage test\n\nSend a message to continue this thread."]);
+    assert.deepEqual(outboundContents(calls), []);
 
     await handleRequest(sendblueWebhook(inboundMessage("Now use the first thread", "msg_2")), testEnv);
     assert.equal(pendingReplies(testEnv, firstThreadId).length, 1);
@@ -1272,8 +1402,33 @@ test("out-of-range menu selection does not change the active thread or enqueue a
     const response = await handleRequest(sendblueWebhook(inboundMessage("2", "switch_msg_bad")), testEnv);
     assert.equal(response.status, 200);
     assert.equal(db.phoneBindings.get("+15551234567")?.active_thread_id, threadId);
-    assert.deepEqual(outboundContents(calls), ["CODEX · NEEDS ATTENTION\n\nThat menu has changed.\nText /threads for a fresh list."]);
+    assert.deepEqual(outboundContents(calls), ["CODEX CONTROL · NEEDS ATTENTION\n\nThat menu has changed.\nText /threads for a fresh list."]);
     assert.deepEqual(pendingReplies(testEnv, threadId), []);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("expired numeric menu replies refresh the directory instead of reaching Codex", async () => {
+  const testEnv = env();
+  const threadId = await register(testEnv);
+  const db = testEnv.DB as unknown as FakeD1Database;
+  await handleRequest(sendblueWebhook(inboundMessage(String(db.threads.get(threadId)?.pairing_code), "pair_expired_menu")), testEnv);
+  const originalFetch = globalThis.fetch;
+  const calls: Array<Record<string, unknown>> = [];
+  globalThis.fetch = async (_input, init) => {
+    calls.push(JSON.parse(String(init?.body)));
+    return new Response(JSON.stringify({ status: "QUEUED", message_handle: `message-${calls.length}` }), { status: 200 });
+  };
+  try {
+    await handleRequest(sendblueWebhook(inboundMessage("/threads", "expired_menu_list")), testEnv);
+    db.menuSnapshots.get("+15551234567")!.expires_at = "2020-01-01T00:00:00.000Z";
+    calls.length = 0;
+    const response = await handleRequest(sendblueWebhook(inboundMessage("1", "expired_menu_choice")), testEnv);
+    assert.equal((await json(response)).command, "stale-menu");
+    assert.equal(pendingReplies(testEnv, threadId).length, 0);
+    assert.match(String(outboundContents(calls)[0]), /menu expired/i);
+    assert.match(String(outboundContents(calls)[1]), /^CODEX CONTROL · THREADS/);
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -1313,9 +1468,10 @@ test("stopping a thread disables it and switches to the newest remaining thread"
     assert.equal(db.phoneBindings.get("+15551234567")?.active_thread_id, firstThreadId);
 
     await handleRequest(sendblueWebhook(inboundMessage("list", "list_after_stop")), testEnv);
-    assert.deepEqual(outboundContents(calls), [
-      "CODEX · THREADS\n\n1  iMessage test  • current\n\nReply with a number to switch.",
-    ]);
+    const directory = String(outboundContents(calls).at(-1));
+    assert.match(directory, /^CODEX CONTROL · THREADS/);
+    assert.match(directory, /1\. iMessage test/);
+    assert.match(directory, /Selected · Idle/);
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -2288,17 +2444,27 @@ test("persistent service registers and synchronizes a thread catalog", async () 
   const registration = await registerService(testEnv);
   assert.equal(registration.pairingRequired, true);
   assert.equal(String(registration.pairingCode).length, 6);
+  const offlineStatus = await handleRequest(req("/service/status", { headers: { authorization: "Bearer dev-token" } }), testEnv);
+  assert.equal((await json(offlineStatus)).connected, false);
+  attachOwnerControlCapture(testEnv, []);
+  const onlineStatus = await handleRequest(req("/service/status", { headers: { authorization: "Bearer dev-token" } }), testEnv);
+  assert.equal((await json(onlineStatus)).connected, true);
 
   const response = await handleRequest(req("/service/catalog", {
     method: "PUT",
     headers: { authorization: "Bearer dev-token" },
-    body: JSON.stringify({ threads: [{
+    body: JSON.stringify({ complete: true, threads: [{
       id: "service-thread-1",
       title: "Service redesign",
       cwd: "/tmp/imessage",
+      projectKey: "project-imessage",
       projectLabel: "imessage",
       createdAt: "2026-07-01T00:00:00.000Z",
       updatedAt: "2026-07-12T00:00:00.000Z",
+      activityAt: "2026-07-12T00:01:00.000Z",
+      stateSince: "2026-07-12T00:00:30.000Z",
+      status: "pending",
+      reasoningEffort: "high",
       visible: true,
       archived: false,
     }] }),
@@ -2308,7 +2474,250 @@ test("persistent service registers and synchronizes a thread catalog", async () 
   assert.equal(body.synchronized, 1);
   const row = (testEnv.DB as unknown as FakeD1Database).threads.get("service-thread-1");
   assert.equal(row?.catalog_source, "service");
+  assert.equal(row?.project_key, "project-imessage");
   assert.equal(row?.project_label, "imessage");
+  assert.equal(row?.status, "pending");
+  assert.equal(row?.activity_at, "2026-07-12T00:01:00.000Z");
+  assert.equal(row?.state_since, "2026-07-12T00:00:30.000Z");
+  assert.equal(row?.reasoning_effort, "high");
+});
+
+test("persistent service unregister restores legacy relay delivery", async () => {
+  const testEnv = env();
+  await registerService(testEnv);
+  await handleRequest(req("/service/catalog", {
+    method: "PUT",
+    headers: { authorization: "Bearer dev-token" },
+    body: JSON.stringify({ complete: true, threads: [{ id: "unregister-task", title: "Task", cwd: "project" }] }),
+  }), testEnv);
+  (testEnv.DB as unknown as FakeD1Database).phoneBindings.set("+15551234567", {
+    phone_number: "+15551234567", owner_id: DEV_OWNER_ID, active_thread_id: "unregister-task",
+    contact_card_sent_at: null, created_at: "2026-07-12T00:00:00.000Z", updated_at: "2026-07-12T00:00:00.000Z",
+  });
+  const response = await handleRequest(req("/service/register", {
+    method: "DELETE",
+    headers: { authorization: "Bearer dev-token" },
+  }), testEnv);
+  assert.equal(response.status, 200);
+  assert.equal((testEnv.DB as unknown as FakeD1Database).serviceInstallations.has(DEV_OWNER_ID), false);
+  assert.equal((testEnv.DB as unknown as FakeD1Database).threads.get("unregister-task")?.visible, 0);
+  assert.equal((testEnv.DB as unknown as FakeD1Database).threads.get("unregister-task")?.handoff_enabled, 0);
+  assert.equal((testEnv.DB as unknown as FakeD1Database).phoneBindings.get("+15551234567")?.active_thread_id, null);
+  assert.equal((await json(response)).deliveryMode, "legacy");
+
+  const legacy = await handleRequest(req("/threads/unregister-task", {
+    method: "POST",
+    headers: { authorization: "Bearer dev-token" },
+    body: JSON.stringify({ cwd: "/tmp/project", title: "Task" }),
+  }), testEnv);
+  assert.equal(legacy.status, 200);
+  assert.equal((testEnv.DB as unknown as FakeD1Database).threads.get("unregister-task")?.catalog_source, "legacy");
+  assert.equal((testEnv.DB as unknown as FakeD1Database).threads.get("unregister-task")?.visible, 1);
+  const inbound = await handleRequest(sendblueWebhook(inboundMessage("Legacy message", "legacy-after-unregister")), testEnv);
+  assert.equal(inbound.status, 200);
+  assert.equal(pendingReplies(testEnv, "unregister-task").length, 1);
+});
+
+test("persistent service catalog is a validated full replacement", async () => {
+  const testEnv = env();
+  await registerService(testEnv);
+  const put = (body: Record<string, unknown>) => handleRequest(req("/service/catalog", {
+    method: "PUT",
+    headers: { authorization: "Bearer dev-token" },
+    body: JSON.stringify(body),
+  }), testEnv);
+  const thread = (id: string, projectKey: string) => ({
+    id, title: id, cwd: projectKey, projectKey, projectLabel: "Shared label",
+    updatedAt: "2026-07-12T00:00:00.000Z", activityAt: "2026-07-12T00:00:00.000Z",
+    status: "idle",
+  });
+
+  const db = testEnv.DB as unknown as FakeD1Database;
+  db.threads.set("legacy-stale", {
+    id: "legacy-stale", owner_id: DEV_OWNER_ID, cwd: "legacy", title: "Legacy task",
+    handoff_summary: null, status: "idle", handoff_enabled: 1, pairing_code: null,
+    pairing_code_expires_at: null, last_stop_at: null, created_at: "2026-01-01T00:00:00.000Z",
+    updated_at: "2026-01-01T00:00:00.000Z", visible: 1,
+  });
+  assert.equal((await put({ complete: true, threads: [thread("one", "project-one"), thread("two", "project-two")] })).status, 200);
+  assert.equal(db.threads.get("legacy-stale")?.visible, 0, "service snapshots retire leftover legacy rows");
+  const firstGeneration = db.threads.get("one")?.catalog_generation;
+  assert.ok(firstGeneration);
+  assert.equal(db.threads.get("two")?.catalog_generation, firstGeneration);
+  assert.equal((await put({ complete: true, threads: [thread("two", "project-two")] })).status, 200);
+  assert.equal(db.threads.get("one")?.visible, 0);
+  assert.equal(db.threads.get("two")?.visible, 1);
+  assert.notEqual(db.threads.get("two")?.catalog_generation, firstGeneration);
+
+  const duplicate = await put({ complete: true, threads: [thread("two", "project-two"), thread("two", "project-two")] });
+  assert.equal(duplicate.status, 400);
+  assert.match(String((await json(duplicate)).error), /unique/i);
+  assert.equal(db.threads.get("two")?.visible, 1, "validation happens before replacement");
+
+  const incomplete = await put({ threads: [thread("two", "project-two")] });
+  assert.equal(incomplete.status, 400);
+  assert.match(String((await json(incomplete)).error), /complete/i);
+
+  const large = Array.from({ length: 500 }, (_, index) => ({
+    ...thread(`large-${index}`, `project-${index}`),
+    title: `Task ${index} ${"x".repeat(145)}`.slice(0, 160),
+  }));
+  const writesBeforeLargeSync = db.runCount;
+  const largeResponse = await put({ complete: true, threads: large });
+  assert.equal(largeResponse.status, 200, "the advertised 500-task snapshot fits the catalog body cap");
+  assert.equal(db.runCount - writesBeforeLargeSync, 2, "catalog replacement is one set-based upsert plus one stale-row update");
+
+  const existing = db.threads.get("large-0");
+  db.threads.set("foreign-id", { ...existing!, id: "foreign-id", owner_id: "another-owner" });
+  const collision = await put({ complete: true, threads: [thread("foreign-id", "foreign-project")] });
+  assert.equal(collision.status, 409);
+  assert.equal(db.threads.get("foreign-id")?.owner_id, "another-owner");
+});
+
+test("thread detail commands route immediately with arguments and start typing", async () => {
+  const testEnv = env();
+  const registration = await registerService(testEnv);
+  await handleRequest(req("/service/catalog", {
+    method: "PUT",
+    headers: { authorization: "Bearer dev-token" },
+    body: JSON.stringify({ complete: true, threads: [{
+      id: "service-thread-1", title: "Service redesign", cwd: "imessage",
+      projectKey: "project-imessage", projectLabel: "imessage", status: "idle",
+    }] }),
+  }), testEnv);
+  await handleRequest(sendblueWebhook(inboundMessage(String(registration.pairingCode), "service-pair-controls")), testEnv);
+  const controls: Array<Record<string, unknown>> = [];
+  attachOwnerControlCapture(testEnv, controls);
+  const calls: string[] = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (input) => {
+    calls.push(String(input));
+    return new Response(JSON.stringify({ status: "SENT", message_handle: `out-${calls.length}` }), { status: 200 });
+  };
+  try {
+    const commands = [
+      ["/history 3", "history", "3"],
+      ["/message", "request", null],
+      ["/turn", "turn", null],
+      ["/reasoning high", "reasoning", "high"],
+      ["/status", "open", "status"],
+      ["/retry", "retry", null],
+      ["/dismiss", "dismiss", null],
+    ] as const;
+    for (let index = 0; index < commands.length; index += 1) {
+      const [text, command, argument] = commands[index];
+      const response = await handleRequest(sendblueWebhook(inboundMessage(text, `control-${index}`)), testEnv);
+      assert.equal(response.status, 200);
+      assert.deepEqual(controls.at(-1), {
+        type: "control", command, threadId: "service-thread-1", argument,
+      });
+    }
+    assert.ok(calls.filter((url) => url.includes("send-typing-indicator")).length >= commands.length);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("thread controls report an offline local service instead of disappearing", async () => {
+  const testEnv = env();
+  const registration = await registerService(testEnv);
+  await handleRequest(req("/service/catalog", {
+    method: "PUT",
+    headers: { authorization: "Bearer dev-token" },
+    body: JSON.stringify({ complete: true, threads: [{ id: "offline-thread", title: "Offline task", cwd: "offline", projectKey: "offline", projectLabel: "Offline" }] }),
+  }), testEnv);
+  await handleRequest(sendblueWebhook(inboundMessage(String(registration.pairingCode), "offline_pair")), testEnv);
+  const calls: Array<{ url: string; body: Record<string, unknown> }> = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (input, init) => {
+    calls.push({ url: String(input), body: init?.body ? JSON.parse(String(init.body)) : {} });
+    return new Response(JSON.stringify({ status: "SENT", message_handle: `offline-${calls.length}` }), { status: 200 });
+  };
+  try {
+    const response = await handleRequest(sendblueWebhook(inboundMessage("/thread", "offline_control")), testEnv);
+    assert.equal((await json(response)).routed, false);
+    assert.match(String(outboundContents(calls.map((call) => call.body)).at(-1)), /local Codex service is offline/i);
+    assert.equal(calls.some((call) => call.url.includes("send-typing-indicator")), false);
+    const ordinary = await handleRequest(sendblueWebhook(inboundMessage("Please run the tests", "offline_prompt")), testEnv);
+    assert.equal((await json(ordinary)).serviceOffline, true);
+    assert.equal(pendingReplies(testEnv, "offline-thread").length, 0);
+    assert.match(String(outboundContents(calls.map((call) => call.body)).at(-1)), /local Codex service is offline/i);
+    await handleRequest(sendblueWebhook(inboundMessage("/threads", "offline_list")), testEnv);
+    const shortcut = await handleRequest(sendblueWebhook(inboundMessage("1: run it", "offline_shortcut")), testEnv);
+    assert.equal((await json(shortcut)).serviceOffline, true);
+    assert.equal(pendingReplies(testEnv, "offline-thread").length, 0);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("grouped directory uses project keys and numeric thread opens route locally", async () => {
+  const testEnv = env();
+  const registration = await registerService(testEnv);
+  const threads = Array.from({ length: 5 }, (_, index) => ({
+    id: `thread-${index + 1}`,
+    title: `Task ${index + 1}`,
+    cwd: `project-${index + 1}`,
+    projectKey: `project-key-${index + 1}`,
+    projectLabel: index < 2 ? "Same label" : `Project ${index + 1}`,
+    status: index === 1 ? "pending" : "idle",
+    activityAt: `2026-07-12T00:0${5 - index}:00.000Z`,
+  }));
+  await handleRequest(req("/service/catalog", {
+    method: "PUT",
+    headers: { authorization: "Bearer dev-token" },
+    body: JSON.stringify({ complete: true, threads }),
+  }), testEnv);
+  await handleRequest(sendblueWebhook(inboundMessage(String(registration.pairingCode), "service-pair-directory")), testEnv);
+  const controls: Array<Record<string, unknown>> = [];
+  attachOwnerControlCapture(testEnv, controls);
+  const calls: Array<Record<string, unknown> | null> = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (_input, init) => {
+    calls.push(init?.body ? JSON.parse(String(init.body)) : null);
+    return new Response(JSON.stringify({ status: "SENT", message_handle: `out-${calls.length}` }), { status: 200 });
+  };
+  try {
+    const list = await handleRequest(sendblueWebhook(inboundMessage("/threads", "directory-list")), testEnv);
+    assert.equal(list.status, 200);
+    const rendered = String(outboundContents(calls).at(-1));
+    assert.match(rendered, /SAME LABEL · 1/);
+    assert.match(rendered, /Same label · 2/i);
+    assert.match(rendered, /project 3/i);
+    const db = testEnv.DB as unknown as FakeD1Database;
+    const snapshot = JSON.parse(String(db.menuSnapshots.get("+15551234567")?.items_json)) as string[];
+    assert.ok(snapshot.some((reference) => reference.startsWith("project:")), "recent projects remain reachable as collapsed rows");
+    assert.equal(new Set(snapshot).size, snapshot.length, "same-label projects keep distinct stable references");
+
+    calls.length = 0;
+    const refresh = await handleRequest(sendblueWebhook(inboundMessage("/refresh", "directory-refresh")), testEnv);
+    assert.equal(refresh.status, 200);
+    assert.equal((await json(refresh)).command, "refresh");
+    assert.equal(controls.length, 0, "refresh is rendered by the relay without waking Codex");
+    assert.match(String(outboundContents(calls).at(-1)), /^CODEX CONTROL · THREADS/);
+
+    calls.length = 0;
+    const projectIndex = snapshot.findIndex((reference) => reference.startsWith("project:"));
+    const expand = await handleRequest(sendblueWebhook(inboundMessage(`${projectIndex + 1}: do not lose this`, "directory-expand")), testEnv);
+    assert.equal(expand.status, 200);
+    assert.equal((await json(expand)).promptNotSent, true);
+    assert.equal(controls.length, 0, "expanding a project does not switch threads");
+    assert.match(String(outboundContents(calls).at(-1)), /text after the project number was not sent/i);
+    assert.equal(pendingReplies(testEnv).length, 0);
+    const expandedSnapshot = JSON.parse(String(db.menuSnapshots.get("+15551234567")?.items_json)) as string[];
+    assert.ok(expandedSnapshot.length > 0);
+    assert.ok(expandedSnapshot.every((reference) => reference.startsWith("thread:")));
+
+    calls.length = 0;
+    const open = await handleRequest(sendblueWebhook(inboundMessage("1", "directory-open")), testEnv);
+    assert.equal(open.status, 200);
+    assert.equal(controls.at(-1)?.type, "control");
+    assert.equal(controls.at(-1)?.command, "open");
+    assert.match(String(controls.at(-1)?.threadId), /^thread-/);
+    assert.match(String(outboundContents(calls).at(0)), /^CODEX CONTROL · SWITCHED/);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });
 
 test("persistent service keeps an unexpired pairing code stable", async () => {
@@ -2343,7 +2752,7 @@ test("installation pairing reuses the phone binding and renders a clean connecte
   await handleRequest(req("/service/catalog", {
     method: "PUT",
     headers: { authorization: "Bearer dev-token" },
-    body: JSON.stringify({ threads: [{ id: "service-thread-1", title: "Service redesign", cwd: "/tmp/imessage", projectLabel: "imessage" }] }),
+    body: JSON.stringify({ complete: true, threads: [{ id: "service-thread-1", title: "Service redesign", cwd: "/tmp/imessage", projectKey: "project-imessage", projectLabel: "imessage" }] }),
   }), testEnv);
   const originalFetch = globalThis.fetch;
   const calls: Array<Record<string, unknown> | null> = [];
@@ -2357,7 +2766,7 @@ test("installation pairing reuses the phone binding and renders a clean connecte
     const body = await json(response);
     assert.equal(body.service, true);
     assert.equal((testEnv.DB as unknown as FakeD1Database).phoneBindings.get("+15551234567")?.active_thread_id, "service-thread-1");
-    assert.match(String(outboundContents(calls).at(-1)), /^CODEX · CONNECTED/);
+    assert.match(String(outboundContents(calls).at(-1)), /^CODEX CONTROL · CONNECTED/);
     assert.doesNotMatch(String(outboundContents(calls).at(-1)), /hook|relay|token/i);
   } finally {
     globalThis.fetch = originalFetch;
@@ -2384,7 +2793,7 @@ test("service outbound labels model output with its source thread", async () => 
       body: JSON.stringify({ event: { kind: "thread.output", thread: { title: "Music crawler" }, body: "All tests pass." } }),
     }), testEnv);
     assert.equal(response.status, 200);
-    assert.deepEqual(outboundContents(calls), ["CODEX · Music crawler\n\nAll tests pass."]);
+    assert.deepEqual(outboundContents(calls), ["CODEX THREAD · CODEX\nMusic crawler\n\nAll tests pass."]);
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -2412,9 +2821,57 @@ test("service outbound splits long thread output with source headers", async () 
     assert.equal(response.status, 200);
     const contents = outboundContents(calls);
     assert.equal(contents.length, 2);
-    assert.match(String(contents[0]), /^CODEX · Long task · 1\/2/);
-    assert.match(String(contents[1]), /^CODEX · Long task · 2\/2/);
+    assert.match(String(contents[0]), /^CODEX THREAD · CODEX · 1\/2/);
+    assert.match(String(contents[1]), /^CODEX THREAD · CODEX · 2\/2/);
     assert.equal(((await json(response)).notification as Record<string, unknown>).parts, 2);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("service outbound chunks long detail and history views with continuation headers", async () => {
+  const testEnv = env();
+  await registerService(testEnv);
+  (testEnv.DB as unknown as FakeD1Database).phoneBindings.set("+15551234567", {
+    phone_number: "+15551234567", owner_id: DEV_OWNER_ID, active_thread_id: "thread-1",
+    contact_card_sent_at: null, created_at: "2026-07-12T00:00:00.000Z", updated_at: "2026-07-12T00:00:00.000Z",
+  });
+  const originalFetch = globalThis.fetch;
+  const calls: Array<Record<string, unknown> | null> = [];
+  globalThis.fetch = async (_input, init) => {
+    calls.push(init?.body ? JSON.parse(String(init.body)) : null);
+    return new Response(JSON.stringify({ status: "QUEUED", message_handle: `out-${calls.length}` }), { status: 200 });
+  };
+  try {
+    const events = [
+      {
+        kind: "thread.detail",
+        thread: { title: "Long detail", projectLabel: "Interaction service" },
+        state: "idle",
+        requestPreview: { body: "Review the complete result." },
+        assistantMessages: [{ body: "D".repeat(18_000), phase: "final_answer" }],
+      },
+      {
+        kind: "thread.history",
+        thread: { title: "Long history", projectLabel: "Interaction service" },
+        turns: [{ request: "Show the prior result.", finalResponse: "H".repeat(18_000) }],
+      },
+    ];
+    for (const event of events) {
+      calls.length = 0;
+      const response = await handleRequest(req("/service/events/outbound", {
+        method: "POST",
+        headers: { authorization: "Bearer dev-token" },
+        body: JSON.stringify({ event }),
+      }), testEnv);
+      assert.equal(response.status, 200);
+      const contents = outboundContents(calls);
+      assert.ok(contents.length >= 3);
+      assert.match(String(contents[0]), /^CODEX THREAD · INTERACTION SERVICE/);
+      assert.match(String(contents[1]), /^CODEX THREAD · INTERACTION SERVICE · 2\//);
+      assert.ok(contents.every((content) => String(content).length <= 8000));
+      assert.equal(((await json(response)).notification as Record<string, unknown>).parts, contents.length);
+    }
   } finally {
     globalThis.fetch = originalFetch;
   }

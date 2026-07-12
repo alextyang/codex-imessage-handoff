@@ -48,27 +48,47 @@ slash prefix:
 ```text
 /threads
 /recent
+/refresh
 /search words
 /projects
+/thread
+/request
+/turn
+/history 3
+/reasoning high
 /status
+/retry
+/dismiss
 /cancel
 /help
 ```
 
-Thread replies and service controls are visually distinct:
+The directory groups tasks beneath project headings. The selected project and
+projects with active work are expanded; more recent projects remain collapsed
+with task counts and live recency. Every task has an explicit Working, Pending,
+Idle, or Error label. Numbered menus are stable for ten minutes.
+
+Thread replies and service controls use separate visual namespaces:
 
 ```text
-CODEX · Music crawler
+CODEX THREAD · MUSIC CRAWLER
+Fix album metadata
 
 All tests pass.
 ```
 
 ```text
-CODEX · SWITCHED
+CODEX CONTROL · THREADS
 
-Portfolio refresh
+MUSIC CRAWLER
+1. Fix album metadata
+   Selected · Idle · 5m ago
+2. Retry failed imports
+   Working · 2m
 
-Send a message to continue this thread.
+RECENT PROJECTS
+3. Portfolio
+   4 tasks · 1h ago
 ```
 
 The service uses native typing indicators for ordinary work and sends bounded,
@@ -91,10 +111,16 @@ without LaunchAgent support.
 
 ## How it works
 
-1. The service reads the local Codex thread catalog in read-only mode.
+1. The service reads the local Codex thread catalog in read-only mode and
+   removes automated/subagent sessions using Codex's canonical metadata.
+   Same-lineage forks and unrelated same-title sessions remain independently
+   reachable and receive stable `Fork N` or `Session N` display labels.
 2. It synchronizes bounded title/project routing metadata to the relay.
 3. One authenticated installation WebSocket receives pending thread/reply IDs.
-4. The service claims a message only when it can process it.
+4. The service immediately claims each notified message into a private local
+   queue so Cloudflare hibernation cannot lose it. Other tasks are marked
+   Pending and distinct tasks run concurrently within a small bound. Claimed
+   work and completed-but-undelivered output survive a service restart.
 5. It passes the exact message through stdin to `codex exec resume --json`.
 6. Structured lifecycle events drive typing and safe progress.
 7. The final response is labeled outside Codex history and sent through
@@ -111,13 +137,15 @@ and redeploy the Worker before starting the service.
 ## Security model
 
 - Prompt and response bodies are not stored in D1.
-- Pending inbound content lives only in the relay Durable Object until claimed.
+- Inbound content lives in the relay only until the connected service
+  immediately claims it into its mode-`0600` local queue.
 - Thread history, previews, full local paths, and git remotes stay local.
 - Tokens, media, logs, and service state are owner-readable only.
 - User text is passed through stdin, not process arguments.
 - Raw JSONL tool output and secrets are never sent as progress.
-- The initial service does not expose remote model, reasoning, approval,
-  sandbox, deletion, or archival controls.
+- Per-task reasoning overrides are stored only in the private local service
+  directory and applied to the next iMessage-started turn. The service does not
+  remotely change approval, sandbox, deletion, or archival settings.
 
 Keep `~/.codex/imessage-handoff/config.json` private. Resetting the install token
 revokes the paired phone.

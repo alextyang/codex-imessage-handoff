@@ -29,10 +29,15 @@ export interface HandoffThreadRow {
   created_at: string;
   updated_at: string;
   project_label?: string | null;
+  project_key?: string | null;
   catalog_source?: string;
   archived?: number;
   visible?: number;
   last_seen_at?: string | null;
+  catalog_generation?: string | null;
+  activity_at?: string | null;
+  state_since?: string | null;
+  reasoning_effort?: string | null;
 }
 
 export interface HandoffReplyRow {

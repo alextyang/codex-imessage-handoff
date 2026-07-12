@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync, renameSync } from "node:fs";
+import { accessSync, constants, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync, renameSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -49,23 +49,75 @@ function launchctl(args, tolerateFailure = false) {
   }
 }
 
-export function installService() {
-  if (process.platform !== "darwin") throw new Error("Automatic service installation currently supports macOS only. Use `service run` elsewhere.");
-  const paths = servicePaths();
-  mkdirSync(paths.home, { recursive: true, mode: 0o700 });
-  mkdirSync(path.dirname(paths.plist), { recursive: true });
-  const plist = `<?xml version="1.0" encoding="UTF-8"?>
+function executable(file) {
+  if (!file || !path.isAbsolute(file)) return false;
+  try {
+    accessSync(file, constants.X_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function which(command, env) {
+  try {
+    const resolved = execFileSync("/usr/bin/which", [command], { encoding: "utf8", env, stdio: ["ignore", "pipe", "ignore"] }).trim();
+    return executable(resolved) ? resolved : null;
+  } catch {
+    return null;
+  }
+}
+
+export function resolveCodexBinary(env = process.env) {
+  const override = String(env.CODEX_BIN || "").trim();
+  const candidates = [
+    executable(override) ? override : which(override, env),
+    which("codex", env),
+    "/Applications/ChatGPT.app/Contents/Resources/codex",
+    "/opt/homebrew/bin/codex",
+    "/usr/local/bin/codex",
+  ];
+  const resolved = candidates.find(executable);
+  if (!resolved) throw new Error("Codex executable not found. Set CODEX_BIN before installing the service.");
+  return resolved;
+}
+
+export function renderLaunchAgent(paths, codexBin = resolveCodexBinary()) {
+  const pathValue = [...new Set([
+    path.dirname(process.execPath),
+    path.dirname(codexBin),
+    ...(process.env.PATH || "").split(":").filter(Boolean),
+    "/opt/homebrew/bin",
+    "/usr/local/bin",
+    "/usr/bin",
+    "/bin",
+    "/usr/sbin",
+    "/sbin",
+  ])].join(":");
+  return `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
 <key>Label</key><string>${label}</string>
 <key>ProgramArguments</key><array><string>${xml(process.execPath)}</string><string>${xml(daemonPath)}</string></array>
-<key>EnvironmentVariables</key><dict><key>CODEX_HOME</key><string>${xml(path.dirname(paths.stateDb))}</string></dict>
+<key>EnvironmentVariables</key><dict>
+<key>CODEX_HOME</key><string>${xml(path.dirname(paths.stateDb))}</string>
+<key>CODEX_BIN</key><string>${xml(codexBin)}</string>
+<key>PATH</key><string>${xml(pathValue)}</string>
+</dict>
 <key>RunAtLoad</key><true/><key>KeepAlive</key><true/>
 <key>ThrottleInterval</key><integer>10</integer>
 <key>StandardOutPath</key><string>${xml(paths.stdoutLog)}</string>
 <key>StandardErrorPath</key><string>${xml(paths.stderrLog)}</string>
 </dict></plist>
 `;
+}
+
+export function installService() {
+  if (process.platform !== "darwin") throw new Error("Automatic service installation currently supports macOS only. Use `service run` elsewhere.");
+  const paths = servicePaths();
+  mkdirSync(paths.home, { recursive: true, mode: 0o700 });
+  mkdirSync(path.dirname(paths.plist), { recursive: true });
+  const plist = renderLaunchAgent(paths);
   writeFileSync(paths.plist, plist, "utf8");
   launchctl(["bootout", `gui/${process.getuid()}`, paths.plist], true);
   launchctl(["bootstrap", `gui/${process.getuid()}`, paths.plist]);

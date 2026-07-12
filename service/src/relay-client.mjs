@@ -27,12 +27,29 @@ export class RelayClient {
   register() {
     return this.request("/service/register", {
       method: "POST",
-      body: JSON.stringify({ clientId: this.clientId, serviceVersion: "0.2.0", capabilities: ["catalog-v1", "raw-prompts", "typed-outbound", "cancel"] }),
+      body: JSON.stringify({
+        clientId: this.clientId,
+        serviceVersion: "0.3.0",
+        capabilities: [
+          "catalog-v2",
+          "raw-prompts",
+          "typed-outbound",
+          "multi-thread-queue",
+          "thread-detail",
+          "turn-history",
+          "reasoning-control",
+          "cancel",
+        ],
+      }),
     });
   }
 
+  unregister() {
+    return this.request("/service/register", { method: "DELETE" });
+  }
+
   syncCatalog(threads) {
-    return this.request("/service/catalog", { method: "PUT", body: JSON.stringify({ threads }) });
+    return this.request("/service/catalog", { method: "PUT", body: JSON.stringify({ threads, complete: true }) });
   }
 
   claim(threadId, replyId) {
@@ -54,16 +71,20 @@ export class RelayClient {
     });
   }
 
-  publishImages(thread, files) {
+  async publishImages(thread, files) {
     const generatedImages = files.slice(0, 5).map((file) => {
       const extension = path.extname(file).toLowerCase();
       const mimeType = extension === ".png" ? "image/png" : extension === ".webp" ? "image/webp" : extension === ".gif" ? "image/gif" : "image/jpeg";
       return { filename: path.basename(file), mimeType, dataBase64: readFileSync(file).toString("base64") };
     });
-    return this.request(`/threads/${encodeURIComponent(thread.id)}/status`, {
+    const result = await this.request(`/threads/${encodeURIComponent(thread.id)}/status`, {
       method: "POST",
       body: JSON.stringify({ cwd: thread.projectLabel || "Codex", status: "idle", createdAt: new Date().toISOString(), generatedImages }),
     });
+    if (result?.notification?.sent !== true) {
+      throw Object.assign(new Error("Generated output was not delivered."), { code: "MEDIA_DELIVERY_FAILED" });
+    }
+    return result;
   }
 
   eventsUrl() {

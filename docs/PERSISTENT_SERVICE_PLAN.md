@@ -76,7 +76,7 @@ the service.
 Use one consistent first line:
 
 ```text
-CODEX · <LABEL>
+CODEX CONTROL · <LABEL>
 ```
 
 Labels are short and meaningful:
@@ -92,7 +92,19 @@ They are never stored in Codex conversation history.
 ### Thread output
 
 ```text
-CODEX · Music crawler
+CODEX CONTROL · SWITCHED
+
+Music crawler
+Fix album metadata
+
+Context selected.
+```
+
+The control header is immediately followed by the local task view:
+
+```text
+CODEX THREAD · MUSIC CRAWLER
+Fix album metadata
 
 The scraper now retries failed artist pages and all 42 tests pass.
 ```
@@ -103,31 +115,42 @@ of unsupported Markdown and message-length splitting.
 If a response requires multiple bubbles, every continuation is identifiable:
 
 ```text
-CODEX · Music crawler · 2/3
+CODEX THREAD · 2/3
 ```
 
 ### Thread menu
 
 ```text
-CODEX · THREADS
+CODEX CONTROL · THREADS
+12 tasks · refreshed now
 
-1  iMessage service redesign  • current
-2  Music crawler
-3  Portfolio refresh
-4  Research notes
+MUSIC CRAWLER
+1. Fix album metadata
+   Selected · Idle · 5m ago
+2. Retry failed imports
+   Working · 2m
 
-Reply with a number to switch.
+IMESSAGE HANDOFF
+3. Improve thread menu
+   Pending · 1m ago
+
+RECENT PROJECTS
+4. Portfolio
+   4 tasks · 1h ago
+
+Reply 1–4
+/refresh · /projects · /search
 ```
 
 The menu is a stable snapshot. Its numbering must not reorder while the user is
 choosing. A snapshot expires after ten minutes; an expired selection returns a
 fresh menu rather than switching to the wrong thread.
 
-Show 8 threads initially. If more exist, end with one relevant note:
-
-```text
-More: /recent or /search words
-```
+Expand the selected project, every project with Working, Pending, or Error
+tasks, and the most recent projects until the eight-task row budget is reached.
+Then show up to five additional recent projects as collapsed selectable rows
+with task counts and live recency. Project names are headings and are not
+repeated on each task.
 
 Do not show raw thread IDs, full filesystem paths, model names, or timestamps
 unless the user explicitly asks for diagnostic information.
@@ -135,16 +158,24 @@ unless the user explicitly asks for diagnostic information.
 ### Context switch
 
 ```text
-CODEX · SWITCHED
+CODEX THREAD · MUSIC CRAWLER
+Fix album metadata
+Idle · 5m ago · Reasoning high
+/request · /turn · /history · /reasoning
 
-Music crawler
-al-music-crawler
+YOU · 7m ago
+Please normalize the album metadata…
+/request shows the full message
 
-Send a message to continue this thread.
+CODEX · 5m ago
+The complete final response from the last turn appears here.
 ```
 
 The second line is a short project label only when it disambiguates the thread.
-Switching does not run Codex and does not generate a model response.
+Switching does not run Codex and does not generate a model response. It reads
+the selected rollout locally: idle tasks show the complete final response from
+the last turn; working tasks show the latest request and every user-visible
+assistant message produced in the current turn so far.
 
 If the user sends `2: run the tests` from an active menu, the service switches
 to item 2 and submits `run the tests` in one action. This shortcut is documented
@@ -155,7 +186,7 @@ only in `/help` initially, not in every thread menu.
 Existing paired users see one migration confirmation:
 
 ```text
-CODEX · CONNECTED
+CODEX CONTROL · CONNECTED
 
 iMessage is linked to Codex on Alex’s Mac.
 12 recent threads are available.
@@ -175,7 +206,7 @@ progress bubble is necessary.
 For longer work, the service may send:
 
 ```text
-CODEX · WORKING
+CODEX CONTROL · WORKING
 
 Music crawler
 Running the test suite after updating the retry logic.
@@ -185,9 +216,9 @@ Progress policy:
 
 - start typing immediately after a reply is claimed;
 - refresh or stop typing according to Sendblue limits;
-- send no progress bubble during the first 60 seconds;
-- after 60 seconds, send an update only when a safe, observable phase changes;
-- send at most one unsolicited update every two minutes;
+- send no progress bubble during the first 30 seconds;
+- after 30 seconds, send an update only when a safe, observable phase changes;
+- rate-limit repeated phases and omit irrelevant intermediate steps;
 - never expose chain-of-thought, raw shell commands, secrets, URLs containing
   tokens, or unredacted tool output;
 - `/status` may return the current safe phase immediately;
@@ -199,20 +230,21 @@ categories. It is not authored by a hidden model prompt.
 ### Queue and busy state
 
 ```text
-CODEX · QUEUED
+CODEX CONTROL · PENDING
 
 Music crawler is already running in Codex.
 Your message will start when the thread is available.
 ```
 
-Only send this when execution cannot begin promptly. Do not claim a relay reply
-until the service can durably lease it. A user can inspect it with `/status` or
-remove it with `/cancel`.
+Only send this when execution cannot begin promptly. Claim each notified relay
+reply immediately into the service's private durable queue before it waits for
+an execution slot. A user can inspect it with `/status` or remove it with
+`/cancel`.
 
 ### Cancellation
 
 ```text
-CODEX · CANCELLED
+CODEX CONTROL · CANCELLED
 
 Music crawler stopped at your request.
 ```
@@ -220,7 +252,7 @@ Music crawler stopped at your request.
 If nothing is running:
 
 ```text
-CODEX · NEEDS ATTENTION
+CODEX CONTROL · NEEDS ATTENTION
 
 There is no active Codex run to cancel.
 ```
@@ -230,7 +262,7 @@ There is no active Codex run to cancel.
 Errors use `NEEDS ATTENTION`, a one-sentence explanation, and one next action.
 
 ```text
-CODEX · NEEDS ATTENTION
+CODEX CONTROL · NEEDS ATTENTION
 
 Music crawler no longer exists on this Mac.
 Text /threads to choose another thread.
@@ -250,10 +282,18 @@ Initial commands:
 
 ```text
 /threads          recent threads
-/recent           a longer recent-thread list
+/recent           grouped tasks plus recent collapsed projects
 /search words     find threads by title or project
 /projects         browse by project
-/status           selected thread, run, and queue state
+/refresh          rebuild the grouped directory
+/thread           selected task and current/last turn
+/request          complete latest user request
+/turn             complete current or last turn
+/history [count]  completed request/final-response history
+/reasoning [level] inspect or set the next iMessage turn's reasoning
+/status           alias for /thread
+/retry            retry the last failed iMessage request
+/dismiss          dismiss the oldest failed iMessage request
 /cancel           cancel the service-owned run or queued message
 /help             command summary
 ```
@@ -261,12 +301,17 @@ Initial commands:
 `/help` renders:
 
 ```text
-CODEX · COMMANDS
+CODEX CONTROL · COMMANDS
 
 /threads       Choose a recent thread
 /search words  Find a thread
 /projects      Browse by project
-/status        Show current activity
+/thread        Show the selected task
+/request       Show its full latest request
+/turn          Show its current or last turn
+/history 3     Show completed turn history
+/reasoning     Show or change reasoning
+/dismiss       Dismiss the oldest failed request
 /cancel        Stop current work
 
 In a thread menu, reply with a number to switch.
@@ -288,7 +333,10 @@ stateDiagram-v2
     Running --> Ready: result or failure
     Running --> Cancelling: /cancel
     Cancelling --> Ready: process stopped
-    Running --> Running: /status or bounded progress
+    Running --> Running: /thread, history controls, or bounded progress
+    Ready --> Pending: capacity or local desktop turn is busy
+    Pending --> Running: task becomes available
+    Pending --> Ready: /cancel
 ```
 
 Important parsing rules:
@@ -418,8 +466,9 @@ Extend the Durable Object with owner-level subscribers. Notify one installation
 socket when a reply is buffered for any thread. Existing thread sockets remain
 only as a temporary compatibility path.
 
-Inbound message bodies stay in the in-memory reply buffer until claimed, then
-are scrubbed. D1 stores routing and presentation metadata only.
+Inbound message bodies stay in the in-memory reply buffer only until the live
+service immediately claims and saves them privately, then are scrubbed. D1
+stores routing and presentation metadata only.
 
 Add metadata tables for service installations, installation-level pairing, and
 stable menu snapshots. Extend thread rows with catalog visibility, project
@@ -437,10 +486,13 @@ Catalog rules:
   archived state;
 - keep full paths and conversation previews local;
 - show the most recently active threads first;
-- group duplicate titles by project label;
+- remove spawned subagent sessions using `thread_spawn_edges` plus legacy
+  source fallbacks;
+- deduplicate strictly by canonical thread ID and never by title or path;
+- group tasks by a stable project key derived locally from the normalized path;
 - exclude empty placeholder sessions;
-- remove deleted threads after a short grace period;
-- support at least the 100 most recent threads initially;
+- hide catalog rows omitted by each complete replacement snapshot;
+- support up to 500 top-level recent tasks;
 - paginate and search locally before returning compact menus.
 
 Selecting a thread updates the existing phone binding's active thread. Catalog
@@ -449,7 +501,8 @@ refreshes never change selection.
 ## Execution and concurrency
 
 - One active remote turn per thread.
-- One active Codex child process per installation by default.
+- A small installation-wide concurrency bound permits distinct tasks to run
+  together while preserving one active turn per task.
 - Messages remain queued in the relay until leased.
 - Service-owned locks prevent duplicate local execution.
 - Codex lock/conflict exits are classified as busy, not model failures.
@@ -508,8 +561,11 @@ and phone pairing remain unchanged.
 - Never log prompt bodies, assistant bodies, tokens, media URLs, or raw JSONL
   tool payloads.
 - Rate-limit control messages and progress independently from final results.
-- Do not expose remote controls for model, reasoning, sandbox, approval mode,
-  project rules, task deletion, or task archival in the first release.
+- A per-task reasoning override may be set for the next iMessage-started turn.
+  It is private local service state and is passed as an invocation override;
+  Codex SQLite and global config are never edited.
+- Do not expose remote controls for model, sandbox, approval mode, project
+  rules, task deletion, or task archival.
 - Preserve each thread's normal Codex configuration.
 - Support local pause, token reset, phone revocation, uninstall, and rollback.
 
@@ -612,8 +668,12 @@ Cloudflare configuration and without re-pairing.
 
 - Fresh pairing and existing paired migration.
 - Hosted and self-hosted relay configurations.
-- 1, 8, 25, and 100 catalog threads.
+- 1, 8, 25, 100, and 500 catalog tasks.
+- Spawned-subagent filtering without title-based false deduplication.
+- Expanded active projects plus collapsed recent-project reach.
 - Duplicate titles across projects.
+- Independently routable fork lineages with stable `Fork N` labels, plus
+  stable labels for unrelated same-title sessions.
 - Stable menu snapshots and expired selections.
 - Slash commands versus identical ordinary words sent to Codex.
 - Raw multiline text with no synthetic prompt wrapper.
@@ -624,6 +684,9 @@ Cloudflare configuration and without re-pairing.
 - Service restart before lease, after lease, and after Codex completion.
 - Duplicate webhook delivery and WebSocket reconnect.
 - Same-thread and cross-thread queues.
+- Immediate cancellation/control commands while other turns are running.
+- Idle full-final, working current-turn, full-request, turn-history, and
+  per-task reasoning views.
 - Desktop-local activity colliding with a remote request.
 - Archived, deleted, moved, and missing-directory threads.
 - Token reset, phone revocation, pause, uninstall, and rollback.

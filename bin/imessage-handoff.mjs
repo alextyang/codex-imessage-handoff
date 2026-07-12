@@ -28,13 +28,20 @@ async function main() {
   const action = first === "service" ? process.argv[3] || "status" : first;
   if (action === "install" || action === "start") {
     const config = await ensureConfig();
-    const installed = installService();
     const relay = new RelayClient(config);
+    const installStartedAt = Date.now();
+    const installed = installService();
     let healthy = false;
     for (let attempt = 0; attempt < 20; attempt += 1) {
       try {
         const status = await relay.serviceStatus();
-        if (status.connected) { healthy = true; break; }
+        const lastSeenAt = Date.parse(String(status.lastSeenAt || ""));
+        if (
+          status.connected
+          && status.clientId === config.clientId
+          && Number.isFinite(lastSeenAt)
+          && lastSeenAt >= installStartedAt - 1000
+        ) { healthy = true; break; }
       } catch {
         // The daemon may still be starting.
       }
@@ -59,9 +66,18 @@ async function main() {
     return;
   }
   if (action === "uninstall") {
-    const hooksRemoved = removeLegacyHook();
     const removed = codexHomeOverride ? { removed: false } : uninstallService();
-    print({ ok: true, ...removed, hooksRemoved });
+    let relayDeregistered = false;
+    try {
+      const relay = new RelayClient(readConfig());
+      await relay.unregister();
+      relayDeregistered = true;
+    } catch {
+      // Local uninstall must remain possible while offline. Re-running
+      // uninstall after connectivity returns completes relay cleanup.
+    }
+    const hooksRemoved = removeLegacyHook();
+    print({ ok: true, ...removed, relayDeregistered, hooksRemoved });
     return;
   }
   if (action === "run") {

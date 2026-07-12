@@ -1,102 +1,597 @@
 #!/usr/bin/env node
 import WebSocket from "ws";
 import os from "node:os";
+import { existsSync } from "node:fs";
 import { readConfig } from "./config.mjs";
-import { listThreads, findThread } from "./thread-store.mjs";
+import { listThreads } from "./thread-store.mjs";
+import { getThreadDetail, getLatestRequest, getTurn, getHistory } from "./thread-history.mjs";
+import { getReasoningOverride, setReasoningOverride, listReasoningOptions } from "./thread-settings.mjs";
 import { RelayClient } from "./relay-client.mjs";
 import { CodexRunner } from "./codex-runner.mjs";
+import { RunManager } from "./run-manager.mjs";
+import { FailureQueue } from "./failure-queue.mjs";
+import { loadClaimedJobs, markClaimedJobState, removeClaimedJob, saveClaimedJob } from "./claimed-store.mjs";
 
 const config = readConfig();
 const relay = new RelayClient(config);
-const runner = new CodexRunner();
-let queue = Promise.resolve();
+const failedRuns = new FailureQueue();
+const pendingNotices = new Set();
+const claimingReplyIds = new Map();
+const discardRetryTimers = new Map();
+const ingestChains = new Map();
+const ingestPendingCounts = new Map();
+const cancelledThrough = new Map();
 let stopped = false;
-let lastProgressAt = 0;
-let progressTimer = null;
-let pendingPhase = null;
+let syncTimer = null;
+let syncChain = Promise.resolve([]);
+let settingsWarningLogged = false;
+let lastCatalogSignature = null;
+let catalogById = new Map();
 
 function log(message) {
   process.stdout.write(`${new Date().toISOString()} ${message}\n`);
 }
 
-async function synchronize() {
-  const threads = await listThreads(100);
-  await relay.syncCatalog(threads.map((thread) => ({ ...thread, cwd: thread.projectLabel || "Codex" })));
+function threadLabel(thread) {
+  return {
+    id: thread.id,
+    title: thread.title,
+    projectKey: thread.projectKey,
+    projectLabel: thread.projectLabel,
+  };
+}
+
+function effectiveState(thread) {
+  const queued = runs.state(thread.id);
+  const failure = failedRuns.list(thread.id)[0] || null;
+  const observed = failure || thread.state === "aborted"
+    ? "error"
+    : thread.state === "running"
+      ? "working"
+      : "idle";
+  return {
+    status: queued?.status || observed,
+    stateSince: queued?.stateSince || thread.stateSince || thread.activityAt || thread.updatedAt,
+    pendingCount: queued?.pendingCount || 0,
+    request: queued ? queued.request : failure?.body ?? null,
+    requestAt: queued?.requestAt || failure?.queuedAt || null,
+  };
+}
+
+function effectiveReasoning(thread) {
+  try {
+    return getReasoningOverride(thread.id) || thread.reasoningEffort || null;
+  } catch {
+    if (!settingsWarningLogged) {
+      settingsWarningLogged = true;
+      log("Thread reasoning settings are invalid; using Codex task defaults.");
+    }
+    return thread.reasoningEffort || null;
+  }
+}
+
+async function synchronizeNow() {
+  const threads = await listThreads(500);
+  catalogById = new Map(threads.map((thread) => [thread.id, thread]));
+  const catalog = threads.map((thread) => {
+    const state = effectiveState(thread);
+    return {
+      id: thread.id,
+      title: thread.title,
+      cwd: thread.projectLabel || "Codex",
+      projectKey: thread.projectKey,
+      projectLabel: thread.projectLabel || "Codex",
+      createdAt: thread.createdAt,
+      updatedAt: thread.updatedAt,
+      activityAt: state.status === "working" || state.status === "pending"
+        ? state.stateSince
+        : thread.activityAt || thread.updatedAt,
+      stateSince: state.stateSince,
+      status: state.status,
+      pendingCount: state.pendingCount,
+      reasoningEffort: effectiveReasoning(thread),
+      archived: thread.archived,
+      visible: thread.visible,
+    };
+  });
+  const signature = JSON.stringify(catalog);
+  if (signature !== lastCatalogSignature) {
+    await relay.syncCatalog(catalog);
+    lastCatalogSignature = signature;
+  }
   return threads;
 }
 
-async function publishFailure(thread, error) {
-  const body = error?.code === "BUSY"
-    ? "This thread is already running in Codex. Your message remains queued."
-    : error?.code === "MISSING_CWD"
-      ? "This thread’s project folder is no longer available.\nText /threads to choose another."
-      : "Codex could not complete this request. Try again or continue locally in Codex.";
-  await relay.outbound({ kind: "service.notice", code: error?.code === "BUSY" ? "queued" : "needs-attention", thread, body });
+function synchronize() {
+  syncChain = syncChain.catch(() => []).then(synchronizeNow);
+  return syncChain;
 }
 
-async function handleReply(event) {
-  const thread = await findThread(String(event.threadId || ""));
-  if (!thread) return;
-  let claim;
+function scheduleSynchronize(delay = 150) {
+  if (syncTimer) return;
+  syncTimer = setTimeout(() => {
+    syncTimer = null;
+    synchronize().catch(() => log("Catalog synchronization failed; will retry."));
+  }, delay);
+  syncTimer.unref?.();
+}
+
+async function publishFailure(thread, error) {
+  const body = error?.code === "MISSING_CWD"
+    ? "This task’s project folder is no longer available.\n\n/threads"
+    : "Codex could not complete this request.\n\n/retry · /turn · /threads";
+  await relay.outbound({ kind: "service.notice", code: "needs-attention", thread: threadLabel(thread), body });
+}
+
+async function discardReply(event) {
+  try { markClaimedJobState(event.replyId, "cancelled"); } catch {}
   try {
-    claim = await relay.claim(thread.id, String(event.replyId || ""));
+    if (!event.claimed) await relay.claim(String(event.threadId), String(event.replyId));
   } catch (error) {
-    if (error.status !== 409) log("Could not claim pending reply.");
+    if (error?.status !== 409) throw error;
+  }
+  removeClaimedJob(event.replyId);
+  failedRuns.remove(event.threadId, event.replyId);
+  pendingNotices.delete(event.replyId);
+}
+
+async function deliverCompleted(event, thread) {
+  const delivery = event.delivery;
+  if (!delivery.textDelivered) {
+    await relay.outbound({ kind: "thread.output", thread: threadLabel(thread), body: delivery.body });
+    delivery.textDelivered = true;
+    saveClaimedJob(event, "delivering");
+  }
+  if (Array.isArray(delivery.generatedImages) && delivery.generatedImages.length > 0) {
+    await relay.publishImages(thread, delivery.generatedImages);
+  } else {
+    await relay.updateThreadStatus(thread, "idle");
+  }
+  failedRuns.remove(thread.id, event.replyId);
+  removeClaimedJob(event.replyId);
+}
+
+async function executeReply(event, context) {
+  const thread = catalogById.get(String(event.threadId || ""));
+  if (!thread) {
+    await relay.outbound({ kind: "service.notice", code: "needs-attention", body: "That task is no longer available, so the message was not run.\n\n/threads" });
+    await discardReply(event);
     return;
   }
-  const reply = claim.reply || {};
-  const images = await relay.downloadImages(thread.id, reply);
-  lastProgressAt = Date.now();
-  pendingPhase = null;
-  progressTimer = setInterval(async () => {
-    if (!pendingPhase || Date.now() - lastProgressAt < 120000) return;
-    const phase = pendingPhase;
-    pendingPhase = null;
-    lastProgressAt = Date.now();
+
+  if (event.delivery) {
     try {
-      await relay.outbound({ kind: "thread.progress", thread, phase });
+      await deliverCompleted(event, thread);
     } catch {
-      log("Could not publish progress.");
+      context.defer(15000);
+      log(`Completed output for ${thread.id} could not be delivered; will retry.`);
     }
-  }, 10000);
-  progressTimer.unref();
+    return;
+  }
+
+  let claim = event.claimed;
+  if (!claim) {
+    try {
+      claim = await relay.claim(thread.id, String(event.replyId || ""));
+      const reply = claim.reply || {};
+      event.claimed = { ...claim, images: [] };
+      saveClaimedJob(event, "queued");
+      claim.images = await relay.downloadImages(thread.id, reply);
+      event.claimed = claim;
+      saveClaimedJob(event, "queued");
+    } catch (error) {
+      if (error?.status === 409) return;
+      if (!claim) {
+        context.defer(5000);
+        log(`Could not claim reply for ${thread.id}; will retry.`);
+        return;
+      }
+      failedRuns.record(thread.id, { body: String(claim?.reply?.body || ""), images: [], replyId: event.replyId, claimed: event.claimed, queuedAt: event.queuedAt });
+      if (event.claimed) markClaimedJobState(event.replyId, "failed");
+      await publishFailure(thread, error);
+      try { await relay.updateThreadStatus(thread, "error"); } catch {}
+      return;
+    }
+  }
+
+  const reply = claim.reply || {};
+  const hasRemoteMedia = Array.isArray(reply.media) && reply.media.length > 0;
+  const localMediaMissing = !Array.isArray(claim.images) || claim.images.length === 0 || claim.images.some((file) => !existsSync(file));
+  if (hasRemoteMedia && localMediaMissing) {
+    try {
+      claim.images = await relay.downloadImages(thread.id, reply);
+      event.claimed = claim;
+      saveClaimedJob(event, "queued");
+    } catch (error) {
+      failedRuns.record(thread.id, { body: String(reply.body || ""), images: [], replyId: event.replyId, claimed: event.claimed, queuedAt: event.queuedAt });
+      markClaimedJobState(event.replyId, "failed");
+      await publishFailure(thread, error);
+      return;
+    }
+  }
+  const images = claim.images || [];
+  const runner = new CodexRunner();
+  let cancelRequested = false;
+  context.setCancel(() => {
+    cancelRequested = true;
+    runner.cancel(thread.id);
+  });
+  let progressTimer = null;
+  let pendingPhase = null;
+  let lastProgressAt = Date.now();
+  let lastPublishedPhase = null;
+  let deferred = false;
+
   try {
     await relay.updateThreadStatus(thread, "working");
+    scheduleSynchronize();
+    if (cancelRequested) {
+      removeClaimedJob(event.replyId);
+      failedRuns.remove(thread.id, event.replyId);
+      await relay.outbound({ kind: "service.notice", code: "cancelled", thread: threadLabel(thread), body: "Stopped at your request." });
+      await relay.updateThreadStatus(thread, "idle");
+      return;
+    }
+    progressTimer = setInterval(async () => {
+      if (!pendingPhase || pendingPhase === lastPublishedPhase || Date.now() - lastProgressAt < 30000) return;
+      const phase = pendingPhase;
+      lastPublishedPhase = phase;
+      lastProgressAt = Date.now();
+      try {
+        await relay.outbound({ kind: "thread.progress", thread: threadLabel(thread), phase });
+      } catch {
+        log("Could not publish progress.");
+      }
+    }, 5000);
+    progressTimer.unref?.();
+
+    markClaimedJobState(event.replyId, "running");
     const result = await runner.run({
       thread,
       prompt: String(reply.body || ""),
       images,
-      onPhase: (phase) => {
-        if (Date.now() - lastProgressAt >= 60000) pendingPhase = phase;
-      },
+      reasoningEffort: effectiveReasoning(thread),
+      onPhase: (phase) => { pendingPhase = phase; },
     });
     if (result.status === "cancelled") {
-      await relay.outbound({ kind: "service.notice", code: "cancelled", thread, body: "Stopped at your request." });
+      removeClaimedJob(event.replyId);
+      failedRuns.remove(thread.id, event.replyId);
+      await relay.outbound({ kind: "service.notice", code: "cancelled", thread: threadLabel(thread), body: "Stopped at your request." });
       await relay.updateThreadStatus(thread, "idle");
     } else {
-      await relay.outbound({ kind: "thread.output", thread, body: result.body });
-      if (Array.isArray(result.generatedImages) && result.generatedImages.length > 0) {
-        await relay.publishImages(thread, result.generatedImages);
-      } else {
-        await relay.updateThreadStatus(thread, "idle");
-      }
+      event.delivery = { body: result.body, generatedImages: result.generatedImages || [], textDelivered: false };
+      saveClaimedJob(event, "delivering");
+      await deliverCompleted(event, thread);
     }
   } catch (error) {
-    await publishFailure(thread, error);
-    try { await relay.updateThreadStatus(thread, error?.code === "BUSY" ? "queued" : "error"); } catch {}
+    if (event.delivery) {
+      deferred = true;
+      context.defer(15000);
+      log(`Completed output for ${thread.id} could not be delivered; will retry.`);
+    } else if (error?.code === "BUSY") {
+      deferred = true;
+      context.defer(15000);
+      markClaimedJobState(event.replyId, "queued");
+      await relay.updateThreadStatus(thread, "pending");
+      if (!event.busyNoticeSent) {
+        event.busyNoticeSent = true;
+        await relay.outbound({
+          kind: "service.notice",
+          code: "queued",
+          thread: threadLabel(thread),
+          body: "This task is already working locally. Your message is pending and will start when it is free.\n\n/cancel · /thread",
+        });
+      }
+    } else {
+      failedRuns.record(thread.id, { body: String(reply.body || ""), images, replyId: event.replyId, claimed: event.claimed, queuedAt: event.queuedAt });
+      markClaimedJobState(event.replyId, "failed");
+      await publishFailure(thread, error);
+      try { await relay.updateThreadStatus(thread, "error"); } catch {}
+    }
   } finally {
-    clearInterval(progressTimer);
-    progressTimer = null;
-    pendingPhase = null;
+    if (progressTimer) clearInterval(progressTimer);
+    if (!deferred) delete event.claimed;
+    if (!deferred) pendingNotices.delete(event.replyId);
+    scheduleSynchronize();
   }
 }
 
+const runs = new RunManager({
+  maxConcurrent: Number(process.env.IMESSAGE_HANDOFF_CONCURRENCY) || 3,
+  run: executeReply,
+  discard: discardReply,
+  onChange: () => scheduleSynchronize(),
+  onError: () => log("Queued Codex work failed unexpectedly."),
+});
+
+function enqueueReply(event) {
+  if (!runs.enqueue(event)) return false;
+  setTimeout(async () => {
+    const state = runs.state(event.threadId);
+    if (state?.status !== "pending" || pendingNotices.has(event.replyId)) return;
+    pendingNotices.add(event.replyId);
+    const thread = catalogById.get(String(event.threadId || ""));
+    if (!thread) return;
+    try {
+      await relay.outbound({
+        kind: "service.notice",
+        code: "queued",
+        thread: threadLabel(thread),
+        body: "Pending. Codex will start this message when a run slot is free.\n\n/cancel · /thread · /threads",
+      });
+    } catch {
+      log("Could not publish pending state.");
+    }
+  }, 150).unref?.();
+  return true;
+}
+
+function scheduleDiscardRetry(event, delay = 5000) {
+  const replyId = String(event?.replyId || "");
+  if (!replyId || discardRetryTimers.has(replyId) || stopped) return;
+  const timer = setTimeout(() => {
+    discardRetryTimers.delete(replyId);
+    discardReply(event).catch(() => scheduleDiscardRetry(event, Math.min(30000, delay * 2)));
+  }, delay);
+  timer.unref?.();
+  discardRetryTimers.set(replyId, timer);
+}
+
+async function ingestReply(event) {
+  const replyId = String(event?.replyId || "");
+  const threadId = String(event?.threadId || "");
+  if (!replyId || !threadId || runs.has(replyId) || claimingReplyIds.has(replyId)) return;
+  event.receivedAtMs ||= Date.now();
+  event.queuedAt ||= event.createdAt || new Date().toISOString();
+  let delay = 1000;
+  while (!stopped && !runs.has(replyId)) {
+    claimingReplyIds.set(replyId, threadId);
+    try {
+      if (!event.claimed) {
+        const claim = await relay.claim(threadId, replyId);
+        event.claimed = { ...claim, images: [] };
+      }
+      saveClaimedJob(event, "queued");
+      if ((cancelledThrough.get(threadId) || 0) >= event.receivedAtMs) {
+        await discardReply(event);
+        return;
+      }
+      if (!catalogById.has(threadId)) {
+        await relay.outbound({ kind: "service.notice", code: "needs-attention", body: "That task is no longer available, so the message was not run.\n\n/threads" });
+        await discardReply(event);
+        return;
+      }
+      enqueueReply(event);
+      return;
+    } catch (error) {
+      if (error?.status === 409) return;
+      log(`Could not save pending reply ${replyId}; will retry.`);
+    } finally {
+      claimingReplyIds.delete(replyId);
+    }
+    await new Promise((resolve) => setTimeout(resolve, delay));
+    delay = Math.min(30000, delay * 2);
+  }
+}
+
+function queueIngest(event) {
+  const threadId = String(event?.threadId || "");
+  if (!threadId) return;
+  event.receivedAtMs ||= Date.now();
+  event.queuedAt ||= event.createdAt || new Date().toISOString();
+  ingestPendingCounts.set(threadId, (ingestPendingCounts.get(threadId) || 0) + 1);
+  const previous = ingestChains.get(threadId) || Promise.resolve();
+  const current = previous.catch(() => {}).then(() => ingestReply(event));
+  ingestChains.set(threadId, current);
+  current.finally(() => {
+    const remaining = (ingestPendingCounts.get(threadId) || 1) - 1;
+    if (remaining > 0) ingestPendingCounts.set(threadId, remaining);
+    else ingestPendingCounts.delete(threadId);
+    if (ingestChains.get(threadId) === current) ingestChains.delete(threadId);
+  }).catch(() => {});
+}
+
+function restoreClaimedState(jobs) {
+  for (const job of jobs) {
+    if (job.state === "queued" || job.state === "delivering") {
+      enqueueReply(job);
+      continue;
+    }
+    if (job.state === "cancelled") {
+      discardReply(job).catch(() => scheduleDiscardRetry(job));
+      continue;
+    }
+    markClaimedJobState(job.replyId, "failed");
+    failedRuns.record(job.threadId, {
+      body: String(job.claimed?.reply?.body || ""),
+      images: job.claimed?.images || [],
+      replyId: job.replyId,
+      claimed: job.claimed,
+      queuedAt: job.queuedAt,
+    });
+  }
+}
+
+async function publishThreadDetail(thread) {
+  const state = effectiveState(thread);
+  const detail = await getThreadDetail(thread, {
+    stateOverride: state.status,
+    reasoningEffort: effectiveReasoning(thread),
+    userPreviewLimit: 360,
+  });
+  const turn = detail.turn;
+  const hasQueuedRequest = state.request !== null;
+  const queuedRequest = state.request ?? "";
+  const requestPreview = hasQueuedRequest
+    ? queuedRequest.slice(0, 360) || "Image attachment"
+    : detail.requestPreview || "No user request was found in the available history.";
+  const queuedTurnVisible = !hasQueuedRequest || (turn?.state === "running" && detail.fullRequest === queuedRequest);
+  const messages = state.status === "working" && queuedTurnVisible
+    ? (detail.assistantMessages || []).map((message) => ({ body: message.text, at: message.timestamp, phase: message.phase }))
+    : state.status === "idle" && detail.finalResponse
+      ? [{ body: detail.finalResponse, at: turn?.completedAt || detail.activityAt, phase: "final_answer" }]
+      : [];
+  await relay.outbound({
+    kind: "thread.detail",
+    thread: threadLabel(thread),
+    state: state.status,
+    activityAt: detail.activityAt || thread.activityAt,
+    stateSince: state.stateSince,
+    pendingCount: state.pendingCount,
+    reasoningEffort: effectiveReasoning(thread),
+    requestPreview: {
+      body: requestPreview,
+      at: state.requestAt || turn?.startedAt || null,
+      truncated: hasQueuedRequest ? queuedRequest.length > requestPreview.length : Boolean(detail.fullRequest && detail.fullRequest !== detail.requestPreview),
+    },
+    assistantMessages: messages,
+    historyTruncated: detail.truncated,
+  });
+}
+
+function outboundTurn(turn) {
+  if (!turn) return null;
+  return {
+    id: turn.id,
+    state: turn.state,
+    request: turn.request || "",
+    requestAt: turn.startedAt || null,
+    assistantMessages: (turn.assistantMessages || []).map((message) => ({
+      body: message.text,
+      at: message.timestamp,
+      phase: message.phase,
+    })),
+    finalResponse: turn.finalResponse || null,
+    completedAt: turn.completedAt || null,
+  };
+}
+
 async function handleControl(event) {
-  if (event.command !== "cancel") return;
-  const thread = event.threadId ? await findThread(String(event.threadId)) : null;
-  const cancelled = runner.cancel(event.threadId ? String(event.threadId) : undefined);
-  if (!cancelled) {
-    await relay.outbound({ kind: "service.notice", code: "needs-attention", thread: thread || undefined, body: "There is no active Codex run to cancel." });
+  const command = String(event.command || "").toLowerCase();
+  const thread = event.threadId ? catalogById.get(String(event.threadId)) : null;
+  if (command === "cancel") {
+    const threadId = event.threadId ? String(event.threadId) : "";
+    cancelledThrough.set(threadId, Date.now());
+    const claiming = ingestPendingCounts.get(threadId) || [...claimingReplyIds.values()].filter((id) => id === threadId).length;
+    const cancelled = await runs.cancel(threadId);
+    if (!cancelled.active && cancelled.pending === 0 && claiming === 0) {
+      await relay.outbound({ kind: "service.notice", code: "needs-attention", thread: thread ? threadLabel(thread) : undefined, body: "There is no iMessage-started work to cancel." });
+    } else if (!cancelled.active) {
+      const count = cancelled.pending + claiming;
+      await relay.outbound({ kind: "service.notice", code: "cancelled", thread: thread ? threadLabel(thread) : undefined, body: `Removed ${count} pending message${count === 1 ? "" : "s"}.` });
+    }
+    return;
+  }
+  if (!thread) {
+    await relay.outbound({ kind: "service.notice", code: "needs-attention", body: "That task is no longer available.\n\n/threads" });
+    return;
+  }
+  if (command === "open" || command === "thread" || command === "status") {
+    await publishThreadDetail(thread);
+    return;
+  }
+  if (command === "request" || command === "message") {
+    const state = effectiveState(thread);
+    const turn = state.request === null ? await getTurn(thread) : null;
+    await relay.outbound({
+      kind: "thread.request",
+      thread: threadLabel(thread),
+      body: state.request ?? await getLatestRequest(thread),
+      at: state.requestAt || turn?.startedAt || null,
+    });
+    return;
+  }
+  if (command === "turn") {
+    const state = effectiveState(thread);
+    const turn = await getTurn(thread);
+    const serviceTurnVisible = state.request !== null
+      && state.status === "working"
+      && turn?.state === "running"
+      && turn.request === state.request;
+    const current = state.request !== null && !serviceTurnVisible
+      ? { state: state.status, request: state.request, requestAt: state.requestAt, assistantMessages: [], finalResponse: null, completedAt: null }
+      : outboundTurn(turn);
+    await relay.outbound({ kind: "thread.turn", thread: threadLabel(thread), turn: current, reasoningEffort: effectiveReasoning(thread) });
+    return;
+  }
+  if (command === "history") {
+    const requested = Number.parseInt(String(event.argument || "3"), 10);
+    const limit = Math.max(1, Math.min(5, Number.isFinite(requested) ? requested : 3));
+    await relay.outbound({ kind: "thread.history", thread: threadLabel(thread), turns: (await getHistory(thread, limit)).map(outboundTurn) });
+    return;
+  }
+  if (command === "reasoning") {
+    let options = listReasoningOptions(thread);
+    const requested = String(event.argument || "").trim().toLowerCase();
+    let current = effectiveReasoning(thread);
+    let changed = false;
+    if (requested) {
+      if (!options.some((option) => option.value === requested)) {
+        await relay.outbound({ kind: "service.reasoning", thread: threadLabel(thread), current, options, invalid: requested });
+        return;
+      }
+      setReasoningOverride(thread.id, requested);
+      current = effectiveReasoning(thread);
+      changed = true;
+      options = listReasoningOptions(thread);
+      scheduleSynchronize();
+    }
+    const running = effectiveState(thread).status === "working";
+    await relay.outbound({
+      kind: "service.reasoning",
+      thread: threadLabel(thread),
+      current,
+      options,
+      changed,
+      note: running ? "Applies to the next turn; the current turn is unchanged." : "Applies to the next iMessage-started turn.",
+    });
+    return;
+  }
+  if (command === "retry") {
+    const failures = failedRuns.list(thread.id);
+    const failed = failedRuns.next(thread.id);
+    if (!failed) {
+      const body = failures.length
+        ? "The failed message is already pending or running.\n\n/thread · /cancel"
+        : "There is no failed iMessage request to retry.\n\n/turn · /threads";
+      await relay.outbound({ kind: "service.notice", code: "needs-attention", thread: threadLabel(thread), body });
+      return;
+    }
+    const retry = {
+      threadId: thread.id,
+      replyId: failed.replyId || `retry-${Date.now()}-${Math.random().toString(16).slice(2)}`,
+      claimed: failed.claimed || { reply: { body: failed.body }, images: failed.images },
+      queuedAt: failed.queuedAt || new Date().toISOString(),
+      retryOf: failed.replyId,
+    };
+    saveClaimedJob(retry, "queued");
+    if (enqueueReply(retry)) failedRuns.markRetrying(thread.id, failed.replyId);
+    else markClaimedJobState(retry.replyId, "failed");
+    return;
+  }
+  if (command === "dismiss") {
+    const failed = failedRuns.list(thread.id)[0] || null;
+    if (!failed) {
+      await relay.outbound({ kind: "service.notice", code: "needs-attention", thread: threadLabel(thread), body: "There is no failed iMessage request to dismiss.\n\n/thread · /threads" });
+      return;
+    }
+    if (failed.retrying) {
+      await relay.outbound({ kind: "service.notice", code: "needs-attention", thread: threadLabel(thread), body: "That failed request is already pending or running. Use /cancel before dismissing it." });
+      return;
+    }
+    failedRuns.remove(thread.id, failed.replyId);
+    removeClaimedJob(failed.replyId);
+    const remaining = failedRuns.list(thread.id).length;
+    try { await relay.updateThreadStatus(thread, remaining ? "error" : "idle"); } catch {}
+    scheduleSynchronize();
+    await relay.outbound({
+      kind: "service.notice",
+      code: "updated",
+      thread: threadLabel(thread),
+      body: remaining
+        ? `Dismissed one failed request. ${remaining} still need${remaining === 1 ? "s" : ""} attention.\n\n/retry · /dismiss`
+        : "Dismissed the failed request. This task is clear.",
+    });
   }
 }
 
@@ -110,8 +605,15 @@ function connect() {
   socket.on("message", (data) => {
     try {
       const event = JSON.parse(String(data));
-      if (event.type === "reply-pending") queue = queue.then(() => handleReply(event)).catch(() => log("Queued reply failed."));
-      if (event.type === "control") queue = queue.then(() => handleControl(event)).catch(() => log("Control command failed."));
+      if (event.type === "reply-pending") queueIngest(event);
+      if (event.type === "control") {
+        handleControl(event).catch(async () => {
+          log("Control command failed.");
+          try {
+            await relay.outbound({ kind: "service.notice", code: "needs-attention", body: "That control could not be completed. Try again or use /threads." });
+          } catch {}
+        });
+      }
     } catch {
       log("Ignored malformed relay event.");
     }
@@ -123,26 +625,22 @@ function connect() {
 }
 
 async function main() {
-  const registration = await relay.register();
+  const restoredJobs = loadClaimedJobs();
   const threads = await synchronize();
+  restoreClaimedState(restoredJobs);
+  const registration = await relay.register();
   if (registration.pairingRequired) {
     log(`Pairing required: text ${registration.pairingCode} to ${registration.sendblueNumber} within 15 minutes.`);
   } else {
-    log(`Ready on ${os.hostname()} with ${threads.length} threads.`);
+    log(`Ready on ${os.hostname()} with ${threads.length} top-level tasks.`);
   }
   connect();
-  setInterval(async () => {
-    try {
-      await relay.register();
-      await synchronize();
-    } catch {
-      log("Background synchronization failed; will retry.");
-    }
-  }, 5 * 60 * 1000).unref();
+  setInterval(() => synchronize().catch(() => log("Background synchronization failed; will retry.")), 30 * 1000).unref();
+  setInterval(() => relay.register().catch(() => log("Service registration refresh failed; will retry.")), 5 * 60 * 1000).unref();
 }
 
-process.on("SIGTERM", () => { stopped = true; runner.cancel(); process.exit(0); });
-process.on("SIGINT", () => { stopped = true; runner.cancel(); process.exit(0); });
+process.on("SIGTERM", () => { stopped = true; runs.cancelAll(); process.exit(0); });
+process.on("SIGINT", () => { stopped = true; runs.cancelAll(); process.exit(0); });
 
 main().catch((error) => {
   process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
