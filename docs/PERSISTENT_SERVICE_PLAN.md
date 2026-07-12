@@ -143,14 +143,16 @@ Reply 1–4
 ```
 
 The menu is a stable snapshot. Its numbering must not reorder while the user is
-choosing. A snapshot expires after ten minutes; an expired selection returns a
-fresh menu rather than switching to the wrong thread.
+choosing. A snapshot expires after ten minutes; an expired selection asks the
+local service for a fresh menu rather than switching to the wrong thread.
 
-Expand the selected project, every project with Working, Pending, or Error
-tasks, and the most recent projects until the eight-task row budget is reached.
-Then show up to five additional recent projects as collapsed selectable rows
-with task counts and live recency. Project names are headings and are not
-repeated on each task.
+Build the directory locally on demand. For each project, show every task with
+pending work first, then every remaining task whose actual latest rollout turn
+is within 48 hours. Omit projects without a qualifying task. Codex tasks listed
+in `projectless-thread-ids` share a final `OTHER TASKS` section. Every task row
+shows a short, single-line preview of its newest user request. Send that preview
+transiently for delivery and persist only the ordered task IDs used by numeric
+selection.
 
 Do not show raw thread IDs, full filesystem paths, model names, or timestamps
 unless the user explicitly asks for diagnostic information.
@@ -281,8 +283,8 @@ command as a compatibility alias.
 Initial commands:
 
 ```text
-/threads          recent threads
-/recent           grouped tasks plus recent collapsed projects
+/threads          pending tasks plus turns from the last 48 hours
+/recent           compatibility alias for /threads
 /search words     find threads by title or project
 /projects         browse by project
 /refresh          rebuild the grouped directory
@@ -484,12 +486,14 @@ Catalog rules:
 
 - synchronize title, short project label, created/updated time, visibility, and
   archived state;
-- keep full paths and conversation previews local;
-- show the most recently active threads first;
+- keep full paths and conversation previews out of D1; read previews locally
+  only for an on-demand directory;
+- include all tasks with pending work, then turns from the last 48 hours;
 - remove spawned subagent sessions using `thread_spawn_edges` plus legacy
   source fallbacks;
 - deduplicate strictly by canonical thread ID and never by title or path;
-- group tasks by a stable project key derived locally from the normalized path;
+- group project tasks using Codex's `thread-workspace-root-hints` and collect
+  `projectless-thread-ids` into one final Other tasks section;
 - exclude empty placeholder sessions;
 - hide catalog rows omitted by each complete replacement snapshot;
 - support up to 500 top-level recent tasks;
@@ -670,7 +674,7 @@ Cloudflare configuration and without re-pairing.
 - Hosted and self-hosted relay configurations.
 - 1, 8, 25, 100, and 500 catalog tasks.
 - Spawned-subagent filtering without title-based false deduplication.
-- Expanded active projects plus collapsed recent-project reach.
+- All pending tasks, exact 48-hour turn filtering, and a final Other tasks group.
 - Duplicate titles across projects.
 - Independently routable fork lineages with stable `Fork N` labels, plus
   stable labels for unrelated same-title sessions.

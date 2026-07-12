@@ -49,6 +49,41 @@ test("grouped directory expands task rows and keeps recent projects compact", ()
   ].join("\n\n"));
 });
 
+test("local directory renders recent criteria, user previews, pending counts, and Other tasks", () => {
+  const rendered = renderOutboundEvent({
+    kind: "service.directory",
+    directory: {
+      label: "THREADS",
+      totalTasks: 3,
+      criteria: "pending + activity in last 48h",
+      groups: [
+        {
+          projectKey: "music",
+          projectLabel: "Music crawler",
+          threads: [
+            { id: "pending", index: 1, title: "Retry imports", status: "pending", pendingCount: 2, stateSince: "2026-07-12T07:48:00.000Z", requestPreview: "Rerun the failed import." },
+            { id: "working", index: 2, title: "Fix metadata", status: "working", pendingCount: 1, stateSince: "2026-07-12T07:58:00.000Z", requestPreview: "Normalize album dates.\nThen test." },
+          ],
+        },
+        {
+          projectKey: "other-tasks",
+          projectLabel: "Other tasks",
+          threads: [
+            { id: "other", index: 3, title: "Compare providers", status: "idle", activityAt: "2026-07-12T06:00:00.000Z", requestPreview: "Which provider supports richer interactions?" },
+          ],
+        },
+      ],
+      note: "Reply with a number to open.",
+    },
+  });
+
+  assert.match(rendered, /^CODEX CONTROL · THREADS/);
+  assert.match(rendered, /3 tasks · pending \+ activity in last 48h · refreshed now/);
+  assert.match(rendered, /1\. Retry imports\n   Pending · \d+[mh] ago · 2 pending\n   “Rerun the failed import\.”/);
+  assert.match(rendered, /2\. Fix metadata\n   Working · \d+[mh] · 1 pending\n   “Normalize album dates\. Then test\.”/);
+  assert.match(rendered, /OTHER TASKS\n3\. Compare providers/);
+});
+
 test("thread detail exposes state, commands, request expansion, and the full final response", () => {
   const now = Date.now();
   const rendered = renderOutboundEvent({

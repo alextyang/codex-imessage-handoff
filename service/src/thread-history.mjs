@@ -245,6 +245,7 @@ function parseTurns(records, metadata = {}) {
       if (!turn) continue;
       if (payload.role === "user") {
         assignRequest(turn, messageText(payload.content, "input_text"), sequence, "response_item");
+        turn.activityAt = recordAt || turn.activityAt;
       } else if (payload.role === "assistant") {
         const text = messageText(payload.content, "output_text");
         if (!text) continue;
@@ -343,11 +344,15 @@ function parseTurns(records, metadata = {}) {
 
   const latestTerminalTurn = terminalTurns[0] || null;
   const latestTurn = currentTurn || latestTerminalTurn;
+  const lastTurnAt = latestTurn?.activityAt || latestTurn?.completedAt || latestTurn?.startedAt || null;
   const activityAt = currentTurn?.activityAt || latestTerminalTurn?.activityAt || latestActivityAt;
   return {
     state,
     activityAt,
     activityAtMs: dateMs(activityAt),
+    hasTurn: Boolean(latestTurn),
+    lastTurnAt,
+    lastTurnAtMs: dateMs(lastTurnAt),
     currentTurn: publicTurn(currentTurn),
     latestTurn: publicTurn(latestTurn),
     latestCompletedTurn: publicTurn(completedTurns[0] || null),
@@ -371,7 +376,7 @@ export function readThreadHistory(threadOrPath, options = {}) {
 
 export function getThreadState(threadOrPath) {
   const filePath = rolloutPath(threadOrPath);
-  if (!filePath) return { state: "unknown", activityAt: null, activityAtMs: null, stateSince: null, currentTurnId: null, truncated: false, malformedTail: false };
+  if (!filePath) return { state: "unknown", activityAt: null, activityAtMs: null, hasTurn: false, lastTurnAt: null, lastTurnAtMs: null, stateSince: null, currentTurnId: null, truncated: false, malformedTail: false };
   let tail = readTailRecords(filePath, { maxBytes: STATE_MAX_BYTES, maxLines: STATE_MAX_LINES });
   const cacheKey = tail.stat ? `${filePath}:${tail.stat.ino}:${tail.stat.size}:${tail.stat.mtimeMs}` : null;
   if (cacheKey && stateCache.has(cacheKey)) return stateCache.get(cacheKey);
@@ -385,6 +390,9 @@ export function getThreadState(threadOrPath) {
     state: parsed.state,
     activityAt: parsed.activityAt,
     activityAtMs: parsed.activityAtMs,
+    hasTurn: parsed.hasTurn,
+    lastTurnAt: parsed.lastTurnAt,
+    lastTurnAtMs: parsed.lastTurnAtMs,
     stateSince: parsed.currentTurn?.startedAt || parsed.latestTurn?.completedAt || parsed.activityAt,
     currentTurnId: parsed.currentTurn?.id || null,
     truncated: parsed.truncated,

@@ -29,7 +29,7 @@ export class RelayClient {
       method: "POST",
       body: JSON.stringify({
         clientId: this.clientId,
-        serviceVersion: "0.3.1",
+        serviceVersion: "0.3.2",
         capabilities: [
           "catalog-v2",
           "raw-prompts",
@@ -39,6 +39,7 @@ export class RelayClient {
           "turn-history",
           "reasoning-control",
           "cancel",
+          "local-directory-v1",
         ],
       }),
     });

@@ -128,3 +128,16 @@ test("state lookup expands its tail until it finds a long-running turn boundary"
   writeFileSync(rollout, `${start}\n${noise.join("\n")}\n`, "utf8");
   assert.equal(getThreadState(rollout).state, "running");
 });
+
+test("recent rollout metadata without a turn does not become recent turn activity", () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "imessage-thread-no-turn-"));
+  const rollout = path.join(directory, "rollout.jsonl");
+  writeFileSync(rollout, `${record("2026-07-12T06:00:00.000Z", "session_meta", { id: "placeholder" })}\n`, "utf8");
+  const history = readThreadHistory(rollout);
+  const state = getThreadState(rollout);
+  assert.equal(history.activityAt, "2026-07-12T06:00:00.000Z");
+  assert.equal(history.hasTurn, false);
+  assert.equal(history.lastTurnAt, null);
+  assert.equal(state.hasTurn, false);
+  assert.equal(state.lastTurnAt, null);
+});

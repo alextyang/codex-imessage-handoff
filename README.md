@@ -63,10 +63,12 @@ slash prefix:
 /help
 ```
 
-The directory groups tasks beneath project headings. The selected project and
-projects with active work are expanded; more recent projects remain collapsed
-with task counts and live recency. Every task has an explicit Working, Pending,
-Idle, or Error label. Numbered menus are stable for ten minutes.
+The local service builds `/threads` on demand. Under each project it shows all
+tasks with pending work first, followed by every task with a turn in the last
+48 hours. Projects with no matching tasks are omitted, and Codex's explicitly
+projectless tasks appear in a final `OTHER TASKS` section. Every row includes
+the latest user-message preview plus a Working, Pending, Idle, or Error label.
+Numbered menus are stable for ten minutes.
 
 Thread replies and service controls use separate visual namespaces:
 
@@ -79,16 +81,25 @@ All tests pass.
 
 ```text
 CODEX CONTROL · THREADS
+3 tasks · pending + activity in last 48h · refreshed now
 
 MUSIC CRAWLER
-1. Fix album metadata
+1. Retry failed imports
+   Pending · 12m ago
+   “Rerun the failed import without creating duplicate IDs.”
+2. Fix album metadata
    Selected · Idle · 5m ago
-2. Retry failed imports
-   Working · 2m
+   “Normalize album dates, then rerun the tests.”
 
-RECENT PROJECTS
-3. Portfolio
-   4 tasks · 1h ago
+OTHER TASKS
+3. Compare messaging providers
+   Idle · 3h ago
+   “Which provider supports richer iMessage interactions?”
+
+Reply with a number to open.
+Use “2: message” to open and send.
+
+/refresh · /search · /projects · /help
 ```
 
 The service uses native typing indicators for ordinary work and sends bounded,
@@ -139,7 +150,9 @@ and redeploy the Worker before starting the service.
 - Prompt and response bodies are not stored in D1.
 - Inbound content lives in the relay only until the connected service
   immediately claims it into its mode-`0600` local queue.
-- Thread history, previews, full local paths, and git remotes stay local.
+- Thread history, full local paths, and git remotes stay local. Directory
+  previews are read locally only when requested, sent transiently to Sendblue,
+  and never written to D1 or menu snapshots.
 - Tokens, media, logs, and service state are owner-readable only.
 - User text is passed through stdin, not process arguments.
 - Raw JSONL tool output and secrets are never sent as progress.

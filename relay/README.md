@@ -98,7 +98,9 @@ Then redeploy with `pnpm run deploy` and update the Sendblue webhook URL to the 
   project, live state/recency, and reasoning routing metadata.
 - `GET /service/events`: installation-level WebSocket delivery for all threads.
 - `GET /service/status`: reports service pairing and active-thread state.
-- `POST /service/events/outbound`: renders and forwards typed service/thread messages.
+- `POST /service/events/outbound`: renders and forwards typed service/thread
+  messages. On-demand directories save only their ordered task IDs as the
+  numeric menu snapshot; user-message previews are not persisted.
 - `POST /threads/:threadId`: registers or re-enables a Codex thread.
 - `POST /threads/:threadId/status`: forwards Codex output, progress updates, and generated images to iMessage without storing the outbound content.
 - `GET /threads/:threadId/events`: WebSocket delivery events backed by the relay Durable Object.
@@ -111,7 +113,7 @@ All non-webhook thread APIs use `Authorization: Bearer <token>`. When a user pai
 
 The hosted relay also applies lightweight abuse caps: anonymous install-token creation and authenticated thread routes are rate-limited in memory by the relay Durable Object, legacy per-thread registration is capped at 25 enabled threads, persistent-service catalogs are capped at 500 canonical tasks, generated images are limited to 5 per status request, and each generated image must be 10 MB or smaller after base64 decoding.
 
-The relay stores the minimum data needed to route messages. Cloudflare D1 is still required for routing metadata such as thread state, pairing state, and phone bindings, but message content is never stored there. Inbound message content is held only in the Durable Object's in-memory buffer until the connected service immediately claims it into private local state, then scrubbed. Outbound Codex replies are forwarded to Sendblue and are not stored by the relay.
+The relay stores the minimum data needed to route messages. Cloudflare D1 is still required for routing metadata such as thread state, pairing state, phone bindings, and ordered menu task IDs, but message content and directory previews are never stored there. Inbound message content is held only in the Durable Object's in-memory buffer until the connected service immediately claims it into private local state, then scrubbed. Outbound Codex replies and on-demand directory previews are forwarded to Sendblue and are not stored by the relay.
 
 Cloudflare persisted logging is disabled for this Worker in `wrangler.jsonc`. Message bodies are never placed in URLs, and relay warnings intentionally avoid logging Sendblue response payloads because provider error payloads could echo message content.
 

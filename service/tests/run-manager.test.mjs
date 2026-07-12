@@ -22,6 +22,7 @@ test("runs different threads concurrently and queues each thread in order", asyn
   assert.equal(manager.state("a").status, "working");
   assert.equal(manager.state("a").pendingCount, 1);
   assert.equal(manager.state("a").request, "First request");
+  assert.equal(manager.state("a").latestRequest, "Second request");
   assert.equal(manager.has("a2"), true);
   releases.get("a1")();
   await tick();

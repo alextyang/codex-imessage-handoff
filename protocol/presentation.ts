@@ -15,6 +15,8 @@ export interface MenuItem extends ThreadLabel {
   stateSince?: string | null;
   reasoningEffort?: string | null;
   threadCount?: number;
+  pendingCount?: number;
+  requestPreview?: string | null;
 }
 
 export interface ThreadDirectoryGroup {
@@ -41,6 +43,7 @@ export interface ThreadDirectory {
   totalTasks?: number;
   groups: ThreadDirectoryGroup[];
   collapsedProjects?: CollapsedProject[];
+  criteria?: string;
   note?: string;
 }
 
@@ -90,6 +93,7 @@ export type OutboundEvent =
     note?: string;
   }
   | { kind: "service.menu"; label?: "THREADS" | "PROJECTS" | "COMMANDS"; items?: MenuItem[]; body?: string; note?: string }
+  | { kind: "service.directory"; directory: ThreadDirectory }
   | { kind: "service.switched"; thread: ThreadLabel }
   | { kind: "service.notice"; code: NoticeCode; body: string; thread?: ThreadLabel };
 
@@ -189,7 +193,17 @@ function menuMetadata(item: MenuItem, now: string | Date | number) {
   const parts = [];
   if (item.current) parts.push("Selected");
   parts.push(statusLine(item.status, item.activityAt, item.stateSince, now));
+  const pending = Math.max(0, Number(item.pendingCount) || 0);
+  if (pending > 0 && (statusName(item.status) !== "Pending" || pending > 1)) {
+    parts.push(`${pending} pending`);
+  }
   return parts.join(" · ");
+}
+
+function requestPreview(value: unknown) {
+  const text = typeof value === "string" ? value.replace(/\s+/g, " ").trim() : "";
+  if (!text) return null;
+  return text.length <= 160 ? text : `${text.slice(0, 159).trimEnd()}…`;
 }
 
 export function renderThreadDirectory(directory: ThreadDirectory, options: { now?: string | Date | number } = {}) {
@@ -202,13 +216,14 @@ export function renderThreadDirectory(directory: ThreadDirectory, options: { now
   );
   const sections: string[] = [
     header(directory.label === "PROJECTS" ? "PROJECTS" : "THREADS"),
-    `${plural(total, "task")} · refreshed now`,
+    [plural(total, "task"), cleanLine(directory.criteria, ""), "refreshed now"].filter(Boolean).join(" · "),
   ];
 
   for (const group of groups) {
     const rows = group.threads.map((item, offset) => {
       const index = item.index ?? offset + 1;
-      return `${index}. ${threadTitle(item)}\n   ${menuMetadata(item, now)}`;
+      const preview = requestPreview(item.requestPreview);
+      return [`${index}. ${threadTitle(item)}`, `   ${menuMetadata(item, now)}`, preview ? `   “${preview}”` : null].filter(Boolean).join("\n");
     });
     if (group.hiddenCount && group.hiddenCount > 0) rows.push(`   +${plural(group.hiddenCount, "more task")}`);
     sections.push(`${cleanLine(group.projectLabel, "OTHER").toUpperCase()}\n${rows.join("\n")}`);
@@ -224,7 +239,7 @@ export function renderThreadDirectory(directory: ThreadDirectory, options: { now
     sections.push(`RECENT PROJECTS\n${rows.join("\n")}`);
   }
 
-  if (groups.length === 0 && collapsed.length === 0) sections.push("No available tasks.");
+  if (groups.length === 0 && collapsed.length === 0) sections.push("No pending or recently active tasks.");
   if (directory.note) sections.push(directory.note);
   return sections.filter(Boolean).join("\n\n");
 }
@@ -240,7 +255,7 @@ export function renderThreadMenu(items: MenuItem[], options: { label?: "THREADS"
   }
   const groups = new Map<string, MenuItem[]>();
   for (const item of items) {
-    const project = item.projectLabel?.trim() || "Other";
+    const project = item.projectLabel?.trim() || "Other tasks";
     groups.set(project, [...(groups.get(project) ?? []), { ...item, index: item.index ?? items.indexOf(item) + 1 }]);
   }
   return renderThreadDirectory({
@@ -334,6 +349,7 @@ export function renderOutboundEvent(event: OutboundEvent) {
   if (event.kind === "thread.progress") {
     return [header("WORKING"), `${event.thread.projectLabel || "Codex"}\n${threadTitle(event.thread)}`, safeBody(event.phase)].join("\n\n");
   }
+  if (event.kind === "service.directory") return renderThreadDirectory(event.directory);
   if (event.kind === "thread.detail") return renderThreadDetail(event);
   if (event.kind === "thread.request") {
     const request = normalizeRequest(event);

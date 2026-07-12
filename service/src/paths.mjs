@@ -16,6 +16,7 @@ export function servicePaths() {
     config: path.join(home, "config.json"),
     legacyConfig: path.join(codexHome(), "skills", "imessage-handoff", ".state", "config.json"),
     stateDb: process.env.IMESSAGE_HANDOFF_STATE_DB || path.join(codexHome(), "state_5.sqlite"),
+    globalState: process.env.IMESSAGE_HANDOFF_GLOBAL_STATE || path.join(codexHome(), ".codex-global-state.json"),
     attachments: path.join(home, "attachments"),
     runState: path.join(home, "run-state.json"),
     stdoutLog: path.join(home, "service.log"),

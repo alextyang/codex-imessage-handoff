@@ -549,11 +549,15 @@ function generatedImageBytes(filename: string, bytes: Uint8Array) {
   };
 }
 
-async function registerService(testEnv: Env) {
+async function registerService(testEnv: Env, options: { serviceVersion?: string; capabilities?: string[] } = {}) {
   const response = await handleRequest(req("/service/register", {
     method: "POST",
     headers: { authorization: "Bearer dev-token" },
-    body: JSON.stringify({ clientId: "client-test", serviceVersion: "0.2.0", capabilities: ["catalog-v1"] }),
+    body: JSON.stringify({
+      clientId: "client-test",
+      serviceVersion: options.serviceVersion || "0.3.2",
+      capabilities: options.capabilities || ["catalog-v2", "local-directory-v1"],
+    }),
   }), testEnv);
   assert.equal(response.status, 200);
   return json(response);
@@ -1286,7 +1290,7 @@ test("list command returns a numbered grouped directory with live status", async
     assert.equal(response.status, 200);
     const directory = String(outboundContents(calls).at(-1));
     assert.match(directory, /^CODEX CONTROL · THREADS/);
-    assert.match(directory, /OTHER\n1\. Second/);
+    assert.match(directory, /OTHER TASKS\n1\. Second/);
     assert.match(directory, /Selected · Idle/);
     assert.match(directory, /2\. iMessage test/);
     assert.doesNotMatch(directory, /enabled|stopped/i);
@@ -1314,7 +1318,7 @@ test("list command reports when the paired phone has no iMessage handoff threads
   try {
     const response = await handleRequest(sendblueWebhook(inboundMessage("list", "list_msg_empty")), testEnv);
     assert.equal(response.status, 200);
-    assert.deepEqual(outboundContents(calls), ["CODEX CONTROL · THREADS\n\n0 tasks · refreshed now\n\nNo available tasks."]);
+    assert.deepEqual(outboundContents(calls), ["CODEX CONTROL · THREADS\n\n0 tasks · refreshed now\n\nNo pending or recently active tasks."]);
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -2642,7 +2646,9 @@ test("thread controls report an offline local service instead of disappearing", 
     assert.equal((await json(ordinary)).serviceOffline, true);
     assert.equal(pendingReplies(testEnv, "offline-thread").length, 0);
     assert.match(String(outboundContents(calls.map((call) => call.body)).at(-1)), /local Codex service is offline/i);
-    await handleRequest(sendblueWebhook(inboundMessage("/threads", "offline_list")), testEnv);
+    const list = await handleRequest(sendblueWebhook(inboundMessage("/threads", "offline_list")), testEnv);
+    assert.equal((await json(list)).routed, false);
+    assert.match(String(outboundContents(calls.map((call) => call.body)).at(-1)), /local Codex service is offline/i);
     const shortcut = await handleRequest(sendblueWebhook(inboundMessage("1: run it", "offline_shortcut")), testEnv);
     assert.equal((await json(shortcut)).serviceOffline, true);
     assert.equal(pendingReplies(testEnv, "offline-thread").length, 0);
@@ -2651,7 +2657,35 @@ test("thread controls report an offline local service instead of disappearing", 
   }
 });
 
-test("grouped directory uses project keys and numeric thread opens route locally", async () => {
+test("older persistent clients keep the relay-rendered directory during a rolling upgrade", async () => {
+  const testEnv = env();
+  const registration = await registerService(testEnv, { serviceVersion: "0.3.1", capabilities: ["catalog-v2"] });
+  await handleRequest(req("/service/catalog", {
+    method: "PUT",
+    headers: { authorization: "Bearer dev-token" },
+    body: JSON.stringify({ complete: true, threads: [{ id: "old-client-thread", title: "Compatible task", cwd: "project", projectKey: "project", projectLabel: "Project" }] }),
+  }), testEnv);
+  await handleRequest(sendblueWebhook(inboundMessage(String(registration.pairingCode), "old-client-pair")), testEnv);
+  const controls: Array<Record<string, unknown>> = [];
+  attachOwnerControlCapture(testEnv, controls);
+  const calls: Array<Record<string, unknown> | null> = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (_input, init) => {
+    calls.push(init?.body ? JSON.parse(String(init.body)) : null);
+    return new Response(JSON.stringify({ status: "SENT", message_handle: `old-${calls.length}` }), { status: 200 });
+  };
+  try {
+    const list = await handleRequest(sendblueWebhook(inboundMessage("/threads", "old-client-list")), testEnv);
+    assert.equal(list.status, 200);
+    assert.equal(controls.length, 0);
+    assert.match(String(outboundContents(calls).at(-1)), /^CODEX CONTROL · THREADS/);
+    assert.match(String(outboundContents(calls).at(-1)), /Compatible task/);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("local directory previews stay transient and numeric thread opens use its exact visual order", async () => {
   const testEnv = env();
   const registration = await registerService(testEnv);
   const threads = Array.from({ length: 5 }, (_, index) => ({
@@ -2659,7 +2693,7 @@ test("grouped directory uses project keys and numeric thread opens route locally
     title: `Task ${index + 1}`,
     cwd: `project-${index + 1}`,
     projectKey: `project-key-${index + 1}`,
-    projectLabel: index < 2 ? "Same label" : `Project ${index + 1}`,
+    projectLabel: index === 4 ? null : index < 2 ? "Same label" : `Project ${index + 1}`,
     status: index === 1 ? "pending" : "idle",
     activityAt: `2026-07-12T00:0${5 - index}:00.000Z`,
   }));
@@ -2680,41 +2714,83 @@ test("grouped directory uses project keys and numeric thread opens route locally
   try {
     const list = await handleRequest(sendblueWebhook(inboundMessage("/threads", "directory-list")), testEnv);
     assert.equal(list.status, 200);
+    assert.equal((await json(list)).routed, true);
+    assert.deepEqual(controls.at(-1), { type: "control", command: "threads", threadId: "thread-2", argument: null });
+
+    calls.length = 0;
+    const directory = {
+      kind: "service.directory",
+      directory: {
+        label: "THREADS",
+        totalTasks: 4,
+        criteria: "pending + activity in last 48h",
+        groups: [
+          {
+            projectKey: "project-key-1",
+            projectLabel: "Same label · 1",
+            threads: [
+              { id: "thread-2", index: 1, title: "Task 2", current: true, status: "pending", stateSince: "2026-07-12T00:04:00.000Z", requestPreview: "Newest private queued request" },
+              { id: "thread-1", index: 2, title: "Task 1", status: "idle", activityAt: "2026-07-12T00:05:00.000Z", requestPreview: "Private preview never in D1" },
+            ],
+          },
+          {
+            projectKey: "project-key-3",
+            projectLabel: "Project 3",
+            threads: [{ id: "thread-3", index: 3, title: "Task 3", status: "idle", activityAt: "2026-07-12T00:03:00.000Z", requestPreview: "Recent project request" }],
+          },
+          {
+            projectKey: "other-tasks",
+            projectLabel: "Other tasks",
+            threads: [{ id: "thread-5", index: 4, title: "Task 5", status: "idle", activityAt: "2026-07-12T00:01:00.000Z", requestPreview: "General Codex question" }],
+          },
+        ],
+      },
+    };
+    const delivered = await handleRequest(req("/service/events/outbound", {
+      method: "POST",
+      headers: { authorization: "Bearer dev-token" },
+      body: JSON.stringify({ event: directory }),
+    }), testEnv);
+    assert.equal(delivered.status, 200);
     const rendered = String(outboundContents(calls).at(-1));
     assert.match(rendered, /SAME LABEL · 1/);
-    assert.match(rendered, /Same label · 2/i);
-    assert.match(rendered, /project 3/i);
+    assert.match(rendered, /“Private preview never in D1”/);
+    assert.match(rendered, /OTHER TASKS/);
+    assert.doesNotMatch(rendered, /Task 4/);
     const db = testEnv.DB as unknown as FakeD1Database;
     const snapshot = JSON.parse(String(db.menuSnapshots.get("+15551234567")?.items_json)) as string[];
-    assert.ok(snapshot.some((reference) => reference.startsWith("project:")), "recent projects remain reachable as collapsed rows");
-    assert.equal(new Set(snapshot).size, snapshot.length, "same-label projects keep distinct stable references");
+    assert.deepEqual(snapshot, ["thread:thread-2", "thread:thread-1", "thread:thread-3", "thread:thread-5"]);
+    assert.doesNotMatch(JSON.stringify([...db.threads.values()]), /Private preview never in D1/);
+    assert.doesNotMatch(String(db.menuSnapshots.get("+15551234567")?.items_json), /Private preview never in D1/);
+
+    const invalidDirectory = JSON.parse(JSON.stringify(directory));
+    invalidDirectory.directory.groups[1].threads[0].index = 2;
+    const invalid = await handleRequest(req("/service/events/outbound", {
+      method: "POST",
+      headers: { authorization: "Bearer dev-token" },
+      body: JSON.stringify({ event: invalidDirectory }),
+    }), testEnv);
+    assert.equal(invalid.status, 400);
+    assert.deepEqual(JSON.parse(String(db.menuSnapshots.get("+15551234567")?.items_json)), snapshot);
 
     calls.length = 0;
     const refresh = await handleRequest(sendblueWebhook(inboundMessage("/refresh", "directory-refresh")), testEnv);
     assert.equal(refresh.status, 200);
     assert.equal((await json(refresh)).command, "refresh");
-    assert.equal(controls.length, 0, "refresh is rendered by the relay without waking Codex");
-    assert.match(String(outboundContents(calls).at(-1)), /^CODEX CONTROL · THREADS/);
+    assert.deepEqual(controls.at(-1), { type: "control", command: "threads", threadId: "thread-2", argument: "refresh" });
 
     calls.length = 0;
-    const projectIndex = snapshot.findIndex((reference) => reference.startsWith("project:"));
-    const expand = await handleRequest(sendblueWebhook(inboundMessage(`${projectIndex + 1}: do not lose this`, "directory-expand")), testEnv);
-    assert.equal(expand.status, 200);
-    assert.equal((await json(expand)).promptNotSent, true);
-    assert.equal(controls.length, 0, "expanding a project does not switch threads");
-    assert.match(String(outboundContents(calls).at(-1)), /text after the project number was not sent/i);
-    assert.equal(pendingReplies(testEnv).length, 0);
-    const expandedSnapshot = JSON.parse(String(db.menuSnapshots.get("+15551234567")?.items_json)) as string[];
-    assert.ok(expandedSnapshot.length > 0);
-    assert.ok(expandedSnapshot.every((reference) => reference.startsWith("thread:")));
-
-    calls.length = 0;
-    const open = await handleRequest(sendblueWebhook(inboundMessage("1", "directory-open")), testEnv);
+    const open = await handleRequest(sendblueWebhook(inboundMessage("2", "directory-open")), testEnv);
     assert.equal(open.status, 200);
     assert.equal(controls.at(-1)?.type, "control");
     assert.equal(controls.at(-1)?.command, "open");
-    assert.match(String(controls.at(-1)?.threadId), /^thread-/);
+    assert.equal(controls.at(-1)?.threadId, "thread-1");
     assert.match(String(outboundContents(calls).at(0)), /^CODEX CONTROL · SWITCHED/);
+
+    db.menuSnapshots.get("+15551234567")!.expires_at = "2026-01-01T00:00:00.000Z";
+    const stale = await handleRequest(sendblueWebhook(inboundMessage("1", "directory-stale")), testEnv);
+    assert.equal((await json(stale)).refreshed, true);
+    assert.deepEqual(controls.at(-1), { type: "control", command: "threads", threadId: "thread-1", argument: "refresh" });
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -2824,6 +2900,72 @@ test("service outbound splits long thread output with source headers", async () 
     assert.match(String(contents[0]), /^CODEX THREAD · CODEX · 1\/2/);
     assert.match(String(contents[1]), /^CODEX THREAD · CODEX · 2\/2/);
     assert.equal(((await json(response)).notification as Record<string, unknown>).parts, 2);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("partial multi-part directory delivery cannot leave an older numeric mapping active", async () => {
+  const testEnv = env();
+  await registerService(testEnv);
+  const threads = Array.from({ length: 60 }, (_, index) => ({
+    id: `large-directory-${index}`,
+    title: `Task ${index} ${"T".repeat(120)}`,
+    cwd: "large-project",
+    projectKey: "large-project",
+    projectLabel: "Large project",
+  }));
+  await handleRequest(req("/service/catalog", {
+    method: "PUT",
+    headers: { authorization: "Bearer dev-token" },
+    body: JSON.stringify({ complete: true, threads }),
+  }), testEnv);
+  const db = testEnv.DB as unknown as FakeD1Database;
+  db.phoneBindings.set("+15551234567", {
+    phone_number: "+15551234567", owner_id: DEV_OWNER_ID, active_thread_id: threads[0].id,
+    contact_card_sent_at: null, created_at: "2026-07-12T00:00:00.000Z", updated_at: "2026-07-12T00:00:00.000Z",
+  });
+  db.menuSnapshots.set("+15551234567", {
+    phone_number: "+15551234567", owner_id: DEV_OWNER_ID, items_json: JSON.stringify(["thread:older-task"]),
+    expires_at: "2099-01-01T00:00:00.000Z", created_at: "2026-07-12T00:00:00.000Z",
+  });
+  let sends = 0;
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (input) => {
+    if (String(input).includes("send-message")) {
+      sends += 1;
+      if (sends === 2) return new Response(JSON.stringify({ error: "provider failure" }), { status: 500 });
+    }
+    return new Response(JSON.stringify({ status: "SENT", message_handle: `large-${sends}` }), { status: 200 });
+  };
+  try {
+    const response = await handleRequest(req("/service/events/outbound", {
+      method: "POST",
+      headers: { authorization: "Bearer dev-token" },
+      body: JSON.stringify({ event: {
+        kind: "service.directory",
+        directory: {
+          label: "THREADS",
+          totalTasks: threads.length,
+          groups: [{
+            projectKey: "large-project",
+            projectLabel: "Large project",
+            threads: threads.map((thread, index) => ({
+              id: thread.id,
+              index: index + 1,
+              title: thread.title,
+              status: "idle",
+              activityAt: "2026-07-12T00:00:00.000Z",
+              requestPreview: `Preview ${index} ${"P".repeat(150)}`,
+            })),
+          }],
+        },
+      } }),
+    }), testEnv);
+    assert.equal(response.status, 400);
+    assert.equal(sends, 2, "the fixture must fail after at least one visible directory part");
+    assert.deepEqual(JSON.parse(String(db.menuSnapshots.get("+15551234567")?.items_json)), []);
+    assert.ok(Date.parse(String(db.menuSnapshots.get("+15551234567")?.expires_at)) > Date.now());
   } finally {
     globalThis.fetch = originalFetch;
   }

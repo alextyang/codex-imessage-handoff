@@ -35,6 +35,7 @@ export class RunManager {
     const id = String(threadId || "");
     const active = this.active.get(id);
     const queued = this.queues.get(id) || [];
+    const newest = queued.at(-1);
     if (active) {
       return {
         status: "working",
@@ -42,6 +43,8 @@ export class RunManager {
         pendingCount: queued.length,
         request: String(active.entry?.claimed?.reply?.body || ""),
         requestAt: active.entry?.queuedAt || active.startedAt,
+        latestRequest: String((newest || active.entry)?.claimed?.reply?.body || ""),
+        latestRequestAt: newest?.queuedAt || active.entry?.queuedAt || active.startedAt,
       };
     }
     if (queued.length) {
@@ -51,6 +54,8 @@ export class RunManager {
         pendingCount: queued.length,
         request: String(queued[0]?.claimed?.reply?.body || ""),
         requestAt: queued[0]?.queuedAt || null,
+        latestRequest: String(newest?.claimed?.reply?.body || ""),
+        latestRequestAt: newest?.queuedAt || null,
       };
     }
     return null;

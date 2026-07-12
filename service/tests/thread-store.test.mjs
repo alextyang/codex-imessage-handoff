@@ -24,6 +24,7 @@ function history(turnId, state) {
 test("catalog excludes subagents, groups projects, carries state, and finds IDs beyond a menu limit", async () => {
   const directory = mkdtempSync(path.join(os.tmpdir(), "imessage-thread-store-"));
   const database = path.join(directory, "state.sqlite");
+  const globalState = path.join(directory, "global-state.json");
   const project = path.join(directory, "projects", "catalog-app");
   const sameNameProject = path.join(directory, "copies", "catalog-app");
   const idleRollout = path.join(directory, "idle.jsonl");
@@ -70,7 +71,15 @@ test("catalog excludes subagents, groups projects, carries state, and finds IDs 
     { id: "session-a", rollout: path.join(directory, "session-a.jsonl"), title: "Separate conversation", cwd: project, source: "vscode", threadSource: "user", recency: 1_783_824_150_000 },
     { id: "session-b", rollout: path.join(directory, "session-b.jsonl"), title: "Separate conversation", cwd: project, source: "vscode", threadSource: "user", recency: 1_783_824_150_001 },
     { id: "same-name-project", rollout: path.join(directory, "same-name-project.jsonl"), title: "Other checkout", cwd: sameNameProject, source: "vscode", threadSource: "user", recency: 1_783_824_140_000 },
+    { id: "projectless-a", rollout: path.join(directory, "projectless-a.jsonl"), title: "General question A", cwd: path.join(directory, "generated", "a"), source: "vscode", threadSource: "user", recency: 1_783_824_130_000 },
+    { id: "projectless-b", rollout: path.join(directory, "projectless-b.jsonl"), title: "General question B", cwd: path.join(directory, "generated", "b"), source: "vscode", threadSource: "user", recency: 1_783_824_120_000 },
+    { id: "hinted-worktree", rollout: path.join(directory, "hinted-worktree.jsonl"), title: "Canonical project", cwd: path.join(directory, "worktrees", "catalog-app"), source: "vscode", threadSource: "user", recency: 1_783_824_110_000 },
   );
+
+  writeFileSync(globalState, JSON.stringify({
+    "projectless-thread-ids": ["projectless-a", "projectless-b"],
+    "thread-workspace-root-hints": { "hinted-worktree": project },
+  }));
 
   const statements = [
     `CREATE TABLE threads (
@@ -93,11 +102,13 @@ test("catalog excludes subagents, groups projects, carries state, and finds IDs 
   execFileSync("sqlite3", [database], { input: statements.join("\n") });
 
   const previous = process.env.IMESSAGE_HANDOFF_STATE_DB;
+  const previousGlobalState = process.env.IMESSAGE_HANDOFF_GLOBAL_STATE;
   process.env.IMESSAGE_HANDOFF_STATE_DB = database;
+  process.env.IMESSAGE_HANDOFF_GLOBAL_STATE = globalState;
   try {
     const all = await listThreads(999);
-    assert.equal(all.length, 132);
-    assert.equal(new Set(all.map((thread) => thread.id)).size, 132);
+    assert.equal(all.length, 135);
+    assert.equal(new Set(all.map((thread) => thread.id)).size, 135);
     assert.equal(all.some((thread) => thread.id.startsWith("child-")), false);
     assert.equal(all.some((thread) => thread.id === "automated-exec"), false);
     assert.equal(all.find((thread) => thread.id === "fork-root")?.title, "Fork 1 · Indistinguishable fork");
@@ -116,6 +127,13 @@ test("catalog excludes subagents, groups projects, carries state, and finds IDs 
     assert.equal(all[0].projectLabel, "catalog-app · projects");
     assert.equal(all.find((thread) => thread.id === "same-name-project")?.projectLabel, "catalog-app · copies");
     assert.equal(all[0].projectKey, projectKey(project));
+    assert.equal(all[0].lastTurnAt, "2026-07-12T03:00:00.010Z");
+    assert.equal(all.find((thread) => thread.id === "hinted-worktree")?.projectKey, projectKey(project));
+    assert.equal(all.find((thread) => thread.id === "hinted-worktree")?.workspaceRoot, project);
+    assert.equal(all.find((thread) => thread.id === "projectless-a")?.projectKey, null);
+    assert.equal(all.find((thread) => thread.id === "projectless-a")?.projectLabel, null);
+    assert.equal(all.find((thread) => thread.id === "projectless-a")?.groupKind, "other");
+    assert.equal(all.find((thread) => thread.id === "projectless-b")?.groupKind, "other");
     assert.equal(projectLabel(`${project}${path.sep}`), "catalog-app");
     assert.equal(projectLabel(path.join(directory, "x".repeat(180))).length, 120);
 
@@ -129,5 +147,7 @@ test("catalog excludes subagents, groups projects, carries state, and finds IDs 
   } finally {
     if (previous === undefined) delete process.env.IMESSAGE_HANDOFF_STATE_DB;
     else process.env.IMESSAGE_HANDOFF_STATE_DB = previous;
+    if (previousGlobalState === undefined) delete process.env.IMESSAGE_HANDOFF_GLOBAL_STATE;
+    else process.env.IMESSAGE_HANDOFF_GLOBAL_STATE = previousGlobalState;
   }
 });

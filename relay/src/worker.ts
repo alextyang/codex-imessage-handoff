@@ -710,6 +710,16 @@ async function findServiceInstallation(env: Env, ownerId: string) {
     .first<ServiceInstallationRow>();
 }
 
+function serviceSupports(installation: ServiceInstallationRow | null, capability: string) {
+  if (!installation) return false;
+  try {
+    const values = JSON.parse(installation.capabilities) as unknown;
+    return Array.isArray(values) && values.includes(capability);
+  } catch {
+    return false;
+  }
+}
+
 async function isServiceSocketConnected(env: Env, ownerId: string) {
   if (!env.HANDOFF_SOCKET) return false;
   try {
@@ -935,6 +945,29 @@ function outboundEvent(value: unknown) {
   return value as unknown as OutboundEvent;
 }
 
+async function serviceDirectoryReferences(env: Env, ownerId: string, event: Extract<OutboundEvent, { kind: "service.directory" }>) {
+  if (!isRecord(event.directory) || !Array.isArray(event.directory.groups)) {
+    throw new Error("directory.groups is required.");
+  }
+  const references: string[] = [];
+  for (const group of event.directory.groups) {
+    if (!isRecord(group) || !Array.isArray(group.threads)) throw new Error("Each directory group must contain threads.");
+    for (const item of group.threads) {
+      if (!isRecord(item)) throw new Error("Each directory thread must be an object.");
+      const id = requireLimitedString(item.id, "directory.thread.id", 160);
+      if (Number(item.index) !== references.length + 1) throw new Error("Directory thread indexes must be continuous.");
+      references.push(`thread:${id}`);
+    }
+  }
+  if (references.length > MAX_CATALOG_THREADS_PER_OWNER) throw new Error("Directory contains too many threads.");
+  if (new Set(references).size !== references.length) throw new Error("Directory thread ids must be unique.");
+  const available = new Set((await listEnabledThreadsForOwner(env, ownerId)).map((thread) => `thread:${thread.id}`));
+  if (references.some((reference) => !available.has(reference))) {
+    throw Object.assign(new Error("Directory contains an unavailable task."), { status: 409 });
+  }
+  return references;
+}
+
 async function handleServiceOutbound(request: Request, env: Env) {
   const ownerId = await requireOwnerId(request);
   const body = await readJsonBody<OutboundBody>(request, SERVICE_OUTBOUND_JSON_BODY_MAX_BYTES);
@@ -943,6 +976,9 @@ async function handleServiceOutbound(request: Request, env: Env) {
     throw Object.assign(new Error("Phone is not paired."), { status: 409 });
   }
   const event = outboundEvent(body.event);
+  const directoryReferences = event.kind === "service.directory"
+    ? await serviceDirectoryReferences(env, ownerId, event)
+    : null;
   const rendered = renderOutboundEvent(event);
   const chunks: string[] = [];
   if (event.kind === "thread.output" && rendered.length > 8000) {
@@ -958,6 +994,13 @@ async function handleServiceOutbound(request: Request, env: Env) {
         : `${threadHeader(event.thread, { index: index + 1, total: renderedChunks.length })}\n${threadTitle(event.thread)}\n\n`;
       chunks.push(`${continuation}${renderedChunks[index]}`);
     }
+  } else if (rendered.length > 8000) {
+    const renderedChunks = splitText(rendered, 7600);
+    for (let index = 0; index < renderedChunks.length; index += 1) {
+      const label = event.kind === "service.directory" ? "THREADS" : "CONTINUED";
+      const continuation = index === 0 ? "" : `CODEX CONTROL · ${label} · ${index + 1}/${renderedChunks.length}\n\n`;
+      chunks.push(`${continuation}${renderedChunks[index]}`);
+    }
   } else {
     chunks.push(rendered);
   }
@@ -966,11 +1009,17 @@ async function handleServiceOutbound(request: Request, env: Env) {
   } catch {
     // Typing is best effort.
   }
+  // A directory may span several provider messages. Replace any older mapping
+  // with an empty, unexpired sentinel before part 1 so an immediate numeric
+  // reply can never select a row from the previous directory. Publish the real
+  // mapping only after every part is accepted by Sendblue.
+  if (directoryReferences) await saveMenuSnapshot(env, binding, [], []);
   let result = null;
   for (const chunk of chunks) {
     if (chunk.length > MAX_ASSISTANT_MESSAGE_LENGTH) requestTooLarge("Rendered message is too large.");
     result = await sendSendblueMessage(env, binding.phone_number, chunk);
   }
+  if (directoryReferences) await saveMenuSnapshot(env, binding, [], directoryReferences);
   if (event.kind === "thread.progress") {
     try {
       await sendSendblueTypingIndicator(env, binding.phone_number, "start");
@@ -1173,6 +1222,7 @@ type DirectoryStatus = "working" | "pending" | "idle" | "error";
 interface DirectoryProject {
   projectKey: string;
   projectLabel: string;
+  other: boolean;
   status: DirectoryStatus;
   activityAt: string;
   current: boolean;
@@ -1196,7 +1246,9 @@ function projectStatus(threads: HandoffThreadRow[]): DirectoryStatus {
 function projectGroups(threads: HandoffThreadRow[], activeThreadId: string | null) {
   const byProject = new Map<string, HandoffThreadRow[]>();
   for (const thread of threads) {
-    const key = thread.project_key?.trim() || thread.project_label?.trim() || "codex";
+    const key = thread.project_label?.trim()
+      ? thread.project_key?.trim() || thread.project_label.trim()
+      : "other-tasks";
     byProject.set(key, [...(byProject.get(key) ?? []), thread]);
   }
   const groups: DirectoryProject[] = [...byProject.entries()].map(([projectKey, rows]) => {
@@ -1208,7 +1260,8 @@ function projectGroups(threads: HandoffThreadRow[], activeThreadId: string | nul
     ));
     return {
       projectKey,
-      projectLabel: sorted[0]?.project_label?.trim() || "Other",
+      projectLabel: sorted[0]?.project_label?.trim() || "Other tasks",
+      other: !sorted[0]?.project_label?.trim(),
       status: projectStatus(sorted),
       activityAt: sorted.reduce((latest, row) => {
         const value = row.activity_at ?? row.updated_at;
@@ -1220,6 +1273,7 @@ function projectGroups(threads: HandoffThreadRow[], activeThreadId: string | nul
   });
   const byLabel = new Map<string, DirectoryProject[]>();
   for (const group of groups) {
+    if (group.other) continue;
     const label = group.projectLabel.toLocaleLowerCase();
     byLabel.set(label, [...(byLabel.get(label) ?? []), group]);
   }
@@ -1230,7 +1284,8 @@ function projectGroups(threads: HandoffThreadRow[], activeThreadId: string | nul
     });
   }
   return groups.sort((a, b) => (
-    Number(b.current) - Number(a.current)
+    Number(a.other) - Number(b.other)
+    || Number(b.current) - Number(a.current)
     || statusRank(a.status) - statusRank(b.status)
     || b.activityAt.localeCompare(a.activityAt)
     || a.projectLabel.localeCompare(b.projectLabel)
@@ -2215,6 +2270,21 @@ async function handleSendblueWebhook(request: Request, env: Env, ctx?: WaitUntil
     || slashCommand?.command === "recent"
     || slashCommand?.command === "refresh"
   )) {
+    const persistentService = await findServiceInstallation(env, binding.owner_id);
+    if (serviceSupports(persistentService, "local-directory-v1")) {
+      const argument = slashCommand?.command === "recent"
+        ? "recent"
+        : slashCommand?.command === "refresh"
+          ? "refresh"
+          : null;
+      const routed = await startTypingAndSendOwnerControl(env, binding, "threads", argument);
+      await recordAppliedControl(env, binding, content, externalId);
+      return json({
+        ok: true,
+        command: slashCommand?.command === "refresh" ? "refresh" : "list",
+        routed,
+      });
+    }
     const threads = await listEnabledThreadsForOwner(env, binding.owner_id);
     const extended = slashCommand?.command === "recent";
     const planned = buildThreadDirectory(threads, binding.active_thread_id, extended
@@ -2318,6 +2388,17 @@ async function handleSendblueWebhook(request: Request, env: Env, ctx?: WaitUntil
   const selection = content ? parseMenuSelection(content) : null;
   const snapshotIds = !mediaUrl && selection ? await findMenuSnapshot(env, fromNumber) : null;
   if (!mediaUrl && content && selection && !snapshotIds && await hasMenuSnapshot(env, fromNumber)) {
+    const persistentService = await findServiceInstallation(env, binding.owner_id);
+    if (serviceSupports(persistentService, "local-directory-v1")) {
+      await sendControlMessage(env, fromNumber, renderOutboundEvent({
+        kind: "service.notice",
+        code: "needs-attention",
+        body: "That menu expired. A fresh directory is on the way; reply with a new number.",
+      }));
+      const routed = await startTypingAndSendOwnerControl(env, binding, "threads", "refresh");
+      await recordAppliedControl(env, binding, content, externalId);
+      return json({ ok: true, command: "stale-menu", refreshed: routed });
+    }
     const threads = await listEnabledThreadsForOwner(env, binding.owner_id);
     const planned = buildThreadDirectory(threads, binding.active_thread_id);
     await saveMenuSnapshot(env, binding, [], planned.references);

@@ -5,6 +5,7 @@ import path from "node:path";
 import { promisify } from "node:util";
 import { servicePaths } from "./paths.mjs";
 import { getThreadState } from "./thread-history.mjs";
+import { readWorkspaceState } from "./workspace-state.mjs";
 
 const execFileAsync = promisify(execFile);
 const MAX_THREADS = 500;
@@ -77,19 +78,25 @@ async function query(sql) {
   return stdout.trim() ? JSON.parse(stdout) : [];
 }
 
-function threadFromRow(row) {
+function threadFromRow(row, workspaceState = readWorkspaceState()) {
+  const id = String(row.id);
   const cwd = normalizedCwd(row.cwd);
+  const projectless = workspaceState.projectlessThreadIds.has(id);
+  const hintedRoot = workspaceState.workspaceRootHints.get(id);
+  const workspaceRoot = projectless ? null : normalizedCwd(hintedRoot || cwd);
   const updatedAt = iso(row.updated_at_ms, row.updated_at);
   const recencyAt = iso(row.recency_at_ms, row.recency_at) || updatedAt;
   const observed = getThreadState(String(row.rollout_path || ""));
   const forkedFromId = forkParent(String(row.rollout_path || ""));
   const activityAt = observed.activityAt || updatedAt || recencyAt;
   return {
-    id: String(row.id),
+    id,
     title: String(row.title || "Untitled thread").replace(/\s+/g, " ").trim().slice(0, 160),
     cwd,
-    projectKey: projectKey(cwd),
-    projectLabel: projectLabel(cwd),
+    workspaceRoot,
+    groupKind: projectless ? "other" : "project",
+    projectKey: projectless ? null : projectKey(workspaceRoot),
+    projectLabel: projectless ? null : projectLabel(workspaceRoot),
     rolloutPath: String(row.rollout_path || ""),
     forkedFromId,
     createdAt: iso(row.created_at_ms, row.created_at),
@@ -98,6 +105,8 @@ function threadFromRow(row) {
     recencyAtMs: Date.parse(recencyAt || "") || null,
     activityAt,
     activityAtMs: observed.activityAtMs || Date.parse(activityAt || "") || null,
+    lastTurnAt: observed.lastTurnAt || null,
+    lastTurnAtMs: observed.lastTurnAtMs || null,
     stateSince: observed.stateSince || activityAt,
     state: observed.state,
     currentTurnId: observed.currentTurnId,
@@ -186,8 +195,9 @@ function stableThreadOrder(left, right) {
 function disambiguateProjectLabels(threads) {
   const byLabel = new Map();
   for (const thread of threads) {
+    if (thread.groupKind === "other" || !thread.projectKey || !thread.projectLabel) continue;
     const projects = byLabel.get(thread.projectLabel) || new Map();
-    projects.set(thread.projectKey, thread.cwd);
+    projects.set(thread.projectKey, thread.workspaceRoot || thread.cwd);
     byLabel.set(thread.projectLabel, projects);
   }
   const labels = new Map();
@@ -216,11 +226,11 @@ function disambiguateProjectLabels(threads) {
 function disambiguateDisplayDuplicates(threads, roots) {
   const groups = new Map();
   for (const thread of threads) {
-    const key = `${thread.cwd}\u0000${thread.title}`;
+    const key = `${thread.projectKey || "other"}\u0000${thread.title}`;
     groups.set(key, [...(groups.get(key) || []), thread]);
   }
   return threads.map((thread) => {
-    const group = groups.get(`${thread.cwd}\u0000${thread.title}`) || [];
+    const group = groups.get(`${thread.projectKey || "other"}\u0000${thread.title}`) || [];
     if (group.length < 2) return thread;
     const stableGroup = [...group].sort((left, right) => (
       Number((roots.get(right.id) || right.id) === right.id) - Number((roots.get(left.id) || left.id) === left.id)
@@ -241,8 +251,9 @@ export async function listThreads(limit = MAX_THREADS) {
     WHERE ${ROOT_THREAD_PREDICATE}
     ORDER BY t.recency_at_ms DESC, t.updated_at_ms DESC, t.id DESC`),
   ]);
+  const workspaceState = readWorkspaceState();
   const roots = lineageRoots(dedupeRows(lineageRows));
-  const threads = disambiguateProjectLabels(dedupeRows(rows).map(threadFromRow));
+  const threads = disambiguateProjectLabels(dedupeRows(rows).map((row) => threadFromRow(row, workspaceState)));
   return disambiguateDisplayDuplicates(threads, roots).slice(0, safeLimit(limit));
 }
 
@@ -255,5 +266,5 @@ export async function findThread(id) {
     WHERE t.id = ${sqlString(canonicalId)}
       AND ${ROOT_THREAD_PREDICATE}
     LIMIT 1`);
-  return rows[0] ? threadFromRow(rows[0]) : null;
+  return rows[0] ? threadFromRow(rows[0], readWorkspaceState()) : null;
 }

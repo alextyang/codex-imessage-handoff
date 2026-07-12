@@ -5,6 +5,7 @@ import { existsSync } from "node:fs";
 import { readConfig } from "./config.mjs";
 import { listThreads } from "./thread-store.mjs";
 import { getThreadDetail, getLatestRequest, getTurn, getHistory } from "./thread-history.mjs";
+import { buildThreadDirectory } from "./thread-directory.mjs";
 import { getReasoningOverride, setReasoningOverride, listReasoningOptions } from "./thread-settings.mjs";
 import { RelayClient } from "./relay-client.mjs";
 import { CodexRunner } from "./codex-runner.mjs";
@@ -20,6 +21,7 @@ const claimingReplyIds = new Map();
 const discardRetryTimers = new Map();
 const ingestChains = new Map();
 const ingestPendingCounts = new Map();
+const ingestLatestAt = new Map();
 const cancelledThrough = new Map();
 let stopped = false;
 let syncTimer = null;
@@ -27,6 +29,7 @@ let syncChain = Promise.resolve([]);
 let settingsWarningLogged = false;
 let lastCatalogSignature = null;
 let catalogById = new Map();
+let controlChain = Promise.resolve();
 
 function log(message) {
   process.stdout.write(`${new Date().toISOString()} ${message}\n`);
@@ -43,18 +46,31 @@ function threadLabel(thread) {
 
 function effectiveState(thread) {
   const queued = runs.state(thread.id);
-  const failure = failedRuns.list(thread.id)[0] || null;
+  const receivingCount = ingestPendingCounts.get(thread.id) || 0;
+  const receivingAt = ingestLatestAt.get(thread.id) || null;
+  const failures = failedRuns.list(thread.id);
+  const failure = failures[0] || null;
+  const newestFailure = failures.at(-1) || null;
+  const latestCandidates = [
+    queued && queued.latestRequestAt ? { body: queued.latestRequest, at: queued.latestRequestAt } : null,
+    receivingCount ? { body: "Receiving newest iMessage request…", at: receivingAt } : null,
+    newestFailure ? { body: newestFailure.body, at: newestFailure.queuedAt } : null,
+  ].filter(Boolean).sort((left, right) => String(right.at || "").localeCompare(String(left.at || "")));
   const observed = failure || thread.state === "aborted"
     ? "error"
     : thread.state === "running"
       ? "working"
-      : "idle";
+      : receivingCount
+        ? "pending"
+        : "idle";
   return {
     status: queued?.status || observed,
-    stateSince: queued?.stateSince || thread.stateSince || thread.activityAt || thread.updatedAt,
-    pendingCount: queued?.pendingCount || 0,
+    stateSince: queued?.stateSince || receivingAt || thread.stateSince || thread.activityAt || thread.updatedAt,
+    pendingCount: (queued?.pendingCount || 0) + receivingCount,
     request: queued ? queued.request : failure?.body ?? null,
     requestAt: queued?.requestAt || failure?.queuedAt || null,
+    latestRequest: latestCandidates[0]?.body ?? null,
+    latestRequestAt: latestCandidates[0]?.at ?? null,
   };
 }
 
@@ -80,7 +96,7 @@ async function synchronizeNow() {
       title: thread.title,
       cwd: thread.projectLabel || "Codex",
       projectKey: thread.projectKey,
-      projectLabel: thread.projectLabel || "Codex",
+      projectLabel: thread.projectLabel,
       createdAt: thread.createdAt,
       updatedAt: thread.updatedAt,
       activityAt: state.status === "working" || state.status === "pending"
@@ -382,13 +398,19 @@ function queueIngest(event) {
   event.receivedAtMs ||= Date.now();
   event.queuedAt ||= event.createdAt || new Date().toISOString();
   ingestPendingCounts.set(threadId, (ingestPendingCounts.get(threadId) || 0) + 1);
+  if (!ingestLatestAt.get(threadId) || String(event.queuedAt).localeCompare(String(ingestLatestAt.get(threadId))) > 0) {
+    ingestLatestAt.set(threadId, event.queuedAt);
+  }
   const previous = ingestChains.get(threadId) || Promise.resolve();
   const current = previous.catch(() => {}).then(() => ingestReply(event));
   ingestChains.set(threadId, current);
   current.finally(() => {
     const remaining = (ingestPendingCounts.get(threadId) || 1) - 1;
     if (remaining > 0) ingestPendingCounts.set(threadId, remaining);
-    else ingestPendingCounts.delete(threadId);
+    else {
+      ingestPendingCounts.delete(threadId);
+      ingestLatestAt.delete(threadId);
+    }
     if (ingestChains.get(threadId) === current) ingestChains.delete(threadId);
   }).catch(() => {});
 }
@@ -468,9 +490,33 @@ function outboundTurn(turn) {
   };
 }
 
+async function publishThreadDirectory(activeThreadId) {
+  const currentIngests = [...ingestChains.values()];
+  if (currentIngests.length) {
+    await Promise.race([
+      Promise.allSettled(currentIngests),
+      new Promise((resolve) => setTimeout(resolve, 3000)),
+    ]);
+  }
+  const threads = await synchronize();
+  const planned = await buildThreadDirectory(threads, {
+    activeThreadId,
+    stateFor: effectiveState,
+    latestRequest: (thread) => {
+      const turn = getTurn(thread);
+      return { body: turn?.request || "", at: turn?.startedAt || thread.lastTurnAt };
+    },
+  });
+  await relay.outbound({ kind: "service.directory", directory: planned.directory });
+}
+
 async function handleControl(event) {
   const command = String(event.command || "").toLowerCase();
   const thread = event.threadId ? catalogById.get(String(event.threadId)) : null;
+  if (command === "threads" || command === "recent" || command === "refresh") {
+    await publishThreadDirectory(event.threadId);
+    return;
+  }
   if (command === "cancel") {
     const threadId = event.threadId ? String(event.threadId) : "";
     cancelledThrough.set(threadId, Date.now());
@@ -597,6 +643,17 @@ async function handleControl(event) {
   }
 }
 
+async function runControl(event) {
+  try {
+    await handleControl(event);
+  } catch {
+    log("Control command failed.");
+    try {
+      await relay.outbound({ kind: "service.notice", code: "needs-attention", body: "That control could not be completed. Try again or use /threads." });
+    } catch {}
+  }
+}
+
 function connect() {
   if (stopped) return;
   const socket = new WebSocket(relay.eventsUrl());
@@ -609,12 +666,11 @@ function connect() {
       const event = JSON.parse(String(data));
       if (event.type === "reply-pending") queueIngest(event);
       if (event.type === "control") {
-        handleControl(event).catch(async () => {
-          log("Control command failed.");
-          try {
-            await relay.outbound({ kind: "service.notice", code: "needs-attention", body: "That control could not be completed. Try again or use /threads." });
-          } catch {}
-        });
+        // Cancellation stays immediate even if a large directory/history view
+        // is still scanning or delivering. Presentation controls remain
+        // ordered so their messages and menu snapshots cannot cross.
+        if (String(event.command || "").toLowerCase() === "cancel") runControl(event);
+        else controlChain = controlChain.catch(() => {}).then(() => runControl(event));
       }
     } catch {
       log("Ignored malformed relay event.");
