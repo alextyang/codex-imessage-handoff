@@ -74,33 +74,74 @@ Thread replies and service controls use separate visual namespaces:
 
 ```text
 CODEX THREAD · MUSIC CRAWLER
+────────────────────────
+
 Fix album metadata
 
+RESULT
 All tests pass.
 ```
 
 ```text
 CODEX CONTROL · THREADS
-3 tasks · pending + activity in last 48h · refreshed now
+────────────────────────
 
-MUSIC CRAWLER
+3 TASKS · UPDATED NOW
+Pending + activity in last 48h
+
+PROJECT · MUSIC CRAWLER · 2 TASKS
+
 1. Retry failed imports
-   Pending · 12m ago
-   “Rerun the failed import without creating duplicate IDs.”
+   [PENDING] 12m ago · 2 QUEUED
+   › Rerun the failed import without creating duplicate IDs.
+
 2. Fix album metadata
-   Selected · Idle · 5m ago
-   “Normalize album dates, then rerun the tests.”
+   [SELECTED] [IDLE] 5m ago
+   › Normalize album dates, then rerun the tests.
 
-OTHER TASKS
+OTHER TASKS · 1 TASK
+
 3. Compare messaging providers
-   Idle · 3h ago
-   “Which provider supports richer iMessage interactions?”
+   [IDLE] 3h ago
+   › Which provider supports richer iMessage interactions?
 
+REPLY
 Reply with a number to open.
 Use “2: message” to open and send.
 
+OPTIONS
 /refresh · /search · /projects · /help
 ```
+
+Opening a task uses the same hierarchy and keeps task controls out of the
+conversation body:
+
+```text
+CODEX THREAD · MUSIC CRAWLER
+────────────────────────
+
+Fix album metadata
+[IDLE] 5m ago · REASONING HIGH
+
+ACTIONS
+/request · /turn · /history · /reasoning
+/threads
+
+YOU · 7m ago
+Normalize all album fields…
+
+TIP · /request shows the full message.
+
+CODEX · 5m ago
+Full final response.
+```
+
+Sendblue's [documented message body](https://docs.sendblue.com/api/resources/messages/methods/send)
+is plain text; its [`send_style` values](https://docs.sendblue.com/guides/expressive-messages/)
+are whole-message iMessage effects rather than inline bold or italic. The service
+therefore uses compact labels, spacing, state chips, and a restrained divider
+instead of markup or effects, so the hierarchy remains meaningful under SMS
+fallback too.
 
 The service uses native typing indicators for ordinary work and sends bounded,
 deterministic progress only for longer runs.
@@ -111,18 +152,21 @@ final response with a distinct completion header:
 
 ```text
 CODEX THREAD · MUSIC CRAWLER
+────────────────────────
+
 Fix album metadata
+[COMPLETED] now
 
-COMPLETED · now
-
+RESULT
 All tests pass.
 ```
 
 Existing task history is baselined silently on first start, and iMessage-started
 turns are deduplicated so their requested reply is never followed by a second
 completion notice. The same 24-hour activity window applies to debounced
-`CODEX CONTROL · ONLINE` and `CODEX CONTROL · OFFLINE` notices when the Mac's
-service connects or disconnects. Inbound prompts, commands, menu choices,
+`CODEX CONTROL · ONLINE` and `CODEX CONTROL · OFFLINE` notices, with matching
+`[ONLINE] MAC CONNECTED` or `[OFFLINE] MAC DISCONNECTED` state blocks, when the
+Mac connects or disconnects. Inbound prompts, commands, menu choices,
 media, and pairing all refresh the window; outbound notices do not.
 
 ## Service commands

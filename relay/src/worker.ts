@@ -59,6 +59,8 @@ const MAX_TITLE_LENGTH = 160;
 const MAX_HANDOFF_SUMMARY_LENGTH = 1000;
 const MAX_STATUS_LENGTH = 40;
 const MAX_ASSISTANT_MESSAGE_LENGTH = 20_000;
+const SENDBLUE_TEXT_LIMIT = 8_000;
+const SENDBLUE_CHUNK_BODY_LIMIT = 7_500;
 const MAX_WEBHOOK_CONTENT_LENGTH = 20_000;
 const MAX_URL_LENGTH = 2048;
 const MAX_ENABLED_THREADS_PER_OWNER = 25;
@@ -1330,27 +1332,39 @@ async function handleServiceOutbound(request: Request, env: Env) {
     : null;
   const rendered = renderOutboundEvent(event);
   const chunks: string[] = [];
-  if ((event.kind === "thread.output" || event.kind === "thread.completed") && rendered.length > 8000) {
-    const bodyChunks = splitText(event.body, event.kind === "thread.completed" ? 7500 : 7800);
+  if ((event.kind === "thread.output" || event.kind === "thread.completed") && rendered.length > SENDBLUE_TEXT_LIMIT) {
+    const bodyChunks = splitText(event.body, SENDBLUE_CHUNK_BODY_LIMIT);
     for (let index = 0; index < bodyChunks.length; index += 1) {
-      const context = `${threadHeader(event.thread, { index: index + 1, total: bodyChunks.length })}\n${threadTitle(event.thread)}`;
-      const completion = event.kind === "thread.completed" ? `\n\nCOMPLETED · ${relativeTime(event.completedAt)}` : "";
-      chunks.push(`${context}${completion}\n\n${bodyChunks[index]}`);
+      const context = `${threadHeader(event.thread, { index: index + 1, total: bodyChunks.length })}\n\n${threadTitle(event.thread)}`;
+      const completion = event.kind === "thread.completed" ? `\n[COMPLETED] ${relativeTime(event.completedAt)}` : "";
+      chunks.push(`${context}${completion}\n\nRESULT\n${bodyChunks[index]}`);
     }
-  } else if (rendered.length > 8000 && "thread" in event && event.thread) {
-    const renderedChunks = splitText(rendered, 7600);
+  } else if (rendered.length > SENDBLUE_TEXT_LIMIT && "thread" in event && event.thread) {
+    const renderedChunks = splitText(rendered, SENDBLUE_CHUNK_BODY_LIMIT, true);
+    const baseHeader = rendered.slice(0, rendered.indexOf("\n\n"));
     for (let index = 0; index < renderedChunks.length; index += 1) {
-      const continuation = index === 0
-        ? ""
-        : `${threadHeader(event.thread, { index: index + 1, total: renderedChunks.length })}\n${threadTitle(event.thread)}\n\n`;
-      chunks.push(`${continuation}${renderedChunks[index]}`);
+      const partHeader = multipartHeader(baseHeader, index + 1, renderedChunks.length);
+      if (index === 0) {
+        chunks.push(renderedChunks[index].startsWith(baseHeader)
+          ? `${partHeader}${renderedChunks[index].slice(baseHeader.length)}`
+          : renderedChunks[index]);
+      } else {
+        const continuation = `${partHeader}\n\n${threadTitle(event.thread)}\n\nCONTINUED\n`;
+        chunks.push(`${continuation}${renderedChunks[index]}`);
+      }
     }
-  } else if (rendered.length > 8000) {
-    const renderedChunks = splitText(rendered, 7600);
+  } else if (rendered.length > SENDBLUE_TEXT_LIMIT) {
+    const renderedChunks = splitText(rendered, SENDBLUE_CHUNK_BODY_LIMIT, true);
+    const baseHeader = rendered.slice(0, rendered.indexOf("\n\n"));
     for (let index = 0; index < renderedChunks.length; index += 1) {
-      const label = event.kind === "service.directory" ? "THREADS" : "CONTINUED";
-      const continuation = index === 0 ? "" : `CODEX CONTROL · ${label} · ${index + 1}/${renderedChunks.length}\n\n`;
-      chunks.push(`${continuation}${renderedChunks[index]}`);
+      const partHeader = multipartHeader(baseHeader, index + 1, renderedChunks.length);
+      if (index === 0) {
+        chunks.push(renderedChunks[index].startsWith(baseHeader)
+          ? `${partHeader}${renderedChunks[index].slice(baseHeader.length)}`
+          : renderedChunks[index]);
+      } else {
+        chunks.push(`${partHeader}\n\n${renderedChunks[index]}`);
+      }
     }
   } else {
     chunks.push(rendered);
@@ -1383,7 +1397,7 @@ async function handleServiceOutbound(request: Request, env: Env) {
   try {
     for (let index = completionStartPart; index < chunks.length; index += 1) {
       const chunk = chunks[index];
-      if (chunk.length > MAX_ASSISTANT_MESSAGE_LENGTH) requestTooLarge("Rendered message is too large.");
+      if (chunk.length > SENDBLUE_TEXT_LIMIT) requestTooLarge("Rendered message is too large.");
       result = await sendSendblueMessage(env, binding.phone_number, chunk);
       if (completionId) {
         completionPartsSent = index + 1;
@@ -1408,13 +1422,34 @@ async function handleServiceOutbound(request: Request, env: Env) {
   return json({ ok: true, notification: { sent: true, status: result?.status, messageHandle: result?.messageHandle, parts: chunks.length } });
 }
 
-function splitText(value: string, maxLength: number) {
+const STRUCTURED_BLOCK_START = /^(?:\d+\. |ACTIONS$|CODEX(?: · .+)?$|CURRENT(?: \/ LAST TURN)?$|DETAILS$|LATEST REQUEST$|MENU REPLIES$|NOTE$|OPTIONS$|PROGRESS$|PROJECT · .+$|RECENT PROJECTS$|REPLY$|RESULT$|TIP(?: · .+)?$|TURN \d+(?: · .+)?$|YOU(?: · .+)?$)/;
+
+function multipartHeader(baseHeader: string, index: number, total: number) {
+  const lineEnd = baseHeader.indexOf("\n");
+  if (lineEnd < 0) return `${baseHeader} · ${index}/${total}`;
+  return `${baseHeader.slice(0, lineEnd)} · ${index}/${total}${baseHeader.slice(lineEnd)}`;
+}
+
+function keepStructuredBlockTogether(value: string, index: number, minimum: number) {
+  const prefix = value.slice(0, index).trimEnd();
+  const separator = prefix.lastIndexOf("\n\n");
+  const blockStart = separator < 0 ? 0 : separator + 2;
+  const block = prefix.slice(blockStart);
+  const lines = block.split("\n");
+  if (blockStart >= minimum && lines.length <= 3 && STRUCTURED_BLOCK_START.test(lines[0] || "")) {
+    return blockStart;
+  }
+  return index;
+}
+
+function splitText(value: string, maxLength: number, keepStructure = false) {
   const chunks: string[] = [];
   let remaining = value.trim();
   while (remaining.length > maxLength) {
     let index = remaining.lastIndexOf("\n", maxLength);
     if (index < Math.floor(maxLength * 0.6)) index = remaining.lastIndexOf(" ", maxLength);
     if (index < 1) index = maxLength;
+    if (keepStructure) index = keepStructuredBlockTogether(remaining, index, Math.floor(maxLength * 0.6));
     chunks.push(remaining.slice(0, index).trim());
     remaining = remaining.slice(index).trim();
   }
@@ -1787,8 +1822,8 @@ function buildThreadDirectory(
       collapsedProjects,
       note: references.length > 0
         ? options.extended
-          ? "Reply with a number to open.  /projects · /search · /help"
-          : "Reply with a number to open.  /recent · /search · /help"
+          ? "Reply with a number to open.\n\n/projects · /search · /help"
+          : "Reply with a number to open.\n\n/recent · /search · /help"
         : undefined,
     },
     references,
@@ -1814,7 +1849,7 @@ function buildProjectDirectory(threads: HandoffThreadRow[], activeThreadId: stri
         threads: selected.map((thread, index) => ({ ...threadLabel(thread), current: thread.id === activeThreadId, index: index + 1 })),
       }],
       collapsedProjects: [],
-      note: references.length > 0 ? "Reply with a number to open.  /threads · /search · /help" : undefined,
+      note: references.length > 0 ? "Reply with a number to open.\n\n/threads · /search · /help" : undefined,
     },
     references,
   };
@@ -2781,7 +2816,10 @@ async function handleSendblueWebhook(request: Request, env: Env, ctx?: WaitUntil
       threadCount: group.threads.length,
     }));
     await saveMenuSnapshot(env, binding, [], groups.map((group) => `project:${group.projectKey}`));
-    await sendControlMessage(env, fromNumber, renderThreadMenu(items, { label: "PROJECTS", note: "Reply with a number to browse that project." }));
+    await sendControlMessage(env, fromNumber, renderThreadMenu(items, {
+      label: "PROJECTS",
+      note: "Reply with a number to browse that project.\n\n/threads · /search · /help",
+    }));
     await recordAppliedControl(env, binding, content, externalId);
     return json({ ok: true, command: "projects", projectCount: groups.length });
   }

@@ -101,6 +101,7 @@ export type OutboundEvent =
 
 const CONTROL_PREFIX = "CODEX CONTROL · ";
 const THREAD_PREFIX = "CODEX THREAD · ";
+const HEADER_RULE = "────────────────────────";
 const MAX_LABEL_LENGTH = 80;
 
 function cleanLine(value: unknown, fallback: string) {
@@ -158,9 +159,11 @@ function statusName(status: unknown) {
 
 function statusLine(status: unknown, activityAt?: string | null, stateSince?: string | null, now: string | Date | number = new Date()) {
   const label = statusName(status);
-  if (label === "Working") return `${label} · ${elapsed(stateSince || activityAt, now)}`;
-  if (label === "Pending") return `${label} · ${relativeTime(stateSince || activityAt, now)}`;
-  return `${label} · ${relativeTime(activityAt || stateSince, now)}`;
+  const chip = `[${label.toUpperCase()}]`;
+  const time = label === "Working"
+    ? elapsed(stateSince || activityAt, now)
+    : relativeTime(label === "Pending" ? stateSince || activityAt : activityAt || stateSince, now);
+  return time === "unknown" ? chip : `${chip} ${time}`;
 }
 
 function reasoningName(value: unknown) {
@@ -175,7 +178,7 @@ export function threadTitle(thread: ThreadLabel) {
 }
 
 export function header(label: string) {
-  return `${CONTROL_PREFIX}${cleanLine(label, "CODEX").toUpperCase()}`;
+  return `${CONTROL_PREFIX}${cleanLine(label, "CODEX").toUpperCase()}\n${HEADER_RULE}`;
 }
 
 function threadProject(thread: ThreadLabel) {
@@ -184,20 +187,19 @@ function threadProject(thread: ThreadLabel) {
 
 export function threadHeader(thread: ThreadLabel, part?: { index: number; total: number }) {
   const suffix = part && part.total > 1 ? ` · ${part.index}/${part.total}` : "";
-  return `${THREAD_PREFIX}${threadProject(thread)}${suffix}`;
+  return `${THREAD_PREFIX}${threadProject(thread)}${suffix}\n${HEADER_RULE}`;
 }
 
 function threadContext(thread: ThreadLabel) {
-  return [threadHeader(thread), threadTitle(thread)].join("\n");
+  return [threadHeader(thread), threadTitle(thread)].join("\n\n");
 }
 
 function menuMetadata(item: MenuItem, now: string | Date | number) {
-  const parts = [];
-  if (item.current) parts.push("Selected");
-  parts.push(statusLine(item.status, item.activityAt, item.stateSince, now));
+  const state = `${item.current ? "[SELECTED] " : ""}${statusLine(item.status, item.activityAt, item.stateSince, now)}`;
+  const parts = [state];
   const pending = Math.max(0, Number(item.pendingCount) || 0);
   if (pending > 0 && (statusName(item.status) !== "Pending" || pending > 1)) {
-    parts.push(`${pending} pending`);
+    parts.push(`${pending} QUEUED`);
   }
   return parts.join(" · ");
 }
@@ -206,6 +208,40 @@ function requestPreview(value: unknown) {
   const text = typeof value === "string" ? value.replace(/\s+/g, " ").trim() : "";
   if (!text) return null;
   return text.length <= 160 ? text : `${text.slice(0, 159).trimEnd()}…`;
+}
+
+function sentenceCase(value: string) {
+  return value ? value.charAt(0).toUpperCase() + value.slice(1) : value;
+}
+
+function directoryGroupLabel(group: ThreadDirectoryGroup) {
+  const label = cleanLine(group.projectLabel, "Other tasks");
+  const count = group.threadCount ?? group.threads.length + Math.max(0, group.hiddenCount ?? 0);
+  const namespace = label.toLowerCase() === "other tasks" ? "OTHER TASKS" : `PROJECT · ${label.toUpperCase()}`;
+  return `${namespace} · ${plural(count, "task").toUpperCase()}`;
+}
+
+function renderDirectoryFooter(note: string) {
+  const blocks = safeBody(note).split(/\n\s*\n/).map((block) => block.trim()).filter(Boolean);
+  if (blocks.length === 0) return "";
+  const optionIndex = blocks.findIndex((block) => block.startsWith("/"));
+  if (optionIndex > 0) {
+    const reply = blocks.slice(0, optionIndex).join("\n\n");
+    const options = blocks.slice(optionIndex).join("\n");
+    return `REPLY\n${reply}\n\nOPTIONS\n${options}`;
+  }
+  return `${blocks[0].startsWith("/") ? "OPTIONS" : "REPLY"}\n${blocks.join("\n\n")}`;
+}
+
+function renderLabeledBody(label: string, value: unknown) {
+  const blocks = safeBody(value).split(/\n\s*\n/).map((block) => block.trim()).filter(Boolean);
+  if (blocks.length === 0) return `${label}\nNo details available.`;
+  const actionIndex = blocks.findIndex((block) => block.startsWith("/"));
+  if (actionIndex === 0) return `ACTIONS\n${blocks.join("\n")}`;
+  if (actionIndex > 0) {
+    return `${label}\n${blocks.slice(0, actionIndex).join("\n\n")}\n\nACTIONS\n${blocks.slice(actionIndex).join("\n")}`;
+  }
+  return `${label}\n${blocks.join("\n\n")}`;
 }
 
 export function renderThreadDirectory(directory: ThreadDirectory, options: { now?: string | Date | number } = {}) {
@@ -218,31 +254,31 @@ export function renderThreadDirectory(directory: ThreadDirectory, options: { now
   );
   const sections: string[] = [
     header(directory.label === "PROJECTS" ? "PROJECTS" : "THREADS"),
-    [plural(total, "task"), cleanLine(directory.criteria, ""), "refreshed now"].filter(Boolean).join(" · "),
+    [
+      `${plural(total, "task").toUpperCase()} · UPDATED NOW`,
+      sentenceCase(cleanLine(directory.criteria, "")),
+    ].filter(Boolean).join("\n"),
   ];
 
   for (const group of groups) {
     const rows = group.threads.map((item, offset) => {
       const index = item.index ?? offset + 1;
       const preview = requestPreview(item.requestPreview);
-      return [`${index}. ${threadTitle(item)}`, `   ${menuMetadata(item, now)}`, preview ? `   “${preview}”` : null].filter(Boolean).join("\n");
+      return [`${index}. ${threadTitle(item)}`, `   ${menuMetadata(item, now)}`, preview ? `   › ${preview}` : null].filter(Boolean).join("\n");
     });
-    if (group.hiddenCount && group.hiddenCount > 0) rows.push(`   +${plural(group.hiddenCount, "more task")}`);
-    sections.push(`${cleanLine(group.projectLabel, "OTHER").toUpperCase()}\n${rows.join("\n")}`);
+    const hidden = group.hiddenCount && group.hiddenCount > 0 ? `\n   +${plural(group.hiddenCount, "more task")}` : "";
+    sections.push(`${directoryGroupLabel(group)}\n\n${rows.join("\n\n")}${hidden}`);
   }
 
   if (collapsed.length > 0) {
     const rows = collapsed.map((project) => {
-      const recency = relativeTime(project.activityAt, now);
-      const active = statusName(project.status);
-      const state = active === "Idle" ? recency : `${active} · ${recency}`;
-      return `${project.index}. ${cleanLine(project.projectLabel, "Other")}\n   ${plural(project.threadCount, "task")} · ${state}`;
+      return `${project.index}. ${cleanLine(project.projectLabel, "Other")}\n   ${plural(project.threadCount, "task")} · ${statusLine(project.status, project.activityAt, project.activityAt, now)}`;
     });
-    sections.push(`RECENT PROJECTS\n${rows.join("\n")}`);
+    sections.push(`RECENT PROJECTS\n\n${rows.join("\n\n")}`);
   }
 
   if (groups.length === 0 && collapsed.length === 0) sections.push("No pending or recently active tasks.");
-  if (directory.note) sections.push(directory.note);
+  if (directory.note) sections.push(renderDirectoryFooter(directory.note));
   return sections.filter(Boolean).join("\n\n");
 }
 
@@ -253,7 +289,11 @@ export function renderThreadMenu(items: MenuItem[], options: { label?: "THREADS"
       const count = item.threadCount ? `${plural(item.threadCount, "task")} · ` : "";
       return `${item.index ?? index + 1}. ${threadTitle(item)}\n   ${count}${statusLine(item.status, item.activityAt, item.stateSince, options.now)}`;
     });
-    return [header("PROJECTS"), rows.join("\n") || "No available projects.", options.note].filter(Boolean).join("\n\n");
+    return [
+      header("PROJECTS"),
+      rows.join("\n\n") || "No available projects.",
+      options.note ? renderDirectoryFooter(options.note) : null,
+    ].filter(Boolean).join("\n\n");
   }
   const groups = new Map<string, MenuItem[]>();
   for (const item of items) {
@@ -263,48 +303,39 @@ export function renderThreadMenu(items: MenuItem[], options: { label?: "THREADS"
   return renderThreadDirectory({
     label: "THREADS",
     groups: [...groups.entries()].map(([projectLabel, threads]) => ({ projectKey: projectLabel, projectLabel, threads })),
-    note: options.note ?? (items.length ? "Reply with a number to open." : undefined),
+    note: options.note ?? (items.length ? "Reply with a number to open.\n\n/threads · /search · /help" : undefined),
   }, { now: options.now });
 }
 
 export function renderHelp() {
   return [
     header("COMMANDS"),
-    [
-      "/threads          Browse tasks by project",
-      "/search words     Find a task",
-      "/projects         Browse all projects",
-      "/thread           Show the selected task",
-      "/request          Show its full latest request",
-      "/turn             Show its current or last turn",
-      "/history 3        Show completed turn history",
-      "/reasoning        Show or change reasoning",
-      "/cancel           Stop iMessage-started work",
-      "/dismiss          Dismiss the oldest failed request",
-    ].join("\n"),
-    "In a menu, reply with a number to open.\nUse “2: your message” to open and continue in one step.",
+    "BROWSE\n/threads · Tasks by project\n/refresh · Refresh the task list\n/search words · Find a task\n/projects · Browse all projects",
+    "CURRENT TASK\n/thread · Status and latest response\n/request · Full latest request\n/turn · Current or last turn\n/history 3 · Completed turn history\n/reasoning · View or change reasoning",
+    "WORK\n/cancel · Stop iMessage-started work\n/retry · Retry the oldest failed request\n/dismiss · Clear the oldest failed request",
+    "MENU REPLIES\n1 · Open item 1\n2: message · Open item 2 and send",
   ].join("\n\n");
 }
 
 function commandLines(state: unknown) {
   const primary = "/request · /turn · /history · /reasoning";
-  if (statusName(state) === "Error") return `${primary}\n/retry · /dismiss · /threads`;
+  if (statusName(state) === "Error") return `ACTIONS\n${primary}\n/retry · /dismiss · /threads`;
   return statusName(state) === "Working" || statusName(state) === "Pending"
-    ? `${primary}\n/cancel · /threads`
-    : `${primary}\n/threads`;
+    ? `ACTIONS\n${primary}\n/cancel · /threads`
+    : `ACTIONS\n${primary}\n/threads`;
 }
 
 function renderThreadDetail(event: Extract<OutboundEvent, { kind: "thread.detail" }>) {
   const state = statusLine(event.state, event.activityAt, event.stateSince);
   const reasoning = reasoningName(event.reasoningEffort);
-  const pending = event.pendingCount && event.pendingCount > 0 ? `${event.pendingCount} pending` : null;
-  const metadata = [state, pending, reasoning ? `Reasoning ${reasoning}` : null].filter(Boolean).join(" · ");
+  const pending = event.pendingCount && event.pendingCount > 0 ? `${event.pendingCount} QUEUED` : null;
+  const metadata = [state, pending, reasoning ? `REASONING ${reasoning.toUpperCase()}` : null].filter(Boolean).join(" · ");
   const preview = typeof event.requestPreview === "string"
     ? { body: event.requestPreview, at: null, truncated: false }
     : event.requestPreview;
-  const sections = [threadContext(event.thread), metadata, commandLines(event.state)];
+  const sections = [`${threadContext(event.thread)}\n${metadata}`, commandLines(event.state)];
   if (preview?.body) {
-    sections.push(`YOU · ${relativeTime(preview.at)}\n${preview.body}${preview.truncated ? "\n/request shows the full message" : ""}`);
+    sections.push(`YOU · ${relativeTime(preview.at)}\n${preview.body}${preview.truncated ? "\n\nTIP · /request shows the full message." : ""}`);
   }
   const messages = event.assistantMessages ?? [];
   for (const message of messages) {
@@ -318,9 +349,9 @@ function renderThreadDetail(event: Extract<OutboundEvent, { kind: "thread.detail
         : statusName(event.state) === "Error"
           ? "This request did not produce a final response. Use /retry to try it again."
           : "No assistant response was found in the available history.";
-    sections.push(note);
+    sections.push(`NOTE\n${note}`);
   }
-  if (event.historyTruncated) sections.push("Older content is outside the local history window. /history may show less than requested.");
+  if (event.historyTruncated) sections.push("NOTE\nOlder content is outside the local history window. /history may show less than requested.");
   return sections.filter(Boolean).join("\n\n");
 }
 
@@ -331,8 +362,8 @@ function normalizeRequest(event: Extract<OutboundEvent, { kind: "thread.request"
 }
 
 function renderTurn(thread: ThreadLabel, turn: ThreadTurn | null, label = "TURN") {
-  const sections = [threadContext(thread), label, "/thread · /request · /history · /reasoning"];
-  if (!turn) return [...sections, "No turn was found in the available history."].join("\n\n");
+  const sections = [`${threadContext(thread)}\n${label}`, "ACTIONS\n/thread · /request · /history · /reasoning"];
+  if (!turn) return [...sections, "NOTE\nNo turn was found in the available history."].join("\n\n");
   if (turn.request) sections.push(`YOU · ${relativeTime(turn.requestAt)}\n${turn.request}`);
   for (const message of turn.assistantMessages ?? []) {
     sections.push(`CODEX · ${relativeTime(message.at)}\n${safeBody(message.body)}`);
@@ -346,58 +377,68 @@ function renderTurn(thread: ThreadLabel, turn: ThreadTurn | null, label = "TURN"
 
 export function renderOutboundEvent(event: OutboundEvent) {
   if (event.kind === "thread.output") {
-    return [threadContext(event.thread), safeBody(event.body)].filter(Boolean).join("\n\n");
+    return [threadContext(event.thread), `RESULT\n${safeBody(event.body)}`].filter(Boolean).join("\n\n");
   }
   if (event.kind === "thread.completed") {
     return [
-      threadContext(event.thread),
-      `COMPLETED · ${relativeTime(event.completedAt)}`,
-      safeBody(event.body),
+      `${threadContext(event.thread)}\n[COMPLETED] ${relativeTime(event.completedAt)}`,
+      `RESULT\n${safeBody(event.body)}`,
     ].filter(Boolean).join("\n\n");
   }
   if (event.kind === "thread.progress") {
-    return [header("WORKING"), `${event.thread.projectLabel || "Codex"}\n${threadTitle(event.thread)}`, safeBody(event.phase)].join("\n\n");
+    return [`${threadContext(event.thread)}\n[WORKING]`, `PROGRESS\n${safeBody(event.phase)}`].join("\n\n");
   }
   if (event.kind === "service.directory") return renderThreadDirectory(event.directory);
   if (event.kind === "thread.detail") return renderThreadDetail(event);
   if (event.kind === "thread.request") {
     const request = normalizeRequest(event);
-    return [threadContext(event.thread), "LATEST REQUEST", "/thread · /turn · /history · /reasoning", `YOU · ${relativeTime(request.at)}\n${request.body || "No user request was found."}`].join("\n\n");
+    return [`${threadContext(event.thread)}\nLATEST REQUEST`, "ACTIONS\n/thread · /turn · /history · /reasoning", `YOU · ${relativeTime(request.at)}\n${request.body || "No user request was found."}`].join("\n\n");
   }
   if (event.kind === "thread.turn") return renderTurn(event.thread, event.turn, "CURRENT / LAST TURN");
   if (event.kind === "thread.history") {
     const turns = event.turns.filter((turn): turn is ThreadTurn => Boolean(turn));
-    const sections = [threadContext(event.thread), `${plural(turns.length, "COMPLETED TURN")} · newest first`, "/thread · /request · /turn · /reasoning"];
+    const sections = [`${threadContext(event.thread)}\n${plural(turns.length, "COMPLETED TURN")} · NEWEST FIRST`, "ACTIONS\n/thread · /request · /turn · /reasoning"];
     turns.forEach((turn, index) => {
       const response = turn.finalResponse || turn.assistantMessages?.at(-1)?.body || "No final text response.";
       sections.push(`TURN ${index + 1} · ${relativeTime(turn.completedAt || turn.requestAt)}\nYOU\n${turn.request || "No request text found."}\n\nCODEX\n${response}`);
     });
-    if (turns.length === 0) sections.push("No completed turns were found in the available history.");
-    if (event.hasMore) sections.push("More completed turns are available. Try /history 5.");
+    if (turns.length === 0) sections.push("NOTE\nNo completed turns were found in the available history.");
+    if (event.hasMore) sections.push("NOTE\nMore completed turns are available. Try /history 5.");
     return sections.join("\n\n");
   }
   if (event.kind === "service.reasoning") {
     const options = event.options.map((option) => typeof option === "string" ? { value: option, label: reasoningName(option) || option } : option);
-    const rows = options.map((option) => `${option.selected ? "•" : " "} ${option.label || reasoningName(option.value) || option.value}  · /reasoning ${option.value}`);
+    const rows = options.map((option) => `${option.selected ? "[SELECTED]" : "[ ]"} ${option.label || reasoningName(option.value) || option.value} · /reasoning ${option.value}`);
     const selected = options.find((option) => option.selected);
     const current = reasoningName(event.current);
     const selection = selected?.value === "default"
       ? `Task default${current ? ` · ${current}` : ""}`
       : selected?.label || reasoningName(selected?.value) || current || "Task default";
     const status = event.invalid
-      ? `“${cleanLine(event.invalid, "value")}” is not available.`
+      ? `[ERROR] “${cleanLine(event.invalid, "value")}” is not available.`
       : event.changed
-        ? `Changed: ${selection}.`
-        : `Current: ${selection}`;
-    return [header("REASONING"), `${event.thread.projectLabel || "Codex"}\n${threadTitle(event.thread)}`, status, rows.join("\n"), event.note].filter(Boolean).join("\n\n");
+        ? `[UPDATED] ${selection}`
+        : `CURRENT · ${selection}`;
+    return [
+      header("REASONING"),
+      `PROJECT · ${cleanLine(event.thread.projectLabel, "Codex").toUpperCase()}\n${threadTitle(event.thread)}`,
+      status,
+      `OPTIONS\n${rows.join("\n")}`,
+      event.note ? `NOTE\n${event.note}` : null,
+    ].filter(Boolean).join("\n\n");
   }
   if (event.kind === "service.switched") {
-    return [header("SWITCHED"), `${event.thread.projectLabel || "Codex"}\n${threadTitle(event.thread)}`, "Context selected."].join("\n\n");
+    return [
+      header("SWITCHED"),
+      `PROJECT · ${cleanLine(event.thread.projectLabel, "Codex").toUpperCase()}\n${threadTitle(event.thread)}`,
+      "[SELECTED] Context is active.",
+      "ACTIONS\n/thread · /threads",
+    ].join("\n\n");
   }
   if (event.kind === "service.presence") {
     return event.state === "online"
-      ? [header("ONLINE"), "Codex on your Mac is online."].join("\n\n")
-      : [header("OFFLINE"), "Codex on your Mac is offline. New task messages won’t run until it reconnects."].join("\n\n");
+      ? [header("ONLINE"), "[ONLINE] MAC CONNECTED", "Ready for new task messages."].join("\n\n")
+      : [header("OFFLINE"), "[OFFLINE] MAC DISCONNECTED", "New task messages will wait until it reconnects."].join("\n\n");
   }
   if (event.kind === "service.menu") {
     if (event.label === "COMMANDS") return event.body ? [header("COMMANDS"), event.body, event.note].filter(Boolean).join("\n\n") : renderHelp();
@@ -410,7 +451,11 @@ export function renderOutboundEvent(event: OutboundEvent) {
     "needs-attention": "NEEDS ATTENTION",
     updated: "UPDATED",
   };
-  return [header(labels[event.code]), event.thread ? `${event.thread.projectLabel || "Codex"}\n${threadTitle(event.thread)}` : null, safeBody(event.body)].filter(Boolean).join("\n\n");
+  return [
+    header(labels[event.code]),
+    event.thread ? `PROJECT · ${cleanLine(event.thread.projectLabel, "Codex").toUpperCase()}\n${threadTitle(event.thread)}` : null,
+    renderLabeledBody("DETAILS", event.body),
+  ].filter(Boolean).join("\n\n");
 }
 
 export function parseMenuSelection(value: string) {

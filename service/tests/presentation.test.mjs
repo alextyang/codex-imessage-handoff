@@ -16,7 +16,7 @@ test("thread output has a distinct project/task namespace without modifying its 
     kind: "thread.output",
     thread: { title: "Fix metadata", projectLabel: "Music crawler" },
     body,
-  }), `CODEX THREAD · MUSIC CRAWLER\nFix metadata\n\n${body}`);
+  }), `CODEX THREAD · MUSIC CRAWLER\n────────────────────────\n\nFix metadata\n\nRESULT\n${body}`);
 });
 
 test("grouped directory expands task rows and keeps recent projects compact", () => {
@@ -37,15 +37,15 @@ test("grouped directory expands task rows and keeps recent projects compact", ()
     collapsedProjects: [
       { index: 3, projectKey: "site", projectLabel: "Personal site", threadCount: 4, status: "idle", activityAt: "2026-07-12T07:00:00.000Z" },
     ],
-    note: "Reply with a number to open.  /recent · /search · /help",
+    note: "Reply with a number to open.\n\n/recent · /search · /help",
   }, { now });
 
   assert.equal(rendered, [
-    "CODEX CONTROL · THREADS",
-    "7 tasks · refreshed now",
-    "MUSIC CRAWLER\n1. Fix album metadata\n   Selected · Idle · 5m ago\n2. Retry imports\n   Working · 2m\n   +1 more task",
-    "RECENT PROJECTS\n3. Personal site\n   4 tasks · 1h ago",
-    "Reply with a number to open.  /recent · /search · /help",
+    "CODEX CONTROL · THREADS\n────────────────────────",
+    "7 TASKS · UPDATED NOW",
+    "PROJECT · MUSIC CRAWLER · 3 TASKS\n\n1. Fix album metadata\n   [SELECTED] [IDLE] 5m ago\n\n2. Retry imports\n   [WORKING] 2m\n   +1 more task",
+    "RECENT PROJECTS\n\n3. Personal site\n   4 tasks · [IDLE] 1h ago",
+    "REPLY\nReply with a number to open.\n\nOPTIONS\n/recent · /search · /help",
   ].join("\n\n"));
 });
 
@@ -78,10 +78,13 @@ test("local directory renders recent criteria, user previews, pending counts, an
   });
 
   assert.match(rendered, /^CODEX CONTROL · THREADS/);
-  assert.match(rendered, /3 tasks · pending \+ activity in last 48h · refreshed now/);
-  assert.match(rendered, /1\. Retry imports\n   Pending · \d+[mh] ago · 2 pending\n   “Rerun the failed import\.”/);
-  assert.match(rendered, /2\. Fix metadata\n   Working · \d+[mh] · 1 pending\n   “Normalize album dates\. Then test\.”/);
-  assert.match(rendered, /OTHER TASKS\n3\. Compare providers/);
+  assert.match(rendered, /────────────────────────/);
+  assert.match(rendered, /3 TASKS · UPDATED NOW\nPending \+ activity in last 48h/);
+  assert.match(rendered, /PROJECT · MUSIC CRAWLER · 2 TASKS/);
+  assert.match(rendered, /1\. Retry imports\n   \[PENDING\] \d+[smhd] ago · 2 QUEUED\n   › Rerun the failed import\./);
+  assert.match(rendered, /2\. Fix metadata\n   \[WORKING\] \d+[smhd] · 1 QUEUED\n   › Normalize album dates\. Then test\./);
+  assert.match(rendered, /OTHER TASKS · 1 TASK\n\n3\. Compare providers/);
+  assert.match(rendered, /REPLY\nReply with a number to open\./);
 });
 
 test("thread detail exposes state, commands, request expansion, and the full final response", () => {
@@ -95,10 +98,11 @@ test("thread detail exposes state, commands, request expansion, and the full fin
     requestPreview: { body: "Normalize all album fields…", at: new Date(now - 7 * 60_000).toISOString(), truncated: true },
     assistantMessages: [{ body: "Full final response.\n\nAll 42 tests pass.", at: new Date(now - 5 * 60_000).toISOString() }],
   });
-  assert.match(rendered, /^CODEX THREAD · MUSIC CRAWLER\nFix album metadata/);
-  assert.match(rendered, /Idle · 5m ago · Reasoning High/);
+  assert.match(rendered, /^CODEX THREAD · MUSIC CRAWLER\n─+\n\nFix album metadata/);
+  assert.match(rendered, /\[IDLE\] 5m ago · REASONING HIGH/);
+  assert.match(rendered, /\n\nACTIONS\n/);
   assert.match(rendered, /\/request · \/turn · \/history · \/reasoning/);
-  assert.match(rendered, /\/request shows the full message/);
+  assert.match(rendered, /TIP · \/request shows the full message\./);
   assert.match(rendered, /Full final response\.\n\nAll 42 tests pass\.$/);
 });
 
@@ -114,7 +118,7 @@ test("working detail includes every visible message from the current turn", () =
       { body: "The deduplication tests pass." },
     ],
   });
-  assert.match(rendered, /Working · 2m/);
+  assert.match(rendered, /\[WORKING\] 2m/);
   assert.match(rendered, /I found two discovery sources\.[\s\S]*The deduplication tests pass\./);
   assert.match(rendered, /\/cancel · \/threads/);
 });
@@ -126,7 +130,7 @@ test("failed detail keeps the request visible and offers retry", () => {
     state: "error",
     requestPreview: { body: "Run the failed import again." },
   });
-  assert.match(rendered, /Error · unknown/);
+  assert.match(rendered, /\[ERROR\]/);
   assert.match(rendered, /Run the failed import again\./);
   assert.match(rendered, /\/retry · \/dismiss · \/threads/);
   assert.match(rendered, /did not produce a final response/);
@@ -160,7 +164,7 @@ test("history renders exact final responses and reasoning is a command menu", ()
     note: "Applies to the next turn.",
   });
   assert.match(reasoning, /^CODEX CONTROL · REASONING/);
-  assert.match(reasoning, /• High  · \/reasoning high/);
+  assert.match(reasoning, /OPTIONS\n\[ \] Medium · \/reasoning medium\n\[SELECTED\] High · \/reasoning high/);
 
   const reset = renderOutboundEvent({
     kind: "service.reasoning",
@@ -172,8 +176,8 @@ test("history renders exact final responses and reasoning is a command menu", ()
       { value: "medium", label: "Medium", selected: false },
     ],
   });
-  assert.match(reset, /Changed: Task default · Medium\./);
-  assert.equal((reset.match(/•/g) || []).length, 1);
+  assert.match(reset, /\[UPDATED\] Task default · Medium/);
+  assert.equal((reset.match(/\[SELECTED\]/g) || []).length, 1);
 });
 
 test("legacy menus remain grouped and selection syntax is snapshot friendly", () => {
@@ -181,8 +185,8 @@ test("legacy menus remain grouped and selection syntax is snapshot friendly", ()
     { title: "Service redesign", projectLabel: "imessage", current: true, status: "idle" },
     { title: "Music crawler", projectLabel: "crawler", status: "pending" },
   ]);
-  assert.match(rendered, /IMESSAGE\n1\. Service redesign/);
-  assert.match(rendered, /CRAWLER\n2\. Music crawler/);
+  assert.match(rendered, /PROJECT · IMESSAGE · 1 TASK\n\n1\. Service redesign/);
+  assert.match(rendered, /PROJECT · CRAWLER · 1 TASK\n\n2\. Music crawler/);
   assert.deepEqual(parseMenuSelection("2"), { index: 1, prompt: null });
   assert.deepEqual(parseMenuSelection("2: run the tests"), { index: 1, prompt: "run the tests" });
   assert.equal(parseMenuSelection("status"), null);
@@ -200,6 +204,9 @@ test("relative recency and all local-control commands parse without consuming or
   assert.equal(parseSlashCommand("threads"), null);
   assert.equal(parseSlashCommand("status"), null);
   assert.match(renderHelp(), /^CODEX CONTROL · COMMANDS/);
+  assert.match(renderHelp(), /BROWSE[\s\S]*CURRENT TASK[\s\S]*WORK[\s\S]*MENU REPLIES/);
+  assert.match(renderHelp(), /\/refresh · Refresh the task list/);
+  assert.match(renderHelp(), /\/retry · Retry the oldest failed request/);
 });
 
 test("proactive completion and Mac presence notices have distinct compact headers", () => {
@@ -210,9 +217,16 @@ test("proactive completion and Mac presence notices have distinct compact header
     completedAt: new Date().toISOString(),
     body: "Deployed and verified.",
   });
-  assert.match(completion, /^CODEX THREAD · IMESSAGE HANDOFF\nShip the service\n\nCOMPLETED · now\n\nDeployed and verified\.$/);
+  assert.match(completion, /^CODEX THREAD · IMESSAGE HANDOFF\n─+\n\nShip the service\n\[COMPLETED\] now\n\nRESULT\nDeployed and verified\.$/);
   assert.equal(renderOutboundEvent({ kind: "service.presence", state: "online" }),
-    "CODEX CONTROL · ONLINE\n\nCodex on your Mac is online.");
+    "CODEX CONTROL · ONLINE\n────────────────────────\n\n[ONLINE] MAC CONNECTED\n\nReady for new task messages.");
   assert.equal(renderOutboundEvent({ kind: "service.presence", state: "offline" }),
-    "CODEX CONTROL · OFFLINE\n\nCodex on your Mac is offline. New task messages won’t run until it reconnects.");
+    "CODEX CONTROL · OFFLINE\n────────────────────────\n\n[OFFLINE] MAC DISCONNECTED\n\nNew task messages will wait until it reconnects.");
+
+  const notice = renderOutboundEvent({
+    kind: "service.notice",
+    code: "needs-attention",
+    body: "The request needs attention.\n\n/retry · /dismiss",
+  });
+  assert.match(notice, /DETAILS\nThe request needs attention\.\n\nACTIONS\n\/retry · \/dismiss$/);
 });

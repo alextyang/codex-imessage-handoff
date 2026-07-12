@@ -923,7 +923,9 @@ test("Mac presence notices are debounced transitions, respect multiple sockets, 
     await control.reconcileOwnerPresence(DEV_OWNER_ID);
     await expirePending();
     assert.equal(first.closed, false, "a v0.3.2 socket without heartbeat capability is never TTL-expired");
-    assert.deepEqual(outboundContents(calls), ["CODEX CONTROL · ONLINE\n\nCodex on your Mac is online."]);
+    assert.deepEqual(outboundContents(calls), [
+      "CODEX CONTROL · ONLINE\n────────────────────────\n\n[ONLINE] MAC CONNECTED\n\nReady for new task messages.",
+    ]);
 
     const second = new PresenceSocket();
     second.serializeAttachment({ ownerId: DEV_OWNER_ID, lastHeartbeatAt: Date.now() });
@@ -947,7 +949,7 @@ test("Mac presence notices are debounced transitions, respect multiple sockets, 
     await control.reconcileOwnerPresence(DEV_OWNER_ID, replacement as unknown as WebSocket);
     await expirePending();
     assert.equal(outboundContents(calls).at(-1),
-      "CODEX CONTROL · OFFLINE\n\nCodex on your Mac is offline. New task messages won’t run until it reconnects.");
+      "CODEX CONTROL · OFFLINE\n────────────────────────\n\n[OFFLINE] MAC DISCONNECTED\n\nNew task messages will wait until it reconnects.");
 
     db.phoneBindings.get("+15551234567")!.last_user_message_at = "2026-01-01T00:00:00.000Z";
     const staleReconnect = new PresenceSocket();
@@ -1478,8 +1480,8 @@ test("list command returns a numbered grouped directory with live status", async
     assert.equal(response.status, 200);
     const directory = String(outboundContents(calls).at(-1));
     assert.match(directory, /^CODEX CONTROL · THREADS/);
-    assert.match(directory, /OTHER TASKS\n1\. Second/);
-    assert.match(directory, /Selected · Idle/);
+    assert.match(directory, /OTHER TASKS · 2 TASKS\n\n1\. Second/);
+    assert.match(directory, /\[SELECTED\] \[IDLE\]/);
     assert.match(directory, /2\. iMessage test/);
     assert.doesNotMatch(directory, /enabled|stopped/i);
     const pending = pendingReplies(testEnv);
@@ -1506,7 +1508,7 @@ test("list command reports when the paired phone has no iMessage handoff threads
   try {
     const response = await handleRequest(sendblueWebhook(inboundMessage("list", "list_msg_empty")), testEnv);
     assert.equal(response.status, 200);
-    assert.deepEqual(outboundContents(calls), ["CODEX CONTROL · THREADS\n\n0 tasks · refreshed now\n\nNo pending or recently active tasks."]);
+    assert.deepEqual(outboundContents(calls), ["CODEX CONTROL · THREADS\n────────────────────────\n\n0 TASKS · UPDATED NOW\n\nNo pending or recently active tasks."]);
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -1529,7 +1531,7 @@ test("normal text reports when there is no active thread to forward to", async (
   try {
     const response = await handleRequest(sendblueWebhook(inboundMessage("What is 2 + 2?", "msg_no_thread")), testEnv);
     assert.equal(response.status, 200);
-    assert.deepEqual(outboundContents(calls), ["CODEX CONTROL · NEEDS ATTENTION\n\nNo thread is selected.\nText /threads to choose one."]);
+    assert.deepEqual(outboundContents(calls), ["CODEX CONTROL · NEEDS ATTENTION\n────────────────────────\n\nDETAILS\nNo thread is selected.\nText /threads to choose one."]);
     const pending = pendingReplies(testEnv);
     assert.deepEqual(pending, []);
   } finally {
@@ -1594,7 +1596,7 @@ test("out-of-range menu selection does not change the active thread or enqueue a
     const response = await handleRequest(sendblueWebhook(inboundMessage("2", "switch_msg_bad")), testEnv);
     assert.equal(response.status, 200);
     assert.equal(db.phoneBindings.get("+15551234567")?.active_thread_id, threadId);
-    assert.deepEqual(outboundContents(calls), ["CODEX CONTROL · NEEDS ATTENTION\n\nThat menu has changed.\nText /threads for a fresh list."]);
+    assert.deepEqual(outboundContents(calls), ["CODEX CONTROL · NEEDS ATTENTION\n────────────────────────\n\nDETAILS\nThat menu has changed.\nText /threads for a fresh list."]);
     assert.deepEqual(pendingReplies(testEnv, threadId), []);
   } finally {
     globalThis.fetch = originalFetch;
@@ -1663,7 +1665,7 @@ test("stopping a thread disables it and switches to the newest remaining thread"
     const directory = String(outboundContents(calls).at(-1));
     assert.match(directory, /^CODEX CONTROL · THREADS/);
     assert.match(directory, /1\. iMessage test/);
-    assert.match(directory, /Selected · Idle/);
+    assert.match(directory, /\[SELECTED\] \[IDLE\]/);
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -2942,7 +2944,7 @@ test("local directory previews stay transient and numeric thread opens use its e
     assert.equal(delivered.status, 200);
     const rendered = String(outboundContents(calls).at(-1));
     assert.match(rendered, /SAME LABEL · 1/);
-    assert.match(rendered, /“Private preview never in D1”/);
+    assert.match(rendered, /› Private preview never in D1/);
     assert.match(rendered, /OTHER TASKS/);
     assert.doesNotMatch(rendered, /Task 4/);
     const db = testEnv.DB as unknown as FakeD1Database;
@@ -3057,7 +3059,9 @@ test("service outbound labels model output with its source thread", async () => 
       body: JSON.stringify({ event: { kind: "thread.output", thread: { title: "Music crawler" }, body: "All tests pass." } }),
     }), testEnv);
     assert.equal(response.status, 200);
-    assert.deepEqual(outboundContents(calls), ["CODEX THREAD · CODEX\nMusic crawler\n\nAll tests pass."]);
+    assert.deepEqual(outboundContents(calls), ["CODEX THREAD · CODEX\n────────────────────────\n\nMusic crawler\n\nRESULT\nAll tests pass."]);
+    assert.equal(calls.some((call) => call && "send_style" in call), false,
+      "routine task UI stays plain text so SMS fallback keeps the same meaning");
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -3099,7 +3103,7 @@ test("proactive completions use the 24-hour inbound activity gate without affect
     }), testEnv);
     assert.equal((await notification(completion)).sent, true);
     assert.deepEqual(outboundContents(calls.map((call) => call.body)), [
-      "CODEX THREAD · IMESSAGE HANDOFF\nLocal task\n\nCOMPLETED · now\n\nExact local final.",
+      "CODEX THREAD · IMESSAGE HANDOFF\n────────────────────────\n\nLocal task\n[COMPLETED] now\n\nRESULT\nExact local final.",
     ]);
     assert.equal(calls.some((call) => call.url.includes("send-typing-indicator")), false,
       "an unrelated proactive completion must not clear another task's typing state");
@@ -3214,6 +3218,8 @@ test("multipart completion retries resume after the last provider-accepted part"
     assert.match(String(contents[0]), /· 1\/2/);
     assert.match(String(contents[1]), /· 2\/2/);
     assert.match(String(contents[2]), /· 2\/2/);
+    assert.ok(contents.every((content) => String(content).length <= 8000));
+    assert.ok(contents.every((content) => String(content).includes("\n\nRESULT\n")));
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -3236,13 +3242,19 @@ test("service outbound splits long thread output with source headers", async () 
     const response = await handleRequest(req("/service/events/outbound", {
       method: "POST",
       headers: { authorization: "Bearer dev-token" },
-      body: JSON.stringify({ event: { kind: "thread.output", thread: { title: "Long task" }, body: "A".repeat(9000) } }),
+      body: JSON.stringify({ event: {
+        kind: "thread.output",
+        thread: { title: "T".repeat(80), projectLabel: "P".repeat(80) },
+        body: "A".repeat(9000),
+      } }),
     }), testEnv);
     assert.equal(response.status, 200);
     const contents = outboundContents(calls);
     assert.equal(contents.length, 2);
-    assert.match(String(contents[0]), /^CODEX THREAD · CODEX · 1\/2/);
-    assert.match(String(contents[1]), /^CODEX THREAD · CODEX · 2\/2/);
+    assert.match(String(contents[0]), /^CODEX THREAD · P+ · 1\/2/);
+    assert.match(String(contents[1]), /^CODEX THREAD · P+ · 2\/2/);
+    assert.ok(contents.every((content) => String(content).length <= 8000));
+    assert.ok(contents.every((content) => String(content).includes("\n\nRESULT\n")));
     assert.equal(((await json(response)).notification as Record<string, unknown>).parts, 2);
   } finally {
     globalThis.fetch = originalFetch;
@@ -3274,10 +3286,13 @@ test("partial multi-part directory delivery cannot leave an older numeric mappin
     expires_at: "2099-01-01T00:00:00.000Z", created_at: "2026-07-12T00:00:00.000Z",
   });
   let sends = 0;
+  const chunkContents: string[] = [];
   const originalFetch = globalThis.fetch;
-  globalThis.fetch = async (input) => {
+  globalThis.fetch = async (input, init) => {
     if (String(input).includes("send-message")) {
       sends += 1;
+      const body = init?.body ? JSON.parse(String(init.body)) as Record<string, unknown> : null;
+      if (typeof body?.content === "string") chunkContents.push(body.content);
       if (sends === 2) return new Response(JSON.stringify({ error: "provider failure" }), { status: 500 });
     }
     return new Response(JSON.stringify({ status: "SENT", message_handle: `large-${sends}` }), { status: 200 });
@@ -3308,6 +3323,11 @@ test("partial multi-part directory delivery cannot leave an older numeric mappin
     }), testEnv);
     assert.equal(response.status, 400);
     assert.equal(sends, 2, "the fixture must fail after at least one visible directory part");
+    assert.match(chunkContents[0] || "", /^CODEX CONTROL · THREADS · 1\//);
+    assert.match(chunkContents[1] || "", /^CODEX CONTROL · THREADS · 2\//);
+    assert.ok(chunkContents.every((content) => content.length <= 8000));
+    assert.ok(chunkContents.every((content) => !/(?:PROJECT · .+|OTHER TASKS · \d+ TASKS?|RECENT PROJECTS|REPLY|OPTIONS|\d+\. [^\n]+)$/.test(content)),
+      "a directory part does not end with an orphaned section label or task title");
     assert.deepEqual(JSON.parse(String(db.menuSnapshots.get("+15551234567")?.items_json)), []);
     assert.ok(Date.parse(String(db.menuSnapshots.get("+15551234567")?.expires_at)) > Date.now());
   } finally {
@@ -3353,7 +3373,7 @@ test("service outbound chunks long detail and history views with continuation he
       assert.equal(response.status, 200);
       const contents = outboundContents(calls);
       assert.ok(contents.length >= 3);
-      assert.match(String(contents[0]), /^CODEX THREAD · INTERACTION SERVICE/);
+      assert.match(String(contents[0]), /^CODEX THREAD · INTERACTION SERVICE · 1\//);
       assert.match(String(contents[1]), /^CODEX THREAD · INTERACTION SERVICE · 2\//);
       assert.ok(contents.every((content) => String(content).length <= 8000));
       assert.equal(((await json(response)).notification as Record<string, unknown>).parts, contents.length);

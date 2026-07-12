@@ -29,7 +29,7 @@ export class RelayClient {
       method: "POST",
       body: JSON.stringify({
         clientId: this.clientId,
-        serviceVersion: "0.3.3",
+        serviceVersion: "0.3.4",
         capabilities: [
           "catalog-v2",
           "raw-prompts",

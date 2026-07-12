@@ -73,17 +73,20 @@ the service.
 
 ### Header grammar
 
-Use one consistent first line:
+Use one consistent masthead and restrained divider:
 
 ```text
 CODEX CONTROL · <LABEL>
+────────────────────────
+
+CODEX THREAD · <PROJECT>
+────────────────────────
 ```
 
 Labels are short and meaningful:
 
-- a thread title for model output;
 - `THREADS`, `PROJECTS`, or `COMMANDS` for menus;
-- `SWITCHED`, `CONNECTED`, `WORKING`, `QUEUED`, `CANCELLED`, or
+- `SWITCHED`, `CONNECTED`, `CANCELLED`, or
   `NEEDS ATTENTION` for service messages.
 
 Headers are rendered by the relay presentation layer after model execution.
@@ -93,52 +96,74 @@ They are never stored in Codex conversation history.
 
 ```text
 CODEX CONTROL · SWITCHED
+────────────────────────
 
-Music crawler
+PROJECT · MUSIC CRAWLER
 Fix album metadata
 
-Context selected.
+[SELECTED] Context is active.
+
+ACTIONS
+/thread · /threads
 ```
 
 The control header is immediately followed by the local task view:
 
 ```text
 CODEX THREAD · MUSIC CRAWLER
+────────────────────────
+
 Fix album metadata
 
+RESULT
 The scraper now retries failed artist pages and all 42 tests pass.
 ```
 
-The assistant body is otherwise unchanged except for transport-safe conversion
-of unsupported Markdown and message-length splitting.
+The assistant body is otherwise unchanged except for surrounding-whitespace
+normalization and message-length splitting. Plain-text hierarchy is transport
+chrome and is never injected into the Codex task.
 
 If a response requires multiple bubbles, every continuation is identifiable:
 
 ```text
-CODEX THREAD · 2/3
+CODEX THREAD · MUSIC CRAWLER · 2/3
+────────────────────────
 ```
 
 ### Thread menu
 
 ```text
 CODEX CONTROL · THREADS
-12 tasks · refreshed now
+────────────────────────
 
-MUSIC CRAWLER
+12 TASKS · UPDATED NOW
+Pending + activity in last 48h
+
+PROJECT · MUSIC CRAWLER · 2 TASKS
+
 1. Fix album metadata
-   Selected · Idle · 5m ago
-2. Retry failed imports
-   Working · 2m
+   [SELECTED] [IDLE] 5m ago
+   › Normalize the album dates.
 
-IMESSAGE HANDOFF
+2. Retry failed imports
+   [WORKING] 2m
+   › Retry the failed artist imports.
+
+PROJECT · IMESSAGE HANDOFF · 1 TASK
+
 3. Improve thread menu
-   Pending · 1m ago
+   [PENDING] 1m ago
+   › Improve message hierarchy.
 
 RECENT PROJECTS
-4. Portfolio
-   4 tasks · 1h ago
 
-Reply 1–4
+4. Portfolio
+   4 tasks · [IDLE] 1h ago
+
+REPLY
+Reply with a number to open.
+
+OPTIONS
 /refresh · /projects · /search
 ```
 
