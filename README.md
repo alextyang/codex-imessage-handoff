@@ -1,96 +1,130 @@
-# Codex iMessage Handoff
+# Codex iMessage Service
 
-> An alternate persistent-service architecture that removes per-thread Stop
-> hooks is specified in
-> [docs/PERSISTENT_SERVICE_PLAN.md](docs/PERSISTENT_SERVICE_PLAN.md).
+Continue any visible local Codex thread from iMessage or SMS through one small
+user-level service. Codex threads run only while handling a message; no Stop hook
+or per-thread skill activation is required.
 
-iMessage Handoff lets you continue a local Codex thread from iMessage or via SMS. It has two parts:
+The system has two components:
 
-- `imessage-handoff`: the installable Codex skill.
-- `relay`: a relay that connects Codex with Messages through [Sendblue](https://sendblue.com) (use our hosted relay or deploy your own).
+- `service`: discovers local Codex threads and runs finite `codex exec resume`
+  turns.
+- `relay`: connects the service to Messages through
+  [Sendblue](https://sendblue.com).
 
-<img width="1836" height="508" alt="image 1" src="https://github.com/user-attachments/assets/c1bacc76-a832-4de2-8a77-ded1e319dde3" />
+The complete product and implementation contract is in
+[docs/PERSISTENT_SERVICE_PLAN.md](docs/PERSISTENT_SERVICE_PLAN.md).
 
 ## Install
 
-Install the skill from Codex:
+From this repository:
 
-```text
-$skill-installer install https://github.com/gragland/codex-imessage-handoff/tree/main/imessage-handoff
+```bash
+pnpm install
+node bin/imessage-handoff.mjs install
 ```
 
-After installing, open a Codex thread and say:
+An existing iMessage Handoff relay URL, install token, and phone pairing are
+imported automatically. For a fresh self-hosted installation:
 
-```text
-$imessage-handoff
+```bash
+node bin/imessage-handoff.mjs install --relay=https://imessage-handoff.example.com
 ```
 
-On first use, Codex asks whether you want the hosted iMessage relay or your own relay, then asks permission to install the Codex Stop hook used to forward responses and wait for iMessage replies. Restart Codex once after the hook is installed.
+The installer starts a macOS user LaunchAgent. It removes the legacy iMessage
+Stop hook only after the new service registers successfully with the relay.
 
-If this is your first time, Codex prints a pairing code. Text that code to the phone number shown by Codex within 15 minutes. After that, text normal instructions from iMessage or SMS.
+If pairing is required, inspect the service log for the six-character code and
+text it to the displayed Sendblue number within 15 minutes:
 
-## How It Works
-
-1. You choose the hosted relay or configure your own relay.
-2. The skill asks permission to install the Codex Stop hook.
-3. `$imessage-handoff` registers the current `CODEX_THREAD_ID` with the relay.
-4. When you text the pairing code, the relay links that local token to your phone number.
-5. The local Stop hook waits on a WebSocket connection to the relay.
-6. When a message arrives from your paired phone, the relay wakes the waiting hook, the hook claims the message, and Codex continues the original thread.
-7. For longer handoff tasks, Codex is prompted to send occasional short progress updates through the relay.
-8. Codex results are forwarded through Sendblue, using iMessage when available and SMS fallback otherwise.
-
-The local Stop hook maintains a WebSocket connection with the relay while it waits for iMessage input.
-
-## Commands
-
-Local Codex:
-
-```text
-$imessage-handoff
-$imessage-handoff stop
+```bash
+tail -f ~/.codex/imessage-handoff/service.log
 ```
 
-iMessage:
+## iMessage interface
+
+Normal text goes unchanged to the selected Codex thread. Service commands use a
+slash prefix:
 
 ```text
-threads
+/threads
+/recent
+/search words
+/projects
+/status
+/cancel
+/help
 ```
 
-`threads` shows active iMessage handoff threads and lets users switch which thread receives iMessage replies.
-
-## Self-Hosting
-
-See [relay](relay) for Cloudflare deployment instructions.
-
-## Configure
-
-Configure it by invoking the skill in Codex:
+Thread replies and service controls are visually distinct:
 
 ```text
-$imessage-handoff show my config
-$imessage-handoff use my self-hosted relay at https://<your-worker-url>
-$imessage-handoff switch back to the hosted relay
-$imessage-handoff reset my install token
-$imessage-handoff remove hook
+CODEX · Music crawler
+
+All tests pass.
 ```
-
-## Uninstall
-
-Ask `$imessage-handoff remove hook`. This removes the Codex Stop hook used for communication with the relay. You can then disable or remove the skill in Codex settings.
-
-## Security Model
-
-iMessage Handoff is a relay for prompts into a local Codex thread. The local config contains the token that gets linked to your phone number when you pair with iMessage.
-
-Keep `~/.codex/skills/imessage-handoff/.state/config.json` private. If that token leaks, reset the install token and pair your phone again:
 
 ```text
-$imessage-handoff reset my install token
+CODEX · SWITCHED
+
+Portfolio refresh
+
+Send a message to continue this thread.
 ```
 
-iMessage Handoff is designed to store the minimum data needed to route messages. The relay avoids persisting conversation content, avoids logging message details, and stores only routing metadata such as thread state, pairing state, and phone bindings.
+The service uses native typing indicators for ordinary work and sends bounded,
+deterministic progress only for longer runs.
 
-User message content is held only briefly while waiting for local Codex to claim it, then it is scrubbed. Codex replies and generated images are forwarded to Sendblue, our iMessage sending provider, and are not stored by the relay. Aside from this transient relay processing, Sendblue is the only system intended to persist iMessage content.
+## Service commands
 
-For added security, Cloudflare persisted logging is disabled for the `imessage-handoff` relay so messages are not stored in Cloudflare logs.
+```bash
+node bin/imessage-handoff.mjs service status
+node bin/imessage-handoff.mjs service stop
+node bin/imessage-handoff.mjs service start
+node bin/imessage-handoff.mjs service restart
+node bin/imessage-handoff.mjs service pause
+node bin/imessage-handoff.mjs service run
+node bin/imessage-handoff.mjs service uninstall
+```
+
+`service run` keeps the daemon in the foreground for development or platforms
+without LaunchAgent support.
+
+## How it works
+
+1. The service reads the local Codex thread catalog in read-only mode.
+2. It synchronizes bounded title/project routing metadata to the relay.
+3. One authenticated installation WebSocket receives pending thread/reply IDs.
+4. The service claims a message only when it can process it.
+5. It passes the exact message through stdin to `codex exec resume --json`.
+6. Structured lifecycle events drive typing and safe progress.
+7. The final response is labeled outside Codex history and sent through
+   Sendblue.
+8. The Codex child process exits; the small service returns to idle.
+
+## Self-hosting
+
+See [relay/README.md](relay/README.md). Existing self-hosted deployments keep
+their Cloudflare Worker/D1 database, Sendblue credentials, webhook, phone
+number, domain, install token, and phone pairing. Apply the included migrations
+and redeploy the Worker before starting the service.
+
+## Security model
+
+- Prompt and response bodies are not stored in D1.
+- Pending inbound content lives only in the relay Durable Object until claimed.
+- Thread history, previews, full local paths, and git remotes stay local.
+- Tokens, media, logs, and service state are owner-readable only.
+- User text is passed through stdin, not process arguments.
+- Raw JSONL tool output and secrets are never sent as progress.
+- The initial service does not expose remote model, reasoning, approval,
+  sandbox, deletion, or archival controls.
+
+Keep `~/.codex/imessage-handoff/config.json` private. Resetting the install token
+revokes the paired phone.
+
+## Development
+
+```bash
+pnpm test
+pnpm typecheck
+```

@@ -1,159 +1,79 @@
 #!/usr/bin/env node
-import { cpSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
-import os from "node:os";
-import path from "node:path";
-import { fileURLToPath } from "node:url";
+import { spawn } from "node:child_process";
+import { configureRelay, importLegacyConfig, readConfig } from "../service/src/config.mjs";
+import { installService, removeLegacyHook, serviceStatus, stopService, uninstallService } from "../service/src/service-manager.mjs";
+import { RelayClient } from "../service/src/relay-client.mjs";
 
-const packageDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const skillSourceDir = path.join(packageDir, "imessage-handoff");
-
-function readArg(name) {
+function arg(name) {
   const prefix = `--${name}=`;
-  const arg = process.argv.find((value) => value.startsWith(prefix));
-  return arg ? arg.slice(prefix.length) : "";
+  const value = process.argv.find((item) => item.startsWith(prefix));
+  return value ? value.slice(prefix.length) : "";
 }
 
-function readJson(filePath, fallback) {
-  if (!existsSync(filePath)) {
-    return fallback;
-  }
-  return JSON.parse(readFileSync(filePath, "utf8"));
+function print(value) {
+  process.stdout.write(`${JSON.stringify(value, null, 2)}\n`);
 }
 
-function writeJson(filePath, value) {
-  mkdirSync(path.dirname(filePath), { recursive: true });
-  const tempPath = `${filePath}.tmp-${process.pid}`;
-  writeFileSync(tempPath, `${JSON.stringify(value, null, 2)}\n`, "utf8");
-  renameSync(tempPath, filePath);
+async function ensureConfig() {
+  if (importLegacyConfig()) return readConfig();
+  const relay = arg("relay");
+  if (!relay) throw new Error("No existing relay config found. Pass --relay=https://your-relay when installing.");
+  return configureRelay(relay);
 }
 
-function installSkill(skillTargetDir, codexHome) {
-  // Reinstall the packaged skill files, but keep .state so upgrades do not
-  // accidentally lose the user's token or active thread list.
-  mkdirSync(path.dirname(skillTargetDir), { recursive: true });
-  const statePath = path.join(skillTargetDir, ".state");
-  const preservedStatePath = path.join(codexHome, `.imessage-handoff-state-${process.pid}`);
-  const hasState = existsSync(statePath);
-  if (hasState) {
-    rmSync(preservedStatePath, { recursive: true, force: true });
-    renameSync(statePath, preservedStatePath);
-  }
-  rmSync(skillTargetDir, { recursive: true, force: true });
-  cpSync(skillSourceDir, skillTargetDir, { recursive: true, force: true, verbatimSymlinks: true });
-  if (hasState) {
-    rmSync(path.join(skillTargetDir, ".state"), { recursive: true, force: true });
-    renameSync(preservedStatePath, path.join(skillTargetDir, ".state"));
-  }
-}
-
-function uninstallStopHook(hooksPath) {
-  // Uninstall is intentionally narrow: the user may remove/disable the skill in
-  // Codex, and this command only removes the global Stop hook we added.
-  if (!existsSync(hooksPath)) {
-    return 0;
-  }
-
-  const root = readJson(hooksPath, {});
-  const hooks = root.hooks && typeof root.hooks === "object" && !Array.isArray(root.hooks) ? root.hooks : {};
-  const groups = Array.isArray(hooks.Stop) ? hooks.Stop : [];
-  let removed = 0;
-  const nextGroups = [];
-
-  for (const group of groups) {
-    if (!group || typeof group !== "object" || !Array.isArray(group.hooks)) {
-      nextGroups.push(group);
-      continue;
-    }
-    const nextHooks = group.hooks.filter((hook) => {
-      const shouldRemove = hook
-        && typeof hook === "object"
-        && isImessageHandoffStopHook(hook.command);
-      if (shouldRemove) {
-        removed += 1;
+async function main() {
+  const codexHomeOverride = arg("codex-home");
+  if (codexHomeOverride) process.env.CODEX_HOME = codexHomeOverride;
+  const first = process.argv[2] || "install";
+  const action = first === "service" ? process.argv[3] || "status" : first;
+  if (action === "install" || action === "start") {
+    const config = await ensureConfig();
+    const installed = installService();
+    const relay = new RelayClient(config);
+    let healthy = false;
+    for (let attempt = 0; attempt < 20; attempt += 1) {
+      try {
+        const status = await relay.serviceStatus();
+        if (status.connected) { healthy = true; break; }
+      } catch {
+        // The daemon may still be starting.
       }
-      return !shouldRemove;
-    });
-    if (nextHooks.length > 0) {
-      nextGroups.push({ ...group, hooks: nextHooks });
+      await new Promise((resolve) => setTimeout(resolve, 250));
     }
+    const hooksRemoved = healthy ? removeLegacyHook() : 0;
+    if (!healthy) throw new Error("The service did not become healthy; the existing Stop hook was preserved.");
+    print({ ok: true, ...installed, healthy, hooksRemoved });
+    return;
   }
-
-  if (removed > 0) {
-    if (nextGroups.length > 0) {
-      hooks.Stop = nextGroups;
-    } else {
-      delete hooks.Stop;
-    }
-    root.hooks = hooks;
-    writeJson(hooksPath, root);
+  if (action === "stop" || action === "pause") {
+    print({ ok: true, ...stopService() });
+    return;
   }
-
-  return removed;
-}
-
-function isImessageHandoffStopHook(command) {
-  if (typeof command !== "string") {
-    return false;
+  if (action === "restart") {
+    stopService();
+    print({ ok: true, ...installService() });
+    return;
   }
-  const normalized = command.replace(/\\/g, "/");
-  return normalized.includes("/imessage-handoff/scripts/publish-stop.js")
-    || normalized.includes("/imessage-handoff/scripts/run-publish-stop.cmd")
-    || normalized.includes("/.agents/skills/imessage-handoff/scripts/publish-stop.js")
-    || normalized.includes("/.agents/skills/imessage-handoff/scripts/run-publish-stop.cmd")
-    || normalized.includes("/.codex/skills/imessage-handoff/scripts/publish-stop.js")
-    || normalized.includes("/.codex/skills/imessage-handoff/scripts/run-publish-stop.cmd");
-}
-
-function install() {
-  // Keep the npx installer as a lightweight compatibility path. First-use relay
-  // choice and hook installation happen later through the skill conversation.
-  const codexHome = readArg("codex-home") || process.env.CODEX_HOME || path.join(os.homedir(), ".codex");
-  const skillTargetDir = path.join(codexHome, "skills", "imessage-handoff");
-  const configPath = path.join(skillTargetDir, ".state", "config.json");
-  const hooksPath = path.join(codexHome, "hooks.json");
-  const existingConfig = readJson(configPath, null);
-
-  installSkill(skillTargetDir, codexHome);
-
-  console.log(JSON.stringify({
-    ok: true,
-    configured: Boolean(existingConfig),
-    hookInstalled: false,
-    skillPath: skillTargetDir,
-    hooksPath,
-  }, null, 2));
-}
-
-function uninstall() {
-  const codexHome = readArg("codex-home") || process.env.CODEX_HOME || path.join(os.homedir(), ".codex");
-  const hooksPath = path.join(codexHome, "hooks.json");
-  const hooksRemoved = uninstallStopHook(hooksPath);
-
-  console.log(JSON.stringify({
-    ok: true,
-    hooksRemoved,
-    hooksPath,
-  }, null, 2));
-}
-
-const command = process.argv[2] && !process.argv[2].startsWith("--") ? process.argv[2] : "install";
-if (command !== "install" && command !== "uninstall") {
-  console.error("Usage: imessage-handoff install [--codex-home=/path]\n       imessage-handoff uninstall [--codex-home=/path]");
-  process.exit(2);
-}
-
-if (command === "install") {
-  try {
-    install();
-  } catch (error) {
-    console.error(error instanceof Error ? error.message : String(error));
-    process.exit(1);
+  if (action === "status") {
+    print({ ok: true, ...serviceStatus() });
+    return;
   }
-} else {
-  try {
-    uninstall();
-  } catch (error) {
-    console.error(error instanceof Error ? error.message : String(error));
-    process.exit(1);
+  if (action === "uninstall") {
+    const hooksRemoved = removeLegacyHook();
+    const removed = codexHomeOverride ? { removed: false } : uninstallService();
+    print({ ok: true, ...removed, hooksRemoved });
+    return;
   }
+  if (action === "run") {
+    await ensureConfig();
+    const child = spawn(process.execPath, [new URL("../service/src/daemon.mjs", import.meta.url).pathname], { stdio: "inherit" });
+    child.on("exit", (code) => process.exit(code ?? 0));
+    return;
+  }
+  throw new Error("Usage: imessage-handoff [service] install|start|stop|restart|status|pause|run|uninstall [--relay=https://...]");
 }
+
+main().catch((error) => {
+  process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
+  process.exit(1);
+});

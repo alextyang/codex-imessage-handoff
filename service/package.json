@@ -1,0 +1,12 @@
+{
+  "name": "@gaberagland/imessage-handoff-service",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --experimental-strip-types --test tests/*.test.mjs"
+  },
+  "dependencies": {
+    "ws": "^8.18.3"
+  }
+}

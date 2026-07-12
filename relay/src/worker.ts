@@ -1,5 +1,16 @@
 import { CODEX_CONTACT_IMAGE_BASE64 } from "./contact-card-image.ts";
-import type { Env, PairingAttemptLimitRow, PhoneBindingRow, HandoffReplyRow, HandoffThreadRow } from "./types.ts";
+import { parseMenuSelection, parseSlashCommand, renderHelp, renderOutboundEvent, renderThreadMenu, threadHeader } from "../../protocol/presentation.ts";
+import type { OutboundEvent, MenuItem } from "../../protocol/presentation.ts";
+import type {
+  Env,
+  InstallationPairingRow,
+  MenuSnapshotRow,
+  PairingAttemptLimitRow,
+  PhoneBindingRow,
+  HandoffReplyRow,
+  HandoffThreadRow,
+  ServiceInstallationRow,
+} from "./types.ts";
 
 type WaitUntilContext = Pick<ExecutionContext, "waitUntil">;
 
@@ -11,15 +22,14 @@ type WaitUntilContext = Pick<ExecutionContext, "waitUntil">;
 const JSON_HEADERS = {
   "content-type": "application/json; charset=utf-8",
   "access-control-allow-origin": "*",
-  "access-control-allow-methods": "GET,POST,OPTIONS",
+  "access-control-allow-methods": "GET,POST,PUT,OPTIONS",
   "access-control-allow-headers": "authorization,content-type",
 };
 const CONTACT_CARD_MESSAGE = "Add me as a contact so you remember who I am.";
 const CONTACT_CARD_FILENAME = "contact.vcf";
 const CONTACT_CARD_IMAGE_FILENAME = "codex-contact.jpg";
-const THREAD_LIST_COMMANDS = new Set(["list", "threads"]);
-const NO_HANDOFF_THREADS_MESSAGE = "You have no iMessage handoff threads";
-const SWITCH_RANGE_MESSAGE = "Text threads to see active iMessage handoff threads.";
+const THREAD_LIST_COMMANDS = new Set(["list", "threads", "/threads", "/recent"]);
+const MENU_SNAPSHOT_TTL_MS = 10 * 60 * 1000;
 
 // Pairing is the security boundary that lets an iMessage sender control a local
 // Codex thread. Codes are intentionally short for human texting, so they expire
@@ -49,6 +59,8 @@ const MAX_ASSISTANT_MESSAGE_LENGTH = 20_000;
 const MAX_WEBHOOK_CONTENT_LENGTH = 20_000;
 const MAX_URL_LENGTH = 2048;
 const MAX_ENABLED_THREADS_PER_OWNER = 25;
+const MAX_CATALOG_THREADS_PER_OWNER = 100;
+const MAX_CATALOG_BATCH = 100;
 const MAX_GENERATED_IMAGES = 5;
 const MAX_GENERATED_IMAGE_BYTES = 10 * 1024 * 1024;
 const MAX_GENERATED_IMAGE_TOTAL_BYTES = MAX_GENERATED_IMAGES * MAX_GENERATED_IMAGE_BYTES;
@@ -61,6 +73,31 @@ interface RegisterBody {
   cwd?: unknown;
   title?: unknown;
   handoffSummary?: unknown;
+}
+
+interface ServiceRegisterBody {
+  clientId?: unknown;
+  serviceVersion?: unknown;
+  capabilities?: unknown;
+}
+
+interface CatalogThreadInput {
+  id?: unknown;
+  title?: unknown;
+  cwd?: unknown;
+  projectLabel?: unknown;
+  createdAt?: unknown;
+  updatedAt?: unknown;
+  archived?: unknown;
+  visible?: unknown;
+}
+
+interface ServiceCatalogBody {
+  threads?: unknown;
+}
+
+interface OutboundBody {
+  event?: unknown;
 }
 
 interface StatusBody {
@@ -134,16 +171,24 @@ export class HandoffSocket {
       if (request.method === "POST" && parts[0] === "rate-limit" && parts.length === 1) {
         return await this.handleRateLimit(request);
       }
+      if (request.method === "POST" && parts[0] === "owners" && parts[1] && parts[2] === "control") {
+        const body = await readJsonBody<JsonRecord>(request);
+        this.notifyOwner(parts[1], { type: "control", command: optionalString(body.command), threadId: optionalString(body.threadId) });
+        return json({ ok: true });
+      }
       return error(404, "Not found.");
     }
 
     const pair = new WebSocketPair();
     const [client, server] = Object.values(pair);
-    const threadId = parts[1] ?? "";
-    // Tag sockets by thread id so a single global DO can still notify only the
-    // local Codex process that is waiting for that specific thread.
-    this.state.acceptWebSocket(server, threadId ? [threadId] : undefined);
-    if (threadId) {
+    const isOwnerSocket = parts[0] === "owners" && parts[1] && parts[2] === "events";
+    const threadId = parts[0] === "threads" ? parts[1] ?? "" : "";
+    const ownerId = isOwnerSocket ? parts[1] : "";
+    const socketTag = ownerId ? `owner:${ownerId}` : threadId;
+    this.state.acceptWebSocket(server, socketTag ? [socketTag] : undefined);
+    if (ownerId) {
+      this.notifyOwnerSocketOrSchedule(ownerId, server);
+    } else if (threadId) {
       // A Stop hook may connect after a message already arrived, so send the
       // next queued message immediately when possible.
       this.notifySocketOrScheduleNextPending(threadId, server);
@@ -227,10 +272,12 @@ export class HandoffSocket {
       externalId?: unknown;
       status?: unknown;
       mediaUrl?: unknown;
+      ownerId?: unknown;
     }>(request);
     const status = optionalString(body.status) === "applied" ? "applied" : "pending";
     const externalId = optionalString(body.externalId);
     const mediaUrl = optionalString(body.mediaUrl);
+    const ownerId = optionalString(body.ownerId);
     const isTombstone = status === "applied";
     const id = makeId("reply");
     const createdAt = nowIso();
@@ -246,23 +293,28 @@ export class HandoffSocket {
       status,
       created_at: createdAt,
       applied_at: isTombstone ? createdAt : null,
+      owner_id: ownerId,
     });
     if (!isTombstone && !mediaGroupId) {
       // Plain text can be delivered as soon as it arrives.
-      this.notifyNextPending(threadId);
+      this.notifyNextPending(threadId, ownerId);
     } else if (!isTombstone) {
       // Media groups need the quiet window before they are safe to claim.
-      this.scheduleMediaPendingNotification(threadId);
+      this.scheduleMediaPendingNotification(threadId, ownerId);
     }
     return json({ id });
   }
 
-  private notifyNextPending(threadId: string) {
+  private notifyNextPending(threadId: string, ownerId?: string | null) {
     const payload = this.nextPendingPayload(threadId);
     if (!payload) {
       return;
     }
-    this.notifyThread(threadId, payload);
+    if (ownerId) {
+      this.notifyOwner(ownerId, payload);
+    } else {
+      this.notifyThread(threadId, payload);
+    }
   }
 
   private notifySocketOrScheduleNextPending(threadId: string, socket: WebSocket) {
@@ -276,6 +328,19 @@ export class HandoffSocket {
     this.scheduleMediaPendingNotification(threadId);
   }
 
+  private notifyOwnerSocketOrSchedule(ownerId: string, socket: WebSocket) {
+    const pending = [...this.replies.values()]
+      .filter((reply) => reply.owner_id === ownerId && reply.status === "pending")
+      .sort((a, b) => a.created_at.localeCompare(b.created_at));
+    for (const row of pending) {
+      const payload = this.nextPendingPayload(row.thread_id);
+      if (payload) {
+        socket.send(JSON.stringify(payload));
+        return;
+      }
+    }
+  }
+
   private nextPendingPayload(threadId: string) {
     const pending = eligiblePendingReplies(this.pendingRows(threadId))[0];
     return pending ? {
@@ -286,12 +351,12 @@ export class HandoffSocket {
     } : null;
   }
 
-  private scheduleMediaPendingNotification(threadId: string) {
+  private scheduleMediaPendingNotification(threadId: string, ownerId?: string | null) {
     const waitMs = this.nextMediaPendingWaitMs(threadId);
     if (waitMs === null) {
       return;
     }
-    setTimeout(() => this.notifyNextPending(threadId), waitMs);
+    setTimeout(() => this.notifyNextPending(threadId, ownerId), waitMs);
   }
 
   private nextMediaPendingWaitMs(threadId: string) {
@@ -315,6 +380,17 @@ export class HandoffSocket {
   private notifyThread(threadId: string, payload: JsonRecord) {
     const message = JSON.stringify(payload);
     for (const socket of this.state.getWebSockets(threadId)) {
+      try {
+        socket.send(message);
+      } catch {
+        // The runtime will clean up dead sockets.
+      }
+    }
+  }
+
+  private notifyOwner(ownerId: string, payload: JsonRecord) {
+    const message = JSON.stringify(payload);
+    for (const socket of this.state.getWebSockets(`owner:${ownerId}`)) {
       try {
         socket.send(message);
       } catch {
@@ -589,6 +665,200 @@ function handleCreateInstallation() {
   return json({ token: makeInstallToken() });
 }
 
+async function findServiceInstallation(env: Env, ownerId: string) {
+  return env.DB.prepare("SELECT * FROM service_installations WHERE owner_id = ?")
+    .bind(ownerId)
+    .first<ServiceInstallationRow>();
+}
+
+async function findInstallationPairingByCode(env: Env, pairingCode: string) {
+  return env.DB.prepare(
+    "SELECT * FROM installation_pairings WHERE pairing_code = ? AND pairing_code_expires_at > ?",
+  ).bind(pairingCode, nowIso()).first<InstallationPairingRow>();
+}
+
+async function findInstallationPairingForOwner(env: Env, ownerId: string) {
+  return env.DB.prepare("SELECT * FROM installation_pairings WHERE owner_id = ?")
+    .bind(ownerId).first<InstallationPairingRow>();
+}
+
+async function handleServiceRegister(request: Request, env: Env) {
+  const ownerId = await requireOwnerId(request);
+  const body = await readJsonBody<ServiceRegisterBody>(request);
+  const clientId = requireLimitedString(body.clientId, "clientId", 120);
+  const serviceVersion = requireLimitedString(body.serviceVersion, "serviceVersion", 40);
+  const capabilities = Array.isArray(body.capabilities)
+    ? body.capabilities.flatMap((value) => typeof value === "string" ? [value.slice(0, 80)] : []).slice(0, 40)
+    : [];
+  const now = nowIso();
+  const existing = await findServiceInstallation(env, ownerId);
+  await env.DB.prepare(
+    `INSERT INTO service_installations (
+      owner_id, client_id, service_version, capabilities, delivery_mode, last_seen_at, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, 'service', ?, ?, ?)
+    ON CONFLICT(owner_id) DO UPDATE SET
+      client_id = excluded.client_id,
+      service_version = excluded.service_version,
+      capabilities = excluded.capabilities,
+      delivery_mode = 'service',
+      last_seen_at = excluded.last_seen_at,
+      updated_at = excluded.updated_at`,
+  ).bind(ownerId, clientId, serviceVersion, JSON.stringify(capabilities), now, existing?.created_at ?? now, now).run();
+
+  const binding = await findPhoneBindingForOwner(env, ownerId);
+  let pairingCode: string | null = null;
+  let pairingCodeExpiresAt: string | null = null;
+  if (!binding) {
+    const currentPairing = await findInstallationPairingForOwner(env, ownerId);
+    const reusable = currentPairing?.pairing_code && currentPairing.pairing_code_expires_at
+      && Date.parse(currentPairing.pairing_code_expires_at) > Date.now();
+    pairingCode = reusable ? currentPairing.pairing_code : makePairingCode();
+    pairingCodeExpiresAt = reusable ? currentPairing.pairing_code_expires_at : isoFromMs(Date.now() + PAIRING_CODE_TTL_MS);
+    await env.DB.prepare(
+      `INSERT INTO installation_pairings (owner_id, pairing_code, pairing_code_expires_at, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?)
+       ON CONFLICT(owner_id) DO UPDATE SET
+         pairing_code = excluded.pairing_code,
+         pairing_code_expires_at = excluded.pairing_code_expires_at,
+         updated_at = excluded.updated_at`,
+    ).bind(ownerId, pairingCode, pairingCodeExpiresAt, now, now).run();
+  }
+
+  return json({
+    ok: true,
+    paired: Boolean(binding),
+    pairingRequired: !binding,
+    pairingCode,
+    pairingCodeExpiresAt,
+    sendblueNumber: env.SENDBLUE_FROM_NUMBER || "+12344198201",
+    activeThreadId: binding?.active_thread_id ?? null,
+  });
+}
+
+function catalogThread(value: unknown) {
+  if (!isRecord(value)) {
+    throw new Error("Each catalog thread must be an object.");
+  }
+  return {
+    id: requireLimitedString(value.id, "thread.id", 160),
+    title: optionalLimitedString(value.title, "thread.title", MAX_TITLE_LENGTH),
+    cwd: optionalLimitedString(value.cwd, "thread.cwd", MAX_CWD_LENGTH) ?? "Codex",
+    projectLabel: optionalLimitedString(value.projectLabel, "thread.projectLabel", 120),
+    createdAt: optionalLimitedString(value.createdAt, "thread.createdAt", 64) ?? nowIso(),
+    updatedAt: optionalLimitedString(value.updatedAt, "thread.updatedAt", 64) ?? nowIso(),
+    archived: value.archived === true ? 1 : 0,
+    visible: value.visible === false ? 0 : 1,
+  };
+}
+
+async function handleServiceCatalog(request: Request, env: Env) {
+  const ownerId = await requireOwnerId(request);
+  const body = await readJsonBody<ServiceCatalogBody>(request);
+  if (!Array.isArray(body.threads) || body.threads.length > MAX_CATALOG_BATCH) {
+    throw new Error(`threads must be an array of at most ${MAX_CATALOG_BATCH} items.`);
+  }
+  const items = body.threads.map(catalogThread);
+  const now = nowIso();
+  for (const item of items) {
+    await env.DB.prepare(
+      `INSERT INTO handoff_threads (
+        id, owner_id, cwd, title, handoff_summary, status, handoff_enabled, pairing_code,
+        pairing_code_expires_at, last_stop_at, created_at, updated_at, project_label,
+        catalog_source, archived, visible, last_seen_at
+      ) VALUES (?, ?, ?, ?, NULL, 'idle', 1, NULL, NULL, NULL, ?, ?, ?, 'service', ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET
+        owner_id = excluded.owner_id,
+        cwd = excluded.cwd,
+        title = excluded.title,
+        project_label = excluded.project_label,
+        catalog_source = 'service',
+        archived = excluded.archived,
+        visible = excluded.visible,
+        handoff_enabled = 1,
+        last_seen_at = excluded.last_seen_at,
+        updated_at = excluded.updated_at`,
+    ).bind(
+      item.id,
+      ownerId,
+      item.cwd,
+      item.title,
+      item.createdAt,
+      item.updatedAt,
+      item.projectLabel,
+      item.archived,
+      item.visible,
+      now,
+    ).run();
+  }
+  return json({ ok: true, synchronized: items.length, limit: MAX_CATALOG_THREADS_PER_OWNER });
+}
+
+async function handleServiceStatus(request: Request, env: Env) {
+  const ownerId = await requireOwnerId(request);
+  const installation = await findServiceInstallation(env, ownerId);
+  const binding = await findPhoneBindingForOwner(env, ownerId);
+  const activeThread = binding?.active_thread_id ? await findThread(env, binding.active_thread_id) : null;
+  return json({
+    ok: true,
+    connected: Boolean(installation),
+    paired: Boolean(binding),
+    activeThread: activeThread ? publicThread(activeThread) : null,
+    lastSeenAt: installation?.last_seen_at ?? null,
+  });
+}
+
+function outboundEvent(value: unknown) {
+  if (!isRecord(value) || typeof value.kind !== "string") {
+    throw new Error("event is required.");
+  }
+  return value as unknown as OutboundEvent;
+}
+
+async function handleServiceOutbound(request: Request, env: Env) {
+  const ownerId = await requireOwnerId(request);
+  const body = await readJsonBody<OutboundBody>(request);
+  const binding = await findPhoneBindingForOwner(env, ownerId);
+  if (!binding) {
+    throw Object.assign(new Error("Phone is not paired."), { status: 409 });
+  }
+  const event = outboundEvent(body.event);
+  const rendered = renderOutboundEvent(event);
+  const chunks: string[] = [];
+  if (event.kind === "thread.output" && rendered.length > 8000) {
+    const bodyChunks = splitText(event.body, 7800);
+    for (let index = 0; index < bodyChunks.length; index += 1) {
+      chunks.push(`${threadHeader(event.thread, { index: index + 1, total: bodyChunks.length })}\n\n${bodyChunks[index]}`);
+    }
+  } else {
+    chunks.push(rendered);
+  }
+  try {
+    await sendSendblueTypingIndicator(env, binding.phone_number, "stop");
+  } catch {
+    // Typing is best effort.
+  }
+  let result = null;
+  for (const chunk of chunks) {
+    if (chunk.length > MAX_ASSISTANT_MESSAGE_LENGTH) requestTooLarge("Rendered message is too large.");
+    result = await sendSendblueMessage(env, binding.phone_number, chunk);
+  }
+  return json({ ok: true, notification: { sent: true, status: result?.status, messageHandle: result?.messageHandle, parts: chunks.length } });
+}
+
+function splitText(value: string, maxLength: number) {
+  const chunks: string[] = [];
+  let remaining = value.trim();
+  while (remaining.length > maxLength) {
+    let index = remaining.lastIndexOf("\n", maxLength);
+    if (index < Math.floor(maxLength * 0.6)) index = remaining.lastIndexOf(" ", maxLength);
+    if (index < 1) index = maxLength;
+    chunks.push(remaining.slice(0, index).trim());
+    remaining = remaining.slice(index).trim();
+  }
+  if (remaining) chunks.push(remaining);
+  return chunks.length ? chunks : [""];
+}
+
 async function findPhoneBinding(env: Env, phoneNumber: string) {
   return env.DB.prepare("SELECT phone_number, owner_id, active_thread_id, contact_card_sent_at, created_at, updated_at FROM phone_bindings WHERE phone_number = ?")
     .bind(phoneNumber)
@@ -703,7 +973,7 @@ async function listEnabledThreadsForOwner(env: Env, ownerId: string) {
   const { results } = await env.DB.prepare(
     `SELECT *
       FROM handoff_threads
-      WHERE owner_id = ? AND handoff_enabled = 1
+      WHERE owner_id = ? AND handoff_enabled = 1 AND visible = 1 AND archived = 0
       ORDER BY updated_at DESC, created_at DESC, id DESC`,
   ).bind(ownerId).all<HandoffThreadRow>();
   return results;
@@ -734,25 +1004,47 @@ function handoffActivationMessage(thread: HandoffThreadRow) {
   ].filter(Boolean).join("\n\n");
 }
 
-function formatThreadList(threads: HandoffThreadRow[], activeThreadId: string | null) {
-  if (threads.length === 0) {
-    return NO_HANDOFF_THREADS_MESSAGE;
-  }
-  return [
-    "iMessage Handoff threads:",
-    "",
-    ...threads.map((thread, index) => {
-      const current = thread.id === activeThreadId ? " (current)" : "";
-      return `${index + 1}. ${threadDisplayName(thread)}${current}`;
-    }),
-    "",
-    "Reply with a number to switch.",
-  ].join("\n");
+function threadLabel(thread: HandoffThreadRow) {
+  return {
+    id: thread.id,
+    title: threadDisplayName(thread),
+    projectLabel: thread.project_label ?? null,
+  };
 }
 
-function parseThreadSelection(content: string) {
-  const trimmed = content.trim();
-  return /^[1-9]\d*$/.test(trimmed) ? Number(trimmed) : null;
+function menuItems(threads: HandoffThreadRow[], activeThreadId: string | null): MenuItem[] {
+  return threads.map((thread) => ({ ...threadLabel(thread), current: thread.id === activeThreadId }));
+}
+
+async function saveMenuSnapshot(env: Env, binding: PhoneBindingRow, threads: HandoffThreadRow[], references?: string[]) {
+  const now = nowIso();
+  const expiresAt = isoFromMs(Date.now() + MENU_SNAPSHOT_TTL_MS);
+  const ids = references ?? threads.map((thread) => thread.id);
+  await env.DB.prepare(
+    `INSERT INTO menu_snapshots (phone_number, owner_id, items_json, expires_at, created_at)
+     VALUES (?, ?, ?, ?, ?)
+     ON CONFLICT(phone_number) DO UPDATE SET
+       owner_id = excluded.owner_id,
+       items_json = excluded.items_json,
+       expires_at = excluded.expires_at,
+       created_at = excluded.created_at`,
+  ).bind(binding.phone_number, binding.owner_id, JSON.stringify(ids), expiresAt, now).run();
+  return { ids, expiresAt };
+}
+
+async function findMenuSnapshot(env: Env, phoneNumber: string) {
+  const row = await env.DB.prepare(
+    "SELECT * FROM menu_snapshots WHERE phone_number = ? AND expires_at > ?",
+  ).bind(phoneNumber, nowIso()).first<MenuSnapshotRow>();
+  if (!row) {
+    return null;
+  }
+  try {
+    const ids = JSON.parse(row.items_json) as unknown;
+    return Array.isArray(ids) ? ids.filter((id): id is string => typeof id === "string") : null;
+  } catch {
+    return null;
+  }
 }
 
 function parseReplyMedia(value: string | null) {
@@ -1202,7 +1494,7 @@ async function sendStatusNotification(
   return sendResult;
 }
 
-async function sendSendblueTypingIndicator(env: Env, number: string) {
+async function sendSendblueTypingIndicator(env: Env, number: string, state: "start" | "stop" = "start") {
   const fromNumber = env.SENDBLUE_FROM_NUMBER?.trim() || "+12344198201";
   const response = await fetch(`${sendblueApiBaseUrl(env)}/send-typing-indicator`, {
     method: "POST",
@@ -1210,6 +1502,7 @@ async function sendSendblueTypingIndicator(env: Env, number: string) {
     body: JSON.stringify({
       number,
       from_number: fromNumber,
+      ...(state === "stop" ? { state } : {}),
     }),
   });
   const body = await readSendblueJson(response);
@@ -1336,13 +1629,14 @@ async function insertHandoffReply(
   externalId: string | null,
   status: "pending" | "applied" = "pending",
   mediaUrl: string | null = null,
+  ownerId: string | null = null,
 ) {
   // Inbound content always goes through the global DO so it stays out of D1.
   const response = await relaySocket(env)
     .fetch(new Request(`https://imessage-handoff.internal/threads/${encodeURIComponent(threadId)}/replies`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ body, externalId, status, mediaUrl }),
+      body: JSON.stringify({ body, externalId, status, mediaUrl, ownerId }),
     }));
   const responseBody = await response.json() as { id?: string };
   if (!response.ok || !responseBody.id) {
@@ -1408,6 +1702,46 @@ async function handleSendblueWebhook(request: Request, env: Env, ctx?: WaitUntil
   }
 
   const pairingThread = looksLikePairingCode ? await findPairingThread(env, pairingCodeCandidate ?? "") : null;
+  const servicePairing = looksLikePairingCode ? await findInstallationPairingByCode(env, pairingCodeCandidate ?? "") : null;
+  if (servicePairing) {
+    const now = nowIso();
+    const threads = await listEnabledThreadsForOwner(env, servicePairing.owner_id);
+    const activeThreadId = threads[0]?.id ?? null;
+    const previousBinding = await findPhoneBinding(env, fromNumber);
+    await env.DB.prepare("DELETE FROM phone_bindings WHERE owner_id = ? AND phone_number != ?")
+      .bind(servicePairing.owner_id, fromNumber).run();
+    await env.DB.prepare(
+      `INSERT INTO phone_bindings (phone_number, owner_id, active_thread_id, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?)
+       ON CONFLICT(phone_number) DO UPDATE SET
+         owner_id = excluded.owner_id,
+         active_thread_id = excluded.active_thread_id,
+         updated_at = excluded.updated_at`,
+    ).bind(fromNumber, servicePairing.owner_id, activeThreadId, now, now).run();
+    await env.DB.prepare(
+      "UPDATE installation_pairings SET pairing_code = NULL, pairing_code_expires_at = NULL, updated_at = ? WHERE owner_id = ?",
+    ).bind(now, servicePairing.owner_id).run();
+    await clearPairingAttempts(env, fromNumber);
+    if (externalId && activeThreadId) {
+      await insertHandoffReply(env, activeThreadId, content ?? "", externalId, "applied", null, servicePairing.owner_id);
+    }
+    if (!previousBinding?.contact_card_sent_at) {
+      try {
+        await sendPairingContactCard(env, fromNumber, new URL(request.url).origin);
+        const sentAt = nowIso();
+        await env.DB.prepare("UPDATE phone_bindings SET contact_card_sent_at = ?, updated_at = ? WHERE phone_number = ?")
+          .bind(sentAt, sentAt, fromNumber).run();
+      } catch {
+        console.warn("Sendblue contact card failed.");
+      }
+    }
+    await sendControlMessage(env, fromNumber, renderOutboundEvent({
+      kind: "service.notice",
+      code: "connected",
+      body: `${threads.length} recent thread${threads.length === 1 ? " is" : "s are"} available.\n\nText /threads to choose one.`,
+    }));
+    return json({ ok: true, paired: true, threadId: activeThreadId, service: true });
+  }
   if (pairingThread) {
     // First-time setup: user texts the pairing code, linking this phone number
     // to the owner id derived from the local install token.
@@ -1471,50 +1805,128 @@ async function handleSendblueWebhook(request: Request, env: Env, ctx?: WaitUntil
     return json({ ok: true, ignored: true });
   }
 
-  const command = content?.trim().toLowerCase() ?? "";
-  if (!mediaUrl && THREAD_LIST_COMMANDS.has(command)) {
-    // "threads" is an iMessage-side command, not a prompt for Codex.
-    const threads = await listEnabledThreadsForOwner(env, binding.owner_id);
-    await sendControlMessage(env, fromNumber, formatThreadList(threads, binding.active_thread_id));
+  const commandText = content?.trim().toLowerCase() ?? "";
+  const slashCommand = content ? parseSlashCommand(content) : null;
+  if (!mediaUrl && (THREAD_LIST_COMMANDS.has(commandText) || slashCommand?.command === "threads" || slashCommand?.command === "recent")) {
+    const threads = (await listEnabledThreadsForOwner(env, binding.owner_id)).slice(0, slashCommand?.command === "recent" ? 25 : 8);
+    await saveMenuSnapshot(env, binding, threads);
+    await sendControlMessage(env, fromNumber, renderThreadMenu(menuItems(threads, binding.active_thread_id), {
+      note: threads.length === 8 ? "Reply with a number to switch.\nMore: /recent or /search words" : undefined,
+    }));
     if (externalId && binding.active_thread_id) {
       await insertHandoffReply(env, binding.active_thread_id, content ?? "", externalId, "applied");
     }
     return json({ ok: true, command: "list", threadCount: threads.length });
   }
 
-  const selection = content ? parseThreadSelection(content) : null;
-  if (!mediaUrl && content && selection !== null) {
-    // A bare number selects from the most recent enabled thread list.
-    const threads = await listEnabledThreadsForOwner(env, binding.owner_id);
-    const selected = threads[selection - 1];
+  if (!mediaUrl && slashCommand?.command === "help") {
+    await sendControlMessage(env, fromNumber, renderHelp());
+    return json({ ok: true, command: "help" });
+  }
+
+  if (!mediaUrl && slashCommand?.command === "status") {
+    const active = binding.active_thread_id ? await findThread(env, binding.active_thread_id) : null;
+    const message = active
+      ? renderOutboundEvent({ kind: "service.notice", code: "connected", thread: threadLabel(active), body: `Status: ${active.status || "idle"}.` })
+      : renderOutboundEvent({ kind: "service.notice", code: "needs-attention", body: "No thread is selected.\nText /threads to choose one." });
+    await sendControlMessage(env, fromNumber, message);
+    return json({ ok: true, command: "status" });
+  }
+
+  if (!mediaUrl && slashCommand?.command === "search") {
+    const query = slashCommand.argument?.toLowerCase() ?? "";
+    const threads = (await listEnabledThreadsForOwner(env, binding.owner_id))
+      .filter((thread) => !query || `${thread.title ?? ""} ${thread.project_label ?? ""}`.toLowerCase().includes(query))
+      .slice(0, 8);
+    await saveMenuSnapshot(env, binding, threads);
+    await sendControlMessage(env, fromNumber, renderThreadMenu(menuItems(threads, binding.active_thread_id)));
+    return json({ ok: true, command: "search", threadCount: threads.length });
+  }
+
+  if (!mediaUrl && slashCommand?.command === "projects") {
+    const labels = [...new Set((await listEnabledThreadsForOwner(env, binding.owner_id))
+      .map((thread) => thread.project_label?.trim() || "Other"))].slice(0, 8);
+    const items = labels.map((label) => ({ title: label }));
+    await saveMenuSnapshot(env, binding, [], labels.map((label) => `project:${label}`));
+    await sendControlMessage(env, fromNumber, renderThreadMenu(items, { label: "PROJECTS", note: "Reply with a number to browse that project." }));
+    return json({ ok: true, command: "projects", projectCount: labels.length });
+  }
+
+  if (!mediaUrl && slashCommand?.command === "cancel") {
+    await relaySocket(env).fetch(new Request(`https://imessage-handoff.internal/owners/${binding.owner_id}/control`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ command: "cancel", threadId: binding.active_thread_id }),
+    }));
+    return json({ ok: true, command: "cancel" });
+  }
+
+  if (!mediaUrl && content?.trim().startsWith("/") && !slashCommand) {
+    await sendControlMessage(env, fromNumber, [
+      renderOutboundEvent({ kind: "service.notice", code: "needs-attention", body: "That command is not available." }),
+      renderHelp(),
+    ].join("\n\n"));
+    return json({ ok: true, command: "unknown" });
+  }
+
+  const selection = content ? parseMenuSelection(content) : null;
+  const snapshotIds = !mediaUrl && selection ? await findMenuSnapshot(env, fromNumber) : null;
+  if (!mediaUrl && content && selection && snapshotIds) {
+    const selectedId = snapshotIds[selection.index];
+    if (selectedId?.startsWith("project:")) {
+      const project = selectedId.slice("project:".length);
+      const threads = (await listEnabledThreadsForOwner(env, binding.owner_id))
+        .filter((thread) => (thread.project_label?.trim() || "Other") === project)
+        .slice(0, 8);
+      await saveMenuSnapshot(env, binding, threads);
+      await sendControlMessage(env, fromNumber, renderThreadMenu(menuItems(threads, binding.active_thread_id)));
+      return json({ ok: true, command: "project", project, threadCount: threads.length });
+    }
+    const selected = selectedId ? await findThread(env, selectedId) : null;
     if (!selected) {
-      await sendControlMessage(env, fromNumber, SWITCH_RANGE_MESSAGE);
+      await sendControlMessage(env, fromNumber, renderOutboundEvent({
+        kind: "service.notice",
+        code: "needs-attention",
+        body: "That menu has changed.\nText /threads for a fresh list.",
+      }));
       if (externalId && binding.active_thread_id) {
         await insertHandoffReply(env, binding.active_thread_id, content, externalId, "applied");
       }
       return json({ ok: true, command: "switch", switched: false });
     }
     await setActiveThreadForOwner(env, binding.owner_id, selected.id);
-    await sendControlMessage(env, fromNumber, `Switched to ${quotedThreadDisplayName(selected)}.`);
-    if (externalId) {
+    await sendControlMessage(env, fromNumber, renderOutboundEvent({ kind: "service.switched", thread: threadLabel(selected) }));
+    if (selection.prompt) {
+      const replyId = await insertHandoffReply(env, selected.id, selection.prompt, externalId, "pending", null, binding.owner_id);
+      return json({ ok: true, command: "switch-and-send", switched: true, threadId: selected.id, replyId });
+    } else if (externalId) {
       await insertHandoffReply(env, selected.id, content, externalId, "applied");
     }
     return json({ ok: true, command: "switch", switched: true, threadId: selected.id });
   }
 
   if (!binding.active_thread_id) {
-    await sendControlMessage(env, fromNumber, NO_HANDOFF_THREADS_MESSAGE);
+    await sendControlMessage(env, fromNumber, renderOutboundEvent({ kind: "service.notice", code: "needs-attention", body: "No thread is selected.\nText /threads to choose one." }));
     return json({ ok: true, ignored: true, noActiveThread: true });
   }
 
   const activeThread = await findThread(env, binding.active_thread_id);
   if (!activeThread || activeThread.handoff_enabled !== 1) {
     await setActiveThreadForOwner(env, binding.owner_id, null);
-    await sendControlMessage(env, fromNumber, NO_HANDOFF_THREADS_MESSAGE);
+    await sendControlMessage(env, fromNumber, renderOutboundEvent({ kind: "service.notice", code: "needs-attention", body: "The selected thread is no longer available.\nText /threads to choose another." }));
     return json({ ok: true, ignored: true, noActiveThread: true });
   }
 
-  const replyId = await insertHandoffReply(env, binding.active_thread_id, content ?? "", externalId, "pending", mediaUrl);
+  const serviceDelivery = await findServiceInstallation(env, binding.owner_id);
+  const replyId = await insertHandoffReply(
+    env,
+    binding.active_thread_id,
+    content ?? "",
+    externalId,
+    "pending",
+    mediaUrl,
+    serviceDelivery?.delivery_mode === "service" ? binding.owner_id : null,
+  );
   await touchThread(env, binding.active_thread_id);
   return json({ ok: true, replyId });
 }
@@ -1568,12 +1980,34 @@ async function handleThreadEvents(request: Request, env: Env, threadId: string) 
   }
   const ownerId = await ownerIdFromToken(token);
   assertAuthorized(await findThread(env, threadId), ownerId);
+  if ((await findServiceInstallation(env, ownerId))?.delivery_mode === "service") {
+    return error(409, "Persistent service delivery is enabled.");
+  }
   if (!env.HANDOFF_SOCKET) {
     return error(500, "Handoff socket Durable Object is not configured.");
   }
 
   const id = env.HANDOFF_SOCKET.idFromName("global");
   return env.HANDOFF_SOCKET.get(id).fetch(request);
+}
+
+async function handleServiceEvents(request: Request, env: Env) {
+  if (request.headers.get("upgrade")?.toLowerCase() !== "websocket") {
+    return error(426, "WebSocket upgrade required.");
+  }
+  const token = authTokenFromRequestOrUrl(request);
+  if (!token) {
+    throw Object.assign(new Error("Unauthorized."), { status: 401 });
+  }
+  const ownerId = await ownerIdFromToken(token);
+  if (!await findServiceInstallation(env, ownerId)) {
+    throw Object.assign(new Error("Service is not registered."), { status: 404 });
+  }
+  if (!env.HANDOFF_SOCKET) {
+    return error(500, "Handoff socket Durable Object is not configured.");
+  }
+  const forwarded = new Request(new URL(`/owners/${ownerId}/events`, request.url), request);
+  return env.HANDOFF_SOCKET.get(env.HANDOFF_SOCKET.idFromName("global")).fetch(forwarded);
 }
 
 export async function handleRequest(request: Request, env: Env, ctx?: WaitUntilContext) {
@@ -1607,6 +2041,22 @@ export async function handleRequest(request: Request, env: Env, ctx?: WaitUntilC
       // coarse speed bump for scripts minting tokens in a loop.
       await enforceRequestRateLimit(env, `installations:${clientIp(request)}`, MAX_INSTALLATIONS_PER_IP_PER_WINDOW);
       return handleCreateInstallation();
+    }
+
+    if (url.pathname === "/service/register" && request.method === "POST") {
+      return await handleServiceRegister(request, env);
+    }
+    if (url.pathname === "/service/catalog" && request.method === "PUT") {
+      return await handleServiceCatalog(request, env);
+    }
+    if (url.pathname === "/service/events" && request.method === "GET") {
+      return await handleServiceEvents(request, env);
+    }
+    if (url.pathname === "/service/status" && request.method === "GET") {
+      return await handleServiceStatus(request, env);
+    }
+    if (url.pathname === "/service/events/outbound" && request.method === "POST") {
+      return await handleServiceOutbound(request, env);
     }
 
     if (parts[0] === "threads" && parts[1]) {

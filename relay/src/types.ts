@@ -28,6 +28,11 @@ export interface HandoffThreadRow {
   last_stop_at: string | null;
   created_at: string;
   updated_at: string;
+  project_label?: string | null;
+  catalog_source?: string;
+  archived?: number;
+  visible?: number;
+  last_seen_at?: string | null;
 }
 
 export interface HandoffReplyRow {
@@ -43,6 +48,34 @@ export interface HandoffReplyRow {
   status: HandoffReplyStatus;
   created_at: string;
   applied_at: string | null;
+  owner_id?: string | null;
+}
+
+export interface ServiceInstallationRow {
+  owner_id: string;
+  client_id: string;
+  service_version: string;
+  capabilities: string;
+  delivery_mode: string;
+  last_seen_at: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface InstallationPairingRow {
+  owner_id: string;
+  pairing_code: string | null;
+  pairing_code_expires_at: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface MenuSnapshotRow {
+  phone_number: string;
+  owner_id: string;
+  items_json: string;
+  expires_at: string;
+  created_at: string;
 }
 
 export interface PhoneBindingRow {

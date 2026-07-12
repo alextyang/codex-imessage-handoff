@@ -59,13 +59,14 @@ Before starting, you need a Cloudflare account, a Sendblue account with a messag
    https://<your-worker-url>/webhooks/sendblue
    ```
 
-10. Install and configure the skill against your relay.
+10. Install and configure the persistent service against your relay.
 
    ```bash
-   $skill-installer install https://github.com/gragland/codex-imessage-handoff/tree/main/imessage-handoff
+   node bin/imessage-handoff.mjs install --relay=https://<your-worker-url>
    ```
 
-   Then ask Codex: `iMessage Handoff use my self-hosted relay at https://<your-worker-url>`
+   Existing installations import their relay token and phone pairing
+   automatically. No Codex Stop hook is installed.
 
 ## Configuration
 
@@ -91,6 +92,11 @@ Then redeploy with `pnpm run deploy` and update the Sendblue webhook URL to the 
 ## API Summary
 
 - `POST /installations`: returns a local install token.
+- `POST /service/register`: registers the persistent local service and returns pairing state.
+- `PUT /service/catalog`: synchronizes visible thread routing metadata.
+- `GET /service/events`: installation-level WebSocket delivery for all threads.
+- `GET /service/status`: reports service pairing and active-thread state.
+- `POST /service/events/outbound`: renders and forwards typed service/thread messages.
 - `POST /threads/:threadId`: registers or re-enables a Codex thread.
 - `POST /threads/:threadId/status`: forwards Codex output, progress updates, and generated images to iMessage without storing the outbound content.
 - `GET /threads/:threadId/events`: WebSocket delivery events backed by the relay Durable Object.

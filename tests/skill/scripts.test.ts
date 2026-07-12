@@ -220,16 +220,12 @@ test("imessage-handoff uninstall removes empty Stop groups", () => {
   assert.equal("Stop" in hooksRoot.hooks, false);
 });
 
-test("imessage-handoff install copies the skill without creating relay config or hooks", () => {
+test("imessage-handoff install requires relay config and does not copy the legacy skill", () => {
   const codexHome = mkdtempSync(path.join(os.tmpdir(), "imessage-handoff-codex-home-"));
   const result = runCli(["install", "--codex-home=" + codexHome]);
-  assert.equal(result.status, 0, result.stderr);
-
-  const output = JSON.parse(result.stdout);
-  assert.equal(output.ok, true);
-  assert.equal(output.configured, false);
-  assert.equal(output.hookInstalled, false);
-  assert.equal(existsSync(path.join(codexHome, "skills", "imessage-handoff", "SKILL.md")), true);
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /No existing relay config found/);
+  assert.equal(existsSync(path.join(codexHome, "skills", "imessage-handoff", "SKILL.md")), false);
   assert.equal(existsSync(path.join(codexHome, "skills", "imessage-handoff", ".state", "config.json")), false);
   assert.equal(existsSync(path.join(codexHome, "hooks.json")), false);
 });
