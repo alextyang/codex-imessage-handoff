@@ -1,91 +1,346 @@
-# Persistent iMessage Service Plan
+# Codex iMessage Service
 
-## Status
+## Product and implementation plan
 
-Proposed alternate architecture for `codex-imessage-handoff`.
+This alternate version replaces the skill and per-thread Stop hooks with one
+user-level local service. It preserves the current Cloudflare relay, Sendblue
+account, phone number, webhook, install token, and pairing.
 
-The goal is to replace per-thread Codex Stop hooks with one user-level local
-service while preserving the existing Cloudflare relay, Sendblue account,
-phone number, webhook, install token, and phone pairing.
+The redesign has two equally important goals:
 
-## Product outcome
+1. Any visible, unarchived local Codex thread can be reached from one iMessage
+   conversation without enabling it first.
+2. The conversation feels like a small, coherent Codex client—not a terminal
+   protocol exposed through text messages.
 
-After a one-time local install, a paired iMessage conversation can discover and
-operate all visible, unarchived local Codex threads without invoking a skill in
-each thread. A remote turn starts only when a message arrives and exits when the
-turn finishes. No Codex thread is kept alive waiting for input.
+No additional third-party service, account, credential, webhook, or manual
+provider configuration is required.
 
-The default experience is:
+## Product principles
 
-1. Install and start the local service.
-2. Reuse an existing relay config and phone pairing, or perform the same pairing
-   flow used today.
-3. Text `threads` to list recent Codex threads.
-4. Reply with a number to select one.
-5. Send a prompt. The service resumes that thread, publishes bounded progress,
-   forwards the final response, and returns to an idle service process.
+### The service owns the interface
 
-No additional third-party service, account, webhook, or credential is required.
+Codex should receive the user's actual message, not instructions about how to
+behave over iMessage.
 
-## Why the architecture changes
+The service must not insert:
 
-The current implementation connects a WebSocket from a Stop hook running inside
-each enabled Codex thread. This has three consequences:
+- hook prompts;
+- synthetic system instructions;
+- local display blocks;
+- formatting instructions;
+- progress-update commands;
+- pairing or delivery details; or
+- instructions to repeat or suppress parts of the user's message.
 
-- every remotely reachable thread must be enabled separately;
-- a Codex task remains stopped inside a long-running hook while waiting; and
-- progress is mostly dependent on the model remembering to invoke a helper.
+For a text-only message, the exact inbound text is passed to the selected Codex
+thread through stdin. Images are attached with supported Codex CLI image flags.
+The resulting user turn and assistant answer remain normal, clean Codex history.
 
-The relay already owns pairing, phone-to-thread routing, numeric thread
-selection, Sendblue delivery, media buffering, and status delivery. Those
-contracts can remain. The missing component is an installation-level local
-consumer that can receive work for any thread and launch a finite Codex resume
-process.
+Navigation, typing, progress, context labels, menus, delivery, and errors are
+service behavior. The model is never asked to implement the transport UI.
 
-## Proposed architecture
+### Every outbound message has a clear source
+
+The user must be able to distinguish three message classes immediately:
+
+- **Thread output** — content produced by a specific Codex thread.
+- **Service state** — connection, switching, queueing, cancellation, or errors.
+- **Menus** — choices or short command help that require user input.
+
+The distinction is made by a compact header generated outside the model. No
+emoji, decorative boxes, signatures, or repeated instructional footers are used
+by default.
+
+### Quiet by default
+
+- Use the native typing indicator instead of sending “working” messages for
+  ordinary turns.
+- Show commands only when requested or when the user needs to make a choice.
+- Do not append help text to normal thread responses.
+- Do not announce internal reconnects, catalog syncs, retries, or process IDs.
+- Send progress only for materially long work and only when state has changed.
+- Keep failures actionable and specific.
+
+### Plain-text first
+
+Formatting must remain readable in iMessage and SMS fallback. It cannot depend
+on Markdown rendering, custom fonts, reactions, carousels, or link previews.
+Rich media can enhance a result but cannot be required to understand or control
+the service.
+
+## Conversation language
+
+### Header grammar
+
+Use one consistent first line:
+
+```text
+CODEX · <LABEL>
+```
+
+Labels are short and meaningful:
+
+- a thread title for model output;
+- `THREADS`, `PROJECTS`, or `COMMANDS` for menus;
+- `SWITCHED`, `CONNECTED`, `WORKING`, `QUEUED`, `CANCELLED`, or
+  `NEEDS ATTENTION` for service messages.
+
+Headers are rendered by the relay presentation layer after model execution.
+They are never stored in Codex conversation history.
+
+### Thread output
+
+```text
+CODEX · Music crawler
+
+The scraper now retries failed artist pages and all 42 tests pass.
+```
+
+The assistant body is otherwise unchanged except for transport-safe conversion
+of unsupported Markdown and message-length splitting.
+
+If a response requires multiple bubbles, every continuation is identifiable:
+
+```text
+CODEX · Music crawler · 2/3
+```
+
+### Thread menu
+
+```text
+CODEX · THREADS
+
+1  iMessage service redesign  • current
+2  Music crawler
+3  Portfolio refresh
+4  Research notes
+
+Reply with a number to switch.
+```
+
+The menu is a stable snapshot. Its numbering must not reorder while the user is
+choosing. A snapshot expires after ten minutes; an expired selection returns a
+fresh menu rather than switching to the wrong thread.
+
+Show 8 threads initially. If more exist, end with one relevant note:
+
+```text
+More: /recent or /search words
+```
+
+Do not show raw thread IDs, full filesystem paths, model names, or timestamps
+unless the user explicitly asks for diagnostic information.
+
+### Context switch
+
+```text
+CODEX · SWITCHED
+
+Music crawler
+al-music-crawler
+
+Send a message to continue this thread.
+```
+
+The second line is a short project label only when it disambiguates the thread.
+Switching does not run Codex and does not generate a model response.
+
+If the user sends `2: run the tests` from an active menu, the service switches
+to item 2 and submits `run the tests` in one action. This shortcut is documented
+only in `/help` initially, not in every thread menu.
+
+### Connection and first use
+
+Existing paired users see one migration confirmation:
+
+```text
+CODEX · CONNECTED
+
+iMessage is linked to Codex on Alex’s Mac.
+12 recent threads are available.
+
+Text /threads to choose one.
+```
+
+Fresh installs retain the current six-character pairing flow. After the code is
+accepted, the same `CONNECTED` message is used. Pairing codes, relay URLs,
+tokens, hook details, and setup commands are not mixed into normal conversation.
+
+### Progress
+
+For normal work, send a read receipt and start the native typing indicator. No
+progress bubble is necessary.
+
+For longer work, the service may send:
+
+```text
+CODEX · WORKING
+
+Music crawler
+Running the test suite after updating the retry logic.
+```
+
+Progress policy:
+
+- start typing immediately after a reply is claimed;
+- refresh or stop typing according to Sendblue limits;
+- send no progress bubble during the first 60 seconds;
+- after 60 seconds, send an update only when a safe, observable phase changes;
+- send at most one unsolicited update every two minutes;
+- never expose chain-of-thought, raw shell commands, secrets, URLs containing
+  tokens, or unredacted tool output;
+- `/status` may return the current safe phase immediately;
+- always stop typing on success, failure, cancellation, or process exit.
+
+Progress text is deterministic and generated from structured Codex JSONL event
+categories. It is not authored by a hidden model prompt.
+
+### Queue and busy state
+
+```text
+CODEX · QUEUED
+
+Music crawler is already running in Codex.
+Your message will start when the thread is available.
+```
+
+Only send this when execution cannot begin promptly. Do not claim a relay reply
+until the service can durably lease it. A user can inspect it with `/status` or
+remove it with `/cancel`.
+
+### Cancellation
+
+```text
+CODEX · CANCELLED
+
+Music crawler stopped at your request.
+```
+
+If nothing is running:
+
+```text
+CODEX · NEEDS ATTENTION
+
+There is no active Codex run to cancel.
+```
+
+### Errors
+
+Errors use `NEEDS ATTENTION`, a one-sentence explanation, and one next action.
+
+```text
+CODEX · NEEDS ATTENTION
+
+Music crawler no longer exists on this Mac.
+Text /threads to choose another thread.
+```
+
+Do not expose stack traces, HTTP codes, database terminology, Cloudflare
+details, or child-process output in normal messages. Diagnostics remain local
+and redacted.
+
+### Commands
+
+Commands use a `/` prefix so ordinary messages such as “status” or “threads” can
+still be sent naturally to Codex. Continue accepting the old bare `threads`
+command as a compatibility alias.
+
+Initial commands:
+
+```text
+/threads          recent threads
+/recent           a longer recent-thread list
+/search words     find threads by title or project
+/projects         browse by project
+/status           selected thread, run, and queue state
+/cancel           cancel the service-owned run or queued message
+/help             command summary
+```
+
+`/help` renders:
+
+```text
+CODEX · COMMANDS
+
+/threads       Choose a recent thread
+/search words  Find a thread
+/projects      Browse by project
+/status        Show current activity
+/cancel        Stop current work
+
+In a thread menu, reply with a number to switch.
+You can also send “2: your message” to switch and continue.
+```
+
+Unknown `/commands` show a concise correction and this menu. Unknown ordinary
+text always goes to the selected Codex thread.
+
+## Interaction state machine
+
+```mermaid
+stateDiagram-v2
+    [*] --> Unpaired
+    Unpaired --> Ready: pairing code accepted
+    Ready --> Choosing: /threads, /recent, /search, /projects
+    Choosing --> Ready: valid selection
+    Ready --> Running: ordinary message claimed
+    Running --> Ready: result or failure
+    Running --> Cancelling: /cancel
+    Cancelling --> Ready: process stopped
+    Running --> Running: /status or bounded progress
+```
+
+Important parsing rules:
+
+1. Slash commands are parsed before thread input.
+2. A bare number is a selection only while a valid menu snapshot exists.
+3. `<number>: <message>` is special only while that snapshot exists.
+4. Otherwise, the complete text is passed unchanged to the selected thread.
+5. Service messages never enter Codex history.
+
+## Architecture
 
 ```mermaid
 flowchart LR
     Phone["iMessage / SMS"] --> Sendblue["Existing Sendblue account"]
     Sendblue --> Relay["Existing Cloudflare relay"]
     Relay --> Socket["One installation WebSocket"]
-    Socket --> Daemon["Local handoff service"]
-    Daemon --> Catalog["Read-only Codex thread catalog"]
-    Daemon --> Resume["codex exec resume --json"]
+    Socket --> Service["Local Codex message service"]
+    Service --> Catalog["Read-only Codex thread catalog"]
+    Service --> Resume["Finite codex exec resume --json"]
     Resume --> Thread["Selected Codex thread"]
-    Resume --> Events["Structured progress and final events"]
-    Events --> Relay
-    Relay --> Sendblue
+    Resume --> Events["Structured lifecycle events"]
+    Events --> Service
+    Service --> Relay
 ```
 
 ### Local service
 
-Add a `service/` workspace package written in TypeScript for Node 20+.
+Add a `service/` TypeScript workspace package for Node 20+.
 
 Responsibilities:
 
-- run as a user process, not a Codex skill or hook;
-- read `~/.codex/state_5.sqlite` in read-only mode;
-- synchronize visible, unarchived thread metadata with the relay;
-- maintain one authenticated installation-level WebSocket;
-- claim an inbound reply only when its destination thread can run;
-- download inbound attachments to private local state;
-- launch a finite process in the thread's recorded working directory:
+- run as a user service, never as a Codex skill or hook;
+- read the Codex thread catalog in read-only mode;
+- synchronize visible, unarchived metadata with the relay;
+- maintain one authenticated installation WebSocket;
+- validate and lease inbound work;
+- resolve the destination thread and working directory locally;
+- download bounded image attachments to private local state;
+- pass the exact user text over stdin to:
 
   ```text
   codex exec resume --json --output-last-message <temporary-file> <thread-id> -
   ```
 
-- pass image attachments with repeated `--image` arguments;
-- parse JSONL events for lifecycle and safe progress signals;
-- forward the final assistant response and generated images through the existing
-  thread status endpoint;
-- return to an idle event loop after the child process exits;
-- reconnect with bounded exponential backoff and jitter;
-- never log prompt bodies, assistant bodies, credentials, or media URLs.
+- attach images with repeated supported image arguments;
+- parse lifecycle events without copying private tool output into logs;
+- publish typed progress, completion, cancellation, and failure events;
+- exit each Codex child process after the turn completes; and
+- remain as a small idle event listener between requests.
 
-The service should use a small adapter interface around Codex state and process
-launching so database or CLI changes are isolated:
+The Codex boundary is isolated behind an adapter:
 
 ```ts
 interface CodexAdapter {
@@ -96,74 +351,59 @@ interface CodexAdapter {
 }
 ```
 
-### Service lifecycle
+### Presentation layer
 
-The package CLI should expose:
+Add a shared, pure presentation module consumed by the relay and local service:
 
 ```text
-imessage-handoff service install
-imessage-handoff service start
-imessage-handoff service stop
-imessage-handoff service restart
-imessage-handoff service status
-imessage-handoff service logs
-imessage-handoff service uninstall
+protocol/
+  messages.ts
+  presentation.ts
+  schemas/
 ```
 
-On macOS, `install` creates a user LaunchAgent with `KeepAlive` and no root
-privileges. Linux systemd user units and Windows user services can follow after
-the protocol is stable. A foreground `service run` command supports development
-and environments without a service manager.
+Logical outbound events are typed rather than preformatted strings:
 
-Service state belongs under `~/.codex/imessage-handoff/`, with files created as
-owner-readable only. Existing config at
-`~/.codex/skills/imessage-handoff/.state/config.json` is imported once and then
-left intact for rollback.
+```ts
+type OutboundEvent =
+  | { kind: "thread.output"; thread: ThreadLabel; body: string }
+  | { kind: "thread.progress"; thread: ThreadLabel; phase: SafePhase }
+  | { kind: "service.menu"; menu: MenuSnapshot }
+  | { kind: "service.switched"; thread: ThreadLabel }
+  | { kind: "service.notice"; code: NoticeCode; detail?: string };
+```
 
-## Relay evolution
+The relay renders the final Sendblue payload. This ensures pairing messages,
+menus, progress, and thread output use one grammar. Snapshot tests cover every
+message in both iMessage and SMS-safe form.
 
-The relay remains the only internet-facing component. The existing Sendblue
-webhook URL and all Sendblue secrets remain unchanged.
+Model output is data inside `thread.output`; it can never choose a service
+header or imitate a control message through transport metadata.
 
-### New authenticated routes
+### Relay protocol
 
-Add routes alongside the existing thread routes:
+Keep the existing webhook and thread data plane. Add:
 
 ```text
 POST /service/register
 PUT  /service/catalog
-GET  /service/events                 (WebSocket)
+GET  /service/events                 WebSocket
 GET  /service/status
+POST /service/events/outbound
 ```
 
-All routes use the existing bearer install token. The owner ID continues to be
-derived from that token; it is not supplied by the client.
+All routes use the existing bearer install token.
 
-`POST /service/register`:
+- `register` advertises client capabilities and returns pairing state.
+- `catalog` synchronizes bounded thread and project labels without conversation
+  content, previews, full paths, or git remotes.
+- `events` emits IDs and routing metadata, not prompt bodies.
+- existing authenticated claim endpoints return prompt/media only when the
+  service is ready to run them.
+- `events/outbound` accepts typed presentation events and applies rate limits,
+  authorization, formatting, splitting, and Sendblue delivery.
 
-- advertises service version and protocol capabilities;
-- marks this installation as service-delivered;
-- returns pairing state and, when necessary, a pairing code;
-- does not require a thread to be running.
-
-`PUT /service/catalog`:
-
-- accepts bounded batches of thread ID, title, project label, timestamps, and
-  archived/visible state;
-- is idempotent and versioned;
-- never accepts conversation history or message content;
-- prunes catalog rows not seen after a retention window;
-- does not change the selected thread merely because metadata was refreshed.
-
-`GET /service/events`:
-
-- upgrades to one WebSocket per local installation;
-- emits `{ type: "reply-pending", threadId, replyId }`;
-- sends catalog refresh requests and health pings;
-- does not carry prompt content. Prompt and media are returned only by the
-  authenticated claim endpoint.
-
-The existing routes remain the execution data plane:
+Retain these existing execution routes during migration:
 
 ```text
 POST /threads/:threadId/replies/:replyId/claim
@@ -172,171 +412,106 @@ GET  /threads/:threadId
 POST /threads/:threadId/stop
 ```
 
-This minimizes relay and self-host migration risk.
+### Relay state
 
-### Durable Object changes
+Extend the Durable Object with owner-level subscribers. Notify one installation
+socket when a reply is buffered for any thread. Existing thread sockets remain
+only as a temporary compatibility path.
 
-Extend `HandoffSocket` to maintain owner-level subscribers in addition to the
-legacy per-thread subscribers. When an inbound reply is buffered, notify the
-connected owner service first. Legacy thread sockets remain supported when the
-owner has not opted into service delivery.
+Inbound message bodies stay in the in-memory reply buffer until claimed, then
+are scrubbed. D1 stores routing and presentation metadata only.
 
-Only IDs and routing metadata cross the WebSocket. Inbound message bodies remain
-in the existing in-memory reply buffer until claimed and are scrubbed after
-claim, preserving the current data-minimization model.
+Add metadata tables for service installations, installation-level pairing, and
+stable menu snapshots. Extend thread rows with catalog visibility, project
+label, and last-seen timestamps. Preserve existing phone bindings so paired
+users do not re-pair.
 
-### D1 migration
+## Thread discovery
 
-Add metadata-only tables/columns:
+Default scope is all visible, unarchived local Codex threads. No opt-in per
+thread is required.
 
-```sql
-CREATE TABLE service_installations (
-  owner_id TEXT PRIMARY KEY,
-  delivery_mode TEXT NOT NULL DEFAULT 'service',
-  client_id TEXT NOT NULL,
-  service_version TEXT NOT NULL,
-  capabilities TEXT NOT NULL,
-  last_seen_at TEXT NOT NULL,
-  created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL
-);
+Catalog rules:
 
-CREATE TABLE installation_pairings (
-  owner_id TEXT PRIMARY KEY,
-  pairing_code TEXT UNIQUE,
-  pairing_code_expires_at TEXT,
-  created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL
-);
-```
+- synchronize title, short project label, created/updated time, visibility, and
+  archived state;
+- keep full paths and conversation previews local;
+- show the most recently active threads first;
+- group duplicate titles by project label;
+- exclude empty placeholder sessions;
+- remove deleted threads after a short grace period;
+- support at least the 100 most recent threads initially;
+- paginate and search locally before returning compact menus.
 
-Extend `handoff_threads` with catalog metadata such as `catalog_source`,
-`archived`, `visible`, and `last_seen_at`. Keep existing columns and indexes so
-old hooks and current deployments continue to function.
+Selecting a thread updates the existing phone binding's active thread. Catalog
+refreshes never change selection.
 
-The current hosted limit of 25 enabled handoff threads should become a catalog
-policy rather than a hard execution limit. The initial service can synchronize
-the 100 most recent visible threads, with pagination/search added before lifting
-that limit further.
+## Execution and concurrency
 
-## Pairing and migration compatibility
+- One active remote turn per thread.
+- One active Codex child process per installation by default.
+- Messages remain queued in the relay until leased.
+- Service-owned locks prevent duplicate local execution.
+- Codex lock/conflict exits are classified as busy, not model failures.
+- A local desktop turn always takes precedence; remote work waits rather than
+  launching a competing turn.
+- `/cancel` terminates only the service-owned child process and never archives,
+  deletes, or rewrites a thread.
+- Relay event IDs and Sendblue external IDs provide idempotency across retries.
 
-Existing users should not reconfigure Sendblue or Cloudflare.
+If Codex later provides a supported local task API, implement it as a preferred
+adapter while retaining CLI fallback.
 
-1. The service imports the existing relay URL and install token.
-2. The relay recognizes the same owner ID and existing `phone_bindings` row.
-3. Existing phone pairing remains valid.
-4. Service registration switches that owner to `delivery_mode = 'service'`.
-5. The installer removes only the iMessage Handoff Stop hook after the service
-   is healthy and the owner WebSocket has connected.
-6. Legacy hook endpoints remain available for rollback and older clients.
+## Installation and migration
 
-For a fresh install, installation-level pairing replaces thread-bound pairing.
-The user still texts one six-character code to the same Sendblue number. No new
-provider setup is introduced.
-
-Self-hosted operators only pull the new code, apply the included D1 migration,
-and deploy. Their D1 database, Worker domain, Sendblue secrets, webhook URL, and
-phone number do not change.
-
-## Thread discovery and control
-
-Default catalog scope is all visible, unarchived local Codex threads. This meets
-the all-threads product goal without exposing archived or placeholder sessions.
-
-The relay continues to support:
+The CLI becomes service-oriented:
 
 ```text
-threads
-<number>
+imessage-handoff service install
+imessage-handoff service start
+imessage-handoff service stop
+imessage-handoff service status
+imessage-handoff service pause
+imessage-handoff service uninstall
 ```
 
-Add commands after the basic service is stable:
+On macOS, `install` creates a user LaunchAgent with no root privileges. A
+foreground `service run` command supports development.
 
-```text
-recent
-projects
-search <words>
-thread <number>: <prompt>
-status
-cancel
-```
+Upgrade flow:
 
-Thread titles and a short project label may be synchronized. Full local paths,
-prompts, conversation previews, and git remotes should stay local by default.
-The current relay `cwd` field can receive the project label for service-managed
-catalog rows while legacy registrations preserve their existing behavior.
+1. Import the existing relay URL and install token.
+2. Confirm the existing phone binding and pairing.
+3. Start the service and establish its owner-level WebSocket.
+4. Synchronize the initial thread catalog.
+5. Switch the owner to service delivery.
+6. Remove the old iMessage Handoff Stop hook.
+7. Remove hook-specific active-thread state and helper prompting scripts after
+   the rollback window.
 
-Optional local policy can exclude roots or individual threads, but no policy
-configuration is required for the default all-visible-threads behavior.
+Do not keep a permanent dual-delivery design. A short migration window may
+retain legacy endpoints, but the target installation contains no Stop hook,
+`publish-stop.js`, `send-update.js`, active-hook state, or skill instructions.
 
-## Execution, concurrency, and cancellation
-
-### Queue semantics
-
-- One active remote turn per Codex thread.
-- Default maximum of one active Codex child process per installation; make this
-  locally configurable later.
-- Do not claim a reply until the service can start or durably lease the work.
-- Additional messages for a running thread remain queued in the Durable Object.
-- Messages for another thread may remain queued or run concurrently according
-  to the local concurrency limit.
-- Deduplicate Sendblue retries by external message ID as today.
-
-### Local/remote collision
-
-Before resuming, check service-owned locks and the Codex process result. If Codex
-reports that a thread is already running or locked, leave the remote reply
-pending and send a bounded `thread busy; queued` control message. Never launch a
-second turn blindly.
-
-The service cannot initially guarantee coordination with every future Codex app
-execution path. The Codex adapter must classify lock/conflict exits separately
-from model or tool failures, and the integration test matrix must include a
-thread active in the desktop app. If Codex exposes a supported local task API in
-the future, add it as a preferred adapter while retaining CLI fallback.
-
-### Cancellation
-
-`cancel` first sends a graceful termination signal to the child process, waits a
-short bounded interval, then force-terminates only that service-owned process.
-It publishes a cancellation result and does not modify or archive the thread.
-
-## Progress updates
-
-Structured `codex exec --json` output allows progress to be service-driven
-instead of prompt-driven.
-
-Initial policy:
-
-- immediately send a typing indicator when a reply is claimed;
-- send a short `Started work in <thread>` message only when startup is slow;
-- publish at most one progress message every 90 seconds;
-- summarize only observable lifecycle events such as tool category, test phase,
-  retry, or completion count;
-- never expose chain-of-thought, raw commands containing secrets, environment
-  values, or unredacted tool output;
-- always send the final assistant message through the existing status endpoint;
-- stop the typing indicator on completion, failure, or cancellation.
-
-Progress formatting should be deterministic and tested. Model-generated
-`send-update.js` calls remain supported only for legacy hook clients.
+Self-hosted users apply the included D1 migration and deploy the updated Worker.
+Their database, domain, Sendblue credentials, webhook URL, number, install token,
+and phone pairing remain unchanged.
 
 ## Security and privacy
 
-- Preserve the current install-token authentication and webhook signature.
-- Store tokens and downloaded media with owner-only filesystem permissions.
-- Validate that every requested thread exists in the local read-only catalog.
-- Derive `cwd` locally; never trust a relay-supplied working directory.
-- Pass prompts through stdin, not process arguments.
-- Restrict media downloads by size, count, protocol, and content type.
-- Redact secrets and prompt/response content from service logs.
-- Use bounded queues, catalog sizes, payloads, and reconnection rates.
-- Do not provide a remote command that changes model, reasoning, sandbox, or
-  approval policy in the first release.
-- Preserve the thread's normal Codex configuration and project rules.
-- Provide `service pause` and `service revoke` locally; token reset continues to
-  revoke the paired phone.
+- Preserve install-token authentication and the Sendblue webhook secret.
+- Store tokens, locks, temporary results, and media with owner-only permissions.
+- Validate thread IDs against the local read-only catalog.
+- Derive working directories locally, never from an inbound relay message.
+- Pass user text through stdin, never process arguments.
+- Bound media size, count, type, and download time.
+- Never log prompt bodies, assistant bodies, tokens, media URLs, or raw JSONL
+  tool payloads.
+- Rate-limit control messages and progress independently from final results.
+- Do not expose remote controls for model, reasoning, sandbox, approval mode,
+  project rules, task deletion, or task archival in the first release.
+- Preserve each thread's normal Codex configuration.
+- Support local pause, token reset, phone revocation, uninstall, and rollback.
 
 ## Repository shape
 
@@ -349,7 +524,6 @@ service/
       state-store.ts
     relay/
       client.ts
-      protocol.ts
     runner/
       queue.ts
       progress.ts
@@ -360,128 +534,128 @@ service/
     cli.ts
     daemon.ts
   tests/
+protocol/
+  messages.ts
+  presentation.ts
+  schemas/
 relay/
   src/
     worker.ts
     db/migrations/0005_service_installations.sql
-protocol/
-  service-events.schema.json
-  service-register.schema.json
 ```
-
-Keep protocol types in a small shared workspace package or generated JSON Schema
-so the Worker and Node service validate the same messages without pulling Node
-dependencies into the Worker bundle.
 
 ## Implementation phases
 
-### Phase 0: contract tests and fixtures
+### Phase 0: interaction contract
 
-- Capture current register, pairing, thread switch, reply claim, media, status,
-  and Stop-hook behavior as compatibility tests.
-- Add sanitized Codex JSONL fixtures for success, tool use, generated images,
-  cancellation, lock conflict, and failure.
-- Add a temporary test-only service token and mock WebSocket harness.
+- Implement pure renderers for every message class in this document.
+- Add golden transcript tests for pairing, menus, switching, ordinary replies,
+  long replies, progress, queueing, cancellation, and errors.
+- Add parsing tests proving ordinary user text is never mistaken for a command
+  outside a valid menu state.
+- Add a test proving the exact inbound user body—not a wrapped prompt—reaches
+  the Codex adapter.
 
-Exit criterion: current skill and relay tests remain green with no behavior
-changes.
+Exit criterion: the full conversation can be reviewed from fixtures without a
+live relay or model.
 
-### Phase 1: local foreground prototype
+### Phase 1: local foreground service
 
-- Implement read-only thread discovery.
-- Implement `codex exec resume --json` adapter and final response extraction.
-- Run a foreground service against a mocked relay.
-- Add per-thread queueing, locks, attachment handling, and log redaction.
+- Implement read-only catalog discovery.
+- Implement finite `codex exec resume --json` execution.
+- Implement leases, locks, attachments, cancellation, and redacted logs.
+- Map stable JSONL lifecycle events to safe progress phases.
+- Run against a mocked installation event stream.
 
-Exit criterion: a mocked inbound event resumes an existing thread, captures its
-final response, and exits the child process.
+Exit criterion: a mocked iMessage event creates one clean Codex user turn, one
+normal assistant turn, and one formatted outbound thread response.
 
-### Phase 2: owner-level relay protocol
+### Phase 2: installation-level relay
 
-- Add D1 migration and service registration/catalog routes.
-- Add installation pairing while preserving thread pairing.
-- Extend the Durable Object with owner subscribers and fallback delivery.
-- Reuse current claim and status endpoints.
-- Add catalog-backed `threads` and numeric switching.
+- Add service registration, catalog sync, pairing, owner WebSocket, menu
+  snapshots, typed outbound events, and presentation rendering.
+- Reuse existing claim, phone binding, Sendblue webhook, and status delivery.
+- Add thread menu/search/project commands and deterministic selection parsing.
 
-Exit criterion: legacy hook tests and new service protocol tests both pass.
+Exit criterion: one connection routes messages to multiple threads and every
+outbound bubble matches a golden presentation fixture.
 
-### Phase 3: end-to-end service
+### Phase 3: end-to-end behavior
 
-- Connect the local service to the owner WebSocket.
-- Implement catalog synchronization and pairing import.
-- Implement safe progress policies, typing, final responses, and media.
-- Test offline reconnect, duplicate webhook events, and queued replies.
+- Connect the real local service and relay.
+- Implement read receipts, typing lifecycle, bounded progress, final output,
+  images, cancellation, offline recovery, and deduplication.
+- Test desktop/local collision and queued remote work.
 
-Exit criterion: one service can operate multiple threads sequentially without
-any Stop hook installed.
+Exit criterion: multiple threads can be used sequentially without a hook, and
+short tasks produce only typing plus the final response.
 
-### Phase 4: installer and migration
+### Phase 4: installer and clean migration
 
-- Add macOS LaunchAgent install/status/uninstall commands.
-- Import existing config and verify relay health before changing delivery mode.
-- Remove the legacy Stop hook only after a successful service heartbeat.
-- Add rollback that stops the service and restores legacy delivery if requested.
-- Update hosted and self-hosted documentation.
+- Add LaunchAgent install/status/pause/uninstall commands.
+- Import current config and pairing automatically.
+- Remove the Stop hook only after service health is confirmed.
+- Remove hook prompts and helper scripts from the target install.
+- Document rollback without making legacy behavior part of the new UX.
 
-Exit criterion: an existing paired installation upgrades without Cloudflare or
-Sendblue configuration and without re-pairing.
+Exit criterion: an existing paired installation upgrades without Sendblue or
+Cloudflare configuration and without re-pairing.
 
-### Phase 5: hardening and release
+### Phase 5: hardening
 
-- Soak-test daemon reconnect and process cleanup.
-- Add resource and abuse limits.
-- Test Codex upgrades and schema drift with adapter compatibility checks.
-- Add signed/notarized packaging only if distribution requirements justify it;
-  npm plus LaunchAgent is sufficient for the initial release.
-
-Exit criterion: 24-hour idle soak, multi-thread routing, restart recovery, and
-rollback tests pass.
+- Run 24-hour idle and reconnect tests.
+- Validate resource and abuse limits.
+- Test Codex schema/CLI drift through the adapter boundary.
+- Review every user-facing string and golden transcript for clarity and noise.
 
 ## Test matrix
 
-Required automated coverage:
-
-- existing paired and fresh pairing flows;
-- hosted and self-hosted relay configs;
-- 1, 25, and 100 catalog threads;
-- numeric switching and active-thread persistence;
-- text, multiline text, image, and grouped-media inputs;
-- final text and generated-image outputs;
-- Codex success, failure, cancellation, and process crash;
-- service restart before claim and after claim;
-- relay disconnect and WebSocket replay/deduplication;
-- simultaneous messages to one thread and different threads;
-- desktop-local activity colliding with a remote request;
-- archived/deleted/moved threads;
-- missing working directory;
-- token reset and revoked phone;
-- upgrade from legacy hook mode and rollback to it;
-- logs checked for prompt, response, token, and media-URL leakage.
+- Fresh pairing and existing paired migration.
+- Hosted and self-hosted relay configurations.
+- 1, 8, 25, and 100 catalog threads.
+- Duplicate titles across projects.
+- Stable menu snapshots and expired selections.
+- Slash commands versus identical ordinary words sent to Codex.
+- Raw multiline text with no synthetic prompt wrapper.
+- Text, image, grouped image, final text, and generated images.
+- Short task with typing only.
+- Long task with deterministic bounded progress.
+- Success, model failure, tool failure, cancellation, and process crash.
+- Service restart before lease, after lease, and after Codex completion.
+- Duplicate webhook delivery and WebSocket reconnect.
+- Same-thread and cross-thread queues.
+- Desktop-local activity colliding with a remote request.
+- Archived, deleted, moved, and missing-directory threads.
+- Token reset, phone revocation, pause, uninstall, and rollback.
+- SMS-safe formatting and long-message splitting.
+- Logs checked for prompt, response, token, media URL, and raw tool leakage.
 
 ## Early technical spikes
 
-Resolve these before broad implementation:
-
 1. Verify `codex exec resume --json <thread-id> -` updates a desktop-created
-   thread consistently and identify its lock/conflict exit behavior.
-2. Enumerate stable JSONL event types and determine which can safely drive
-   deterministic progress messages.
-3. Verify generated-image paths are available through JSONL or the updated
-   rollout log without scanning unrelated session files.
-4. Test how a desktop-local turn behaves while a service-owned resume is active.
-5. Confirm LaunchAgent environment requirements for Codex auth, PATH, and
-   `CODEX_HOME` without copying credentials.
+   thread and document lock/conflict behavior.
+2. Confirm which JSONL lifecycle events are stable enough for deterministic
+   progress without exposing reasoning or sensitive tool data.
+3. Verify generated-image discovery without scanning unrelated session files.
+4. Test desktop-local turns while a service-owned resume is running.
+5. Validate LaunchAgent PATH, Codex authentication, and `CODEX_HOME` inheritance
+   without copying credentials.
+6. Confirm Sendblue typing refresh/stop behavior and SMS fallback rendering.
 
 ## Definition of done
 
-- No iMessage Handoff Stop hook is installed or required.
-- No Codex task waits indefinitely for iMessage input.
+- No skill, Stop hook, synthetic hook prompt, display block, or model-authored
+  progress helper is required.
+- No Codex thread waits for iMessage input.
 - One local service exposes all visible, unarchived threads by default.
 - Existing Sendblue and Cloudflare configuration works unchanged.
 - Existing install token and phone pairing migrate without re-pairing.
-- `threads` and numeric switching work across projects.
-- Remote prompts resume the selected thread and preserve its normal context.
-- Progress and final results are delivered without model-authored update calls.
-- Legacy hook clients remain compatible during the migration window.
-- Installation, pause, restart, revocation, uninstall, and rollback are tested.
+- Thread menus, project browsing, search, switching, and commands are concise
+  and visually consistent.
+- Every model response is labeled with its source thread outside Codex history.
+- Every service message is visibly distinct from model output.
+- Short tasks use native typing and a final response without extra chatter.
+- Long tasks receive safe, deterministic, rate-limited progress.
+- The exact user message reaches Codex without transport instructions.
+- Installation, pause, cancellation, revocation, uninstall, and rollback are
+  tested.
