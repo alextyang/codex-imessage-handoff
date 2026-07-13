@@ -927,6 +927,7 @@ test("watch failures resubscribe once with backoff and stopping cancels recovery
   firstHandlers.onError(new Error("bridge exited"));
   firstHandlers.onError(new Error("duplicate failure callback"));
   assert.equal(transport.isHealthy(), false);
+  assert.equal(transport.watchRetryTimer?.hasRef?.(), true, "watch recovery must keep the daemon alive");
   await new Promise((resolve) => setTimeout(resolve, 35));
   assert.equal(client.calls.filter(([kind]) => kind === "watch").length, 2, JSON.stringify(client.calls));
   assert.equal(errors.length, 1);

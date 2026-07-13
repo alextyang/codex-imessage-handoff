@@ -40,6 +40,32 @@ function dedicatedHelperUser() {
 
 async function inspectConfiguredHelper(profile) {
   const runtime = serviceStatus();
+  const liveServiceProof = runtime.jobRunning === true
+    && runtime.running === true
+    && runtime.readiness?.pidMatches === true
+    && runtime.readiness?.fresh === true
+    && runtime.readiness?.healthHealthy === true
+    && runtime.readiness?.health?.activeWatch === true
+    && runtime.readiness?.health?.mode === "helper";
+  if (liveServiceProof) {
+    // The helper permits exactly one authenticated controller. A ready daemon
+    // has already authenticated the pinned profile, required every advanced
+    // capability, and established the live watch, so a second diagnostic
+    // connection would only contend with the service it is trying to verify.
+    return {
+      serviceRunning: true,
+      serviceReady: true,
+      activeWatch: true,
+      helperAuthenticated: true,
+      bridgeAvailable: true,
+      watchReady: true,
+      richText: true,
+      replies: true,
+      polls: true,
+      chatAccess: true,
+      verification: "active-service",
+    };
+  }
   const client = createImsgIpcClientFromConfig(profile.clientConfig);
   try {
     await client.connect();
@@ -65,6 +91,7 @@ async function inspectConfiguredHelper(profile) {
       replies: status.capabilities?.replies === true,
       polls: status.capabilities?.polls === true,
       chatAccess: true,
+      verification: "direct-helper",
     };
     if (!inspected.bridgeAvailable || !inspected.watchReady || !inspected.richText || !inspected.replies || !inspected.polls) {
       throw new Error("The local Messages helper is authenticated but its full bridge capabilities are unavailable.");

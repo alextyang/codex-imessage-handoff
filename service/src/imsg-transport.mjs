@@ -471,7 +471,9 @@ export class ImsgTransport {
         this._scheduleWatchRecovery();
       }
     }, delay);
-    this.watchRetryTimer.unref?.();
+    // Keep the daemon alive while its only external socket is unavailable.
+    // If this timer is unreferenced, a helper restart can close the IPC socket,
+    // leave no referenced handles, and let Node exit before recovery runs.
   }
 
   async _recoverWatch() {

@@ -167,7 +167,7 @@ export function renderLaunchAgent(paths, codexBin = resolveCodexBinary(), option
 <key>PATH</key><string>${xml(pathValue)}</string>
 </dict>
 <key>RunAtLoad</key><true/><key>KeepAlive</key><true/>
-<key>ThrottleInterval</key><integer>60</integer>
+<key>ThrottleInterval</key><integer>10</integer>
 <key>StandardOutPath</key><string>${xml(paths.stdoutLog)}</string>
 <key>StandardErrorPath</key><string>${xml(paths.stderrLog)}</string>
 </dict></plist>

@@ -92,6 +92,7 @@ test("LaunchAgent pins an executable Codex binary and the shared app-server back
   assert.match(plist, new RegExp(`<key>CODEX_BIN</key><string>${codex}</string>`));
   assert.match(plist, /<key>IMESSAGE_HANDOFF_CODEX_BACKEND<\/key><string>app-server<\/string>/);
   assert.match(plist, /<key>PATH<\/key><string>[^<]*\/usr\/bin/);
+  assert.match(plist, /<key>ThrottleInterval<\/key><integer>10<\/integer>/);
 });
 
 test("LaunchAgent can require the shared app-server backend without configuring Desktop in the child", () => {
@@ -124,6 +125,7 @@ test("shared backend LaunchAgent supervises one foreground owner without enablin
   assert.match(plist, /shared-backend-supervisor\.mjs/);
   assert.match(plist, /<key>RunAtLoad<\/key><true\/>/);
   assert.match(plist, /<key>KeepAlive<\/key><true\/>/);
+  assert.match(plist, /<key>ThrottleInterval<\/key><integer>60<\/integer>/);
   assert.match(plist, new RegExp(`<key>CODEX_BIN</key><string>${codex}</string>`));
   assert.match(plist, /<key>CODEX_APP_SERVER_USE_LOCAL_DAEMON<\/key><string>0<\/string>/);
   assert.match(plist, new RegExp(`<key>IMESSAGE_HANDOFF_SUPERVISOR_BUILD_FINGERPRINT</key><string>${sharedBackendSupervisorBuildFingerprint()}</string>`));
