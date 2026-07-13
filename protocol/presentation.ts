@@ -385,7 +385,7 @@ export function renderThreadMenu(items: MenuItem[], options: { label?: "THREADS"
 export function renderHelp(_options: PresentationOptions = {}) {
   return [
     "**Browse**\n/threads · Tasks by project\n/refresh · Refresh the task list\n/search (query) · Find a task\n/projects · Browse all projects",
-    "**Active task**\n/thread · Status and latest response\n/turn · Show current or last turn\n/history (length) · Completed turn history\n/reasoning (level/none) · View or change reasoning\n/cancel · Stop iMessage-started work in current thread",
+    "**Task commands**\n/thread · Status and latest response\n/turn · Show current or last turn\n/history (length) · Completed turn history\n/reasoning (level/none) · View or change reasoning\n/listen · Stream the next turn’s live updates\n/link · Show the Codex task link\n/mute · Pause automatic updates\n/unmute · Resume automatic updates\n/cancel · Stop iMessage-started work in this task\n/retry · Retry failed iMessage-started work\n/dismiss · Remove failed work from the queue",
   ].join("\n\n");
 }
 
@@ -451,9 +451,13 @@ export function renderOutboundMessages(event: OutboundEvent, options: Presentati
     if (event.reason === "fork") messages.push(openedMessage(event.thread));
     if (event.reason === "status") messages.push(statusSummary(event));
     const preview = typeof event.requestPreview === "string" ? event.requestPreview : event.requestPreview?.body;
-    if (preview && !/^No user request was found/i.test(preview)) messages.push(`👤 ${safeBody(preview)}`);
+    if (preview && !/^No user request was found/i.test(preview)) {
+      const truncated = typeof event.requestPreview === "object" && event.requestPreview?.truncated;
+      messages.push(`👤 ${safeBody(preview)}${truncated ? "\n\nRequest shortened · /request shows it in full." : ""}`);
+    }
     const assistant = (event.assistantMessages ?? []).map((message) => safeBody(message.body)).filter(Boolean);
     if (assistant.length > 0) messages.push(assistant.join("\n\n"));
+    if (event.historyTruncated) messages.push("Older task context wasn’t loaded · /turn or /history 5");
     if (messages.length === 0) messages.push("No response yet.");
     if (!sameThread(event.thread, activeThread) && event.reason !== "status") {
       messages[0] = scopedBody(event.thread, messages[0], activeThread);
@@ -485,7 +489,8 @@ export function renderOutboundEvent(event: OutboundEvent, options: PresentationO
   }
   if (event.kind === "thread.history") {
     const blocks = event.turns.flatMap(turnBlocks);
-    const body = blocks.length ? blocks.join("\n\n\n") : "No completed turns found.";
+    let body = blocks.length ? blocks.join("\n\n\n") : "No completed turns found.";
+    if (event.hasMore) body += "\n\n\nEarlier completed turns exist · /history 5 shows the newest five.";
     return `${part}${scopedBody(event.thread, body, activeThread)}`;
   }
   if (event.kind === "service.reasoning") {
@@ -504,7 +509,7 @@ export function renderOutboundEvent(event: OutboundEvent, options: PresentationO
     }
     const rows = optionsList.map((option) => {
       const name = reasoningName(option.value);
-      return `${option.selected ? "●" : "○"} ${name}`;
+      return `${option.selected ? "●" : "○"} ${name}${option.selected ? " · selected" : ""}`;
     });
     body = `**Reasoning**\n${rows.join("\n")}\n\n/reasoning (level/none)`;
     return `${part}${scopedBody(event.thread, body, activeThread)}`;
@@ -535,6 +540,6 @@ export function parseMenuSelection(value: string) {
 
 export function parseSlashCommand(value: string) {
   const text = value.trim();
-  const match = text.match(/^\/(threads|recent|refresh|projects|search|thread|request|message|turn|history|reasoning|status|retry|dismiss|cancel|help)(?:\s+([\s\S]+))?$/i);
+  const match = text.match(/^\/(threads|recent|refresh|projects|search|thread|request|message|turn|history|reasoning|listen|link|mute|unmute|status|retry|dismiss|cancel|help)(?:\s+([\s\S]+))?$/i);
   return match ? { command: match[1].toLowerCase(), argument: match[2]?.trim() || null } : null;
 }

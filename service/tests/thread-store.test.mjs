@@ -4,7 +4,7 @@ import { execFileSync } from "node:child_process";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { findThread, listThreads, projectKey, projectLabel } from "../src/thread-store.mjs";
+import { findThread, listThreads, projectKey, projectLabel, threadStoreInternals } from "../src/thread-store.mjs";
 
 function sql(value) {
   if (value === null || value === undefined) return "NULL";
@@ -20,6 +20,38 @@ function history(turnId, state) {
   if (state === "idle") rows.push({ timestamp: "2026-07-12T03:00:01.000Z", type: "event_msg", payload: { type: "task_complete", turn_id: turnId, completed_at: 1_783_824_401_000, last_agent_message: "Fixture response" } });
   return `${rows.map((row) => JSON.stringify(row)).join("\n")}\n`;
 }
+
+test("SQLite catalog reads wait and retry bounded transient lock/open failures", async () => {
+  const calls = [];
+  const waits = [];
+  const execute = async (_binary, args) => {
+    calls.push(args);
+    if (calls.length < 3) {
+      const error = new Error(calls.length === 1 ? "database is locked" : "unable to open database file");
+      error.stderr = calls.length === 1 ? "SQLITE_BUSY" : "SQLITE_CANTOPEN";
+      throw error;
+    }
+    return { stdout: '[{"id":"ok"}]' };
+  };
+  const result = await threadStoreInternals.queryWithRetry("/tmp/state.sqlite", "SELECT 1", {
+    execute,
+    wait: async (milliseconds) => { waits.push(milliseconds); },
+  });
+  assert.deepEqual(result, [{ id: "ok" }]);
+  assert.deepEqual(waits, [50, 100]);
+  assert.equal(calls.length, 3);
+  assert.deepEqual(calls[0].slice(0, 4), ["-readonly", "-json", "-cmd", `.timeout ${threadStoreInternals.sqliteBusyTimeoutMs}`]);
+
+  let permanentCalls = 0;
+  await assert.rejects(
+    threadStoreInternals.queryWithRetry("/tmp/state.sqlite", "SELECT 1", {
+      execute: async () => { permanentCalls += 1; throw new Error("syntax error"); },
+      wait: async () => { throw new Error("must not wait"); },
+    }),
+    /syntax error/,
+  );
+  assert.equal(permanentCalls, 1);
+});
 
 test("catalog excludes subagents, groups projects, carries state, and finds IDs beyond a menu limit", async () => {
   const directory = mkdtempSync(path.join(os.tmpdir(), "imessage-thread-store-"));

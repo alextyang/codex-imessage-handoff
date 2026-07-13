@@ -3,7 +3,7 @@ import { writePrivateJson } from "./config.mjs";
 import { servicePaths } from "./paths.mjs";
 
 function emptyStore() {
-  return { version: 1, jobs: Object.create(null) };
+  return { version: 2, jobs: Object.create(null) };
 }
 
 function readStore() {
@@ -15,7 +15,7 @@ function readStore() {
   } catch (error) {
     throw Object.assign(new Error("Claimed-run state could not be read safely.", { cause: error }), { code: "INVALID_RUN_STATE" });
   }
-  if (!value || value.version !== 1 || !value.jobs || typeof value.jobs !== "object" || Array.isArray(value.jobs)) {
+  if (!value || value.version !== 2 || !value.jobs || typeof value.jobs !== "object" || Array.isArray(value.jobs)) {
     throw Object.assign(new Error("Claimed-run state has an unsupported format."), { code: "INVALID_RUN_STATE" });
   }
   return value;
@@ -50,10 +50,18 @@ export function saveClaimedJob(event, state = "queued") {
     claimed: event.claimed,
     delivery: event.delivery || null,
     busyNoticeSent: Boolean(event.busyNoticeSent),
+    backendNoticeSent: Boolean(event.backendNoticeSent),
+    imsgGuid: typeof event.imsgGuid === "string" && event.imsgGuid.length <= 256
+      ? event.imsgGuid
+      : null,
     mirrorSuppressionToken: typeof event.mirrorSuppressionToken === "string"
       ? event.mirrorSuppressionToken
       : null,
     retryOf: event.retryOf || null,
+    reconcileRunning: Boolean(event.reconcileRunning),
+    recoveredTurnId: typeof event.recoveredTurnId === "string" && event.recoveredTurnId.length <= 256
+      ? event.recoveredTurnId
+      : null,
     state,
     updatedAt: new Date().toISOString(),
   };
@@ -78,6 +86,20 @@ export function removeClaimedJob(id) {
   delete store.jobs[key];
   writeStore(store);
   return existed;
+}
+
+export function removeClaimedJobs(ids) {
+  if (!Array.isArray(ids)) throw new TypeError("Claimed-run ids must be an array.");
+  const keys = [...new Set(ids.map(replyId))];
+  const store = readStore();
+  let removed = 0;
+  for (const key of keys) {
+    if (!store.jobs[key]) continue;
+    delete store.jobs[key];
+    removed += 1;
+  }
+  if (removed) writeStore(store);
+  return removed;
 }
 
 export function loadClaimedJobs() {

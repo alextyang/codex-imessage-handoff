@@ -1,0 +1,308 @@
+import assert from "node:assert/strict";
+import { EventEmitter } from "node:events";
+import { PassThrough, Writable } from "node:stream";
+import test from "node:test";
+import { ImsgClient } from "../src/imsg-client.mjs";
+
+const fullStatus = {
+  version: "0.13.0",
+  basic_features: true,
+  advanced_features: true,
+  typing_indicators: true,
+  read_receipts: true,
+  sip: "disabled",
+  bridge_version: 2,
+  v2_ready: true,
+  selectors: {
+    urlPreviewMessage: true,
+    sendRichLinkAction: true,
+    pollPayloadMessage: true,
+    pollVoteMessage: true,
+    editMessage: true,
+    retractMessagePart: true,
+  },
+  rpc_methods: [
+    "chats.list",
+    "watch.subscribe",
+    "watch.unsubscribe",
+    "send.rich",
+    "send.attachment",
+    "poll.send",
+    "poll.vote",
+    "poll.unvote",
+    "tapback",
+    "typing",
+    "read",
+    "message.send_status",
+    "message.edit",
+    "message.unsend",
+  ],
+};
+
+function execFixture(status = fullStatus, options = {}) {
+  const calls = [];
+  const implementation = (file, args, _execOptions, callback) => {
+    calls.push({ file, args });
+    queueMicrotask(() => {
+      if (args[0] === "--version") callback(null, "imsg 0.13.0\n", "");
+      else if (args[0] === "status") callback(null, `${JSON.stringify(status)}\n`, "");
+      else if (args[0] === "history" && options.history !== undefined) {
+        const rows = Array.isArray(options.history) ? options.history : options.history ? [options.history] : [];
+        callback(null, rows.map((row) => JSON.stringify(row)).join("\n") + (rows.length ? "\n" : ""), "");
+      }
+      else if (args[0] === "send" && options.cliSend !== false) callback(null, `${JSON.stringify({ status: "sent", guid: "CLI-GUID" })}\n`, "");
+      else callback(Object.assign(new Error("failed"), { code: options.errorCode || 1 }), "", "sensitive diagnostic");
+    });
+  };
+  return { calls, implementation };
+}
+
+class FakeChild extends EventEmitter {
+  constructor(onRequest = () => {}) {
+    super();
+    this.stdout = new PassThrough();
+    this.stderr = new PassThrough();
+    this.pid = 123;
+    this.exitCode = null;
+    this.killed = false;
+    this.requests = [];
+    this.closed = false;
+    this.stdin = new Writable({
+      write: (chunk, _encoding, callback) => {
+        const lines = String(chunk).split("\n").filter(Boolean);
+        for (const line of lines) {
+          const request = JSON.parse(line);
+          this.requests.push(request);
+          onRequest(request, this);
+        }
+        callback();
+      },
+    });
+    this.stdin.on("finish", () => this.close(0));
+  }
+
+  json(value, chunks = null) {
+    const line = `${JSON.stringify(value)}\n`;
+    if (!chunks) {
+      this.stdout.write(line);
+      return;
+    }
+    let offset = 0;
+    for (const length of chunks) {
+      this.stdout.write(line.slice(offset, offset + length));
+      offset += length;
+    }
+    if (offset < line.length) this.stdout.write(line.slice(offset));
+  }
+
+  close(code = 0) {
+    if (this.closed) return;
+    this.closed = true;
+    this.exitCode = code;
+    queueMicrotask(() => this.emit("close", code, null));
+  }
+
+  kill() {
+    this.killed = true;
+    this.close(0);
+    return true;
+  }
+}
+
+function respondingChild(overrides = {}) {
+  return new FakeChild((request, child) => {
+    if (overrides[request.method]) return overrides[request.method](request, child);
+    queueMicrotask(() => child.json({ jsonrpc: "2.0", id: request.id, result: { ok: true } }));
+  });
+}
+
+function createClient({ status = fullStatus, child, spawnImpl, execOptions, ...options } = {}) {
+  const exec = execFixture(status, execOptions);
+  const spawned = child || respondingChild();
+  const client = new ImsgClient({
+    binary: "/fake/imsg",
+    execFileImpl: exec.implementation,
+    spawnImpl: spawnImpl || (() => spawned),
+    rpcTimeoutMs: 40,
+    sendTimeoutMs: 40,
+    stopTimeoutMs: 10,
+    ...options,
+  });
+  return { client, child: spawned, execCalls: exec.calls };
+}
+
+test("locates imsg and reports normalized basic and bridge capabilities", async () => {
+  const { client, execCalls } = createClient();
+  const status = await client.probeCapabilities();
+
+  assert.equal(status.available, true);
+  assert.equal(status.version, "0.13.0");
+  assert.equal(status.capabilities.richText, true);
+  assert.equal(status.capabilities.urlPreviews, true);
+  assert.equal(status.capabilities.polls, true);
+  assert.equal(status.capabilities.pollVoting, true);
+  assert.equal(status.capabilities.typing, true);
+  assert.equal(status.capabilities.readReceipts, true);
+  assert.equal(status.capabilities.edits, true);
+  assert.equal(status.capabilities.unsend, true);
+  assert.deepEqual(execCalls.map((call) => call.args), [["--version"], ["status", "--json"]]);
+});
+
+test("reads one latest local message to baseline a new conversation without RPC", async () => {
+  const latest = { id: 902, guid: "LATEST", text: "private existing history" };
+  const { client, execCalls } = createClient({ execOptions: { history: [
+    { id: 901, guid: "CHRONOLOGICALLY-LATER", text: "outbound copy" },
+    latest,
+    { id: 900, guid: "OLDER", text: "older copy" },
+  ] } });
+  assert.deepEqual(await client.latestMessage({ chat_id: 42 }), latest);
+  const historyCall = execCalls.find((call) => call.args[0] === "history");
+  assert.deepEqual(historyCall.args, ["history", "--chat-id", "42", "--limit", "50", "--json"]);
+  assert.equal((await client.latestMessage({ chat_id: 42 })).text, "private existing history");
+});
+
+test("frames fragmented JSON-RPC lines and correlates concurrent request IDs", async () => {
+  const delayed = new Map();
+  const child = respondingChild({
+    "chats.list": (request, process) => queueMicrotask(() => process.json({ jsonrpc: "2.0", id: request.id, result: { chats: [] } }, [1, 2, 4])),
+    alpha: (request) => delayed.set("alpha", request),
+    beta: (request, process) => {
+      delayed.set("beta", request);
+      queueMicrotask(() => {
+        const first = delayed.get("alpha");
+        process.stdout.write(
+          `${JSON.stringify({ jsonrpc: "2.0", id: request.id, result: { value: "b" } })}\n${JSON.stringify({ jsonrpc: "2.0", id: first.id, result: { value: "a" } })}\n`,
+        );
+      });
+    },
+  });
+  const { client } = createClient({ child });
+  await client.start();
+
+  const [alpha, beta] = await Promise.all([client.request("alpha"), client.request("beta")]);
+  assert.deepEqual(alpha, { value: "a" });
+  assert.deepEqual(beta, { value: "b" });
+  await client.stop();
+});
+
+test("routes watch notifications and unsubscribes without leaking handlers", async () => {
+  let subscriptionRequest;
+  const child = respondingChild({
+    "watch.subscribe": (request, process) => {
+      subscriptionRequest = request;
+      queueMicrotask(() => process.json({ jsonrpc: "2.0", id: request.id, result: { subscription: 9 } }));
+    },
+  });
+  const { client } = createClient({ child });
+  const messages = [];
+  const watch = await client.subscribeWatch({ chat_id: 42, include_reactions: true }, (message) => messages.push(message));
+  child.json({ jsonrpc: "2.0", method: "message", params: { subscription: 9, message: { guid: "INBOUND", text: "hello" } } });
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(subscriptionRequest.params.chat_id, 42);
+  assert.deepEqual(messages, [{ guid: "INBOUND", text: "hello" }]);
+  assert.equal(await watch.unsubscribe(), true);
+  child.json({ jsonrpc: "2.0", method: "message", params: { subscription: 9, message: { guid: "LATE" } } });
+  assert.equal(messages.length, 1);
+  await client.stop();
+});
+
+test("rejects oversized RPC lines and bounds outbound requests", async () => {
+  const child = respondingChild({ query: (_request, process) => queueMicrotask(() => process.stdout.write("x".repeat(65))) });
+  const { client } = createClient({ child, maxLineBytes: 64, maxMessageBytes: 1024 });
+  await client.start();
+  await assert.rejects(client.request("query", { value: "hello" }), { code: "IMSG_RPC_LINE_TOO_LARGE" });
+  assert.equal(child.killed, true);
+
+  const second = createClient({ maxMessageBytes: 80 });
+  await second.client.start();
+  await assert.rejects(second.client.request("query", { value: "x".repeat(100) }), { code: "IMSG_MESSAGE_TOO_LARGE", attempted: false });
+  await second.client.stop();
+});
+
+test("advanced send capability failures fail closed before delivery", async () => {
+  const noBridge = { ...fullStatus, advanced_features: false, v2_ready: false };
+  const { client, child } = createClient({ status: noBridge });
+
+  const formatted = await client.sendRich({ chat_id: 42, text: "hello", formatting: [{ start: 0, length: 5, styles: ["bold"] }] });
+  const reply = await client.sendRich({ chat_id: 42, text: "hello", reply_to: "PARENT" });
+  const link = await client.sendRich({ chat_id: 42, url: "https://example.com" });
+  const file = await client.sendRich({ chat_id: 42, file: "/tmp/image.png" });
+
+  assert.deepEqual([formatted, reply, link, file].map((result) => result.classification),
+    ["unsupported", "unsupported", "unsupported", "unsupported"]);
+  assert.equal(child.requests.length, 0, "capability rejection must happen before spawning RPC");
+});
+
+test("sends rich text, native polls, votes, tapbacks, typing, read receipts, and status through documented RPC methods", async () => {
+  const { client, child } = createClient();
+  const rich = await client.sendRich({ chat_id: 42, text: "hello", effect: "confetti", formatting: [{ start: 0, length: 5, styles: ["bold"] }] });
+  const reply = await client.sendRich({ chat_id: 42, text: "threaded", reply_to: "PARENT" });
+  const attachment = await client.sendRich({ chat_id: 42, file: "/tmp/image.png", reply_to: "PARENT" });
+  const link = await client.sendRich({ chat_id: 42, url: "https://example.com/card" });
+  const poll = await client.sendPoll({ chat_id: 42, question: "Dinner?", options: ["Pizza", "Sushi"] });
+  const vote = await client.votePoll({ chat_id: 42, poll_guid: "POLL", option_id: "PIZZA" });
+  const reaction = await client.tapback({ chat_id: 42, message_guid: "MESSAGE", reaction: "love" });
+  const typing = await client.setTyping({ chat_id: 42 }, true);
+  const read = await client.markRead({ chat_id: 42 });
+  const status = await client.sendStatus("MESSAGE");
+  const edit = await client.editMessage({ chat_id: 42, message_guid: "MESSAGE", text: "Revised", part_index: 0 });
+  const unsend = await client.unsendMessage({ chat_id: 42, message_guid: "MESSAGE", part_index: 0 });
+
+  assert.ok([rich, reply, attachment, link, poll, vote, reaction, typing, read, status, edit, unsend].every((result) => result.classification === "accepted"));
+  assert.deepEqual(
+    child.requests.map((request) => request.method),
+    ["chats.list", "send.rich", "send.rich", "send.attachment", "send.rich", "poll.send", "poll.vote", "tapback", "typing", "read", "message.send_status", "message.edit", "message.unsend"],
+  );
+  assert.deepEqual(child.requests[1].params.text_formatting, [{ start: 0, length: 5, styles: ["bold"] }]);
+  assert.equal(child.requests[2].params.reply_to, "PARENT");
+  assert.equal(child.requests[3].params.file, "/tmp/image.png");
+  assert.equal(child.requests[4].params.url, "https://example.com/card");
+  assert.deepEqual(child.requests[11].params, { chat_id: 42, message_guid: "MESSAGE", text: "Revised", part_index: 0 });
+  assert.deepEqual(child.requests[12].params, { chat_id: 42, message_guid: "MESSAGE", part_index: 0 });
+  await client.stop();
+});
+
+test("caps native Apple polls at twelve options before any send attempt", async () => {
+  const { client, child } = createClient();
+  const valid = await client.sendPoll({
+    chat_id: 42,
+    question: "Choose",
+    options: Array.from({ length: 12 }, (_, index) => `Option ${index + 1}`),
+  });
+  const invalid = await client.sendPoll({
+    chat_id: 42,
+    question: "Choose",
+    options: Array.from({ length: 13 }, (_, index) => `Option ${index + 1}`),
+  });
+
+  assert.equal(valid.classification, "accepted");
+  assert.equal(invalid.classification, "unsupported");
+  assert.equal(invalid.retrySafe, true);
+  assert.equal(child.requests.filter((request) => request.method === "poll.send").length, 1);
+  await client.stop();
+});
+
+test("rejects malformed edit and unsend mutations before writing RPC", async () => {
+  const { client, child } = createClient();
+  const edit = await client.editMessage({ chat_id: 42, message_guid: "MESSAGE", text: "", part_index: -1 });
+  const unsend = await client.unsendMessage({ chat_id: 42, message_guid: "MESSAGE", part_index: -1 });
+  assert.equal(edit.classification, "unsupported");
+  assert.equal(unsend.classification, "unsupported");
+  assert.equal(child.requests.length, 0);
+});
+
+test("stop removes watch subscriptions, closes stdin, and leaves no pending RPC work", async () => {
+  const child = respondingChild({
+    "watch.subscribe": (request, process) => queueMicrotask(() => process.json({ jsonrpc: "2.0", id: request.id, result: { subscription: 7 } })),
+  });
+  const { client } = createClient({ child });
+  await client.subscribeWatch({}, () => {});
+  await client.stop();
+
+  assert.equal(child.requests.some((request) => request.method === "watch.unsubscribe"), true);
+  assert.equal(child.stdin.writableEnded, true);
+  assert.equal(client.child, null);
+  assert.equal(client.pending.size, 0);
+  assert.equal(client.watchers.size, 0);
+});

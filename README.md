@@ -1,287 +1,188 @@
-# Codex iMessage Service
+# Codex local iMessage service
 
-Continue any visible local Codex thread from iMessage or SMS through one small
-user-level service. Codex threads run only while handling a message; no Stop hook
-or per-thread skill activation is required.
+A persistent, local macOS service for controlling Codex tasks from Messages.
+It uses one dedicated macOS Messages account, an authenticated local `imsg`
+helper, and the supervised Codex app-server shared with Codex Desktop.
 
-The system has two components:
+The service fails closed if its authenticated helper, rich IMCore bridge,
+selected chat, or shared Codex backend is unavailable.
 
-- `service`: discovers local Codex threads and runs finite `codex exec resume`
-  turns.
-- `relay`: connects the service to Messages through
-  [Sendblue](https://sendblue.com).
+## Architecture
 
-The complete product and implementation contract is in
-[docs/PERSISTENT_SERVICE_PLAN.md](docs/PERSISTENT_SERVICE_PLAN.md).
+```text
+Messages on dedicated macOS account
+        │ private imsg RPC
+        ▼
+authenticated split-user helper
+        │ mutually authenticated local IPC
+        ▼
+Codex iMessage service
+        │ local WebSocket
+        ▼
+supervised shared Codex app-server ◀── Codex Desktop
+```
 
-## Install
+The helper is pinned to one exact iMessage chat and one expected sender. IPC is
+mutually authenticated. The service account never receives the dedicated
+Messages account's database or signing material.
 
-From this repository:
+## Requirements
+
+- macOS with a separate standard (non-administrator) account signed into the
+  service's iMessage identity.
+- `imsg` with the daemon-safe Contacts patch in `docs/` and the full IMCore
+  bridge enabled.
+- A healthy supervised shared Codex app-server, with Codex Desktop connected
+  to it.
+- Node.js 22.6 or newer and pnpm 10.26.
+
+The supported messaging profile is fixed: authenticated helper mode, bridge
+features, native rich text, native replies, polls, and reactions. Basic,
+automatic-downgrade, plain-text, and direct/local CLI profiles are rejected.
+
+## Setup
+
+Install dependencies and verify the source:
 
 ```bash
 pnpm install
-node bin/imessage-handoff.mjs install
+pnpm test
+pnpm typecheck
 ```
 
-An existing iMessage Handoff relay URL, install token, and phone pairing are
-imported automatically. For a fresh self-hosted installation:
+Prepare and activate the shared Codex backend:
 
 ```bash
-node bin/imessage-handoff.mjs install --relay=https://imessage-handoff.example.com
+node bin/imessage-handoff.mjs desktop-sync prepare
+node bin/imessage-handoff.mjs desktop-sync activate
+# Quit and reopen Codex Desktop once.
+node bin/imessage-handoff.mjs desktop-sync finish
 ```
 
-The installer starts a macOS user LaunchAgent. It removes the legacy iMessage
-Stop hook only after the new service registers successfully with the relay.
-
-If pairing is required, inspect the service log for the six-character code and
-text it to the displayed Sendblue number within 15 minutes:
+Harden an existing dedicated Messages account before staging the helper. This
+requests administrator authorization only for account/group changes, removes
+administrator and other privileged memberships, creates a two-member private
+exchange group, and does not change Messages data or secure-token state:
 
 ```bash
-tail -f ~/.codex/imessage-handoff/service.log
+node bin/imessage-handoff.mjs transport harden-helper --helper-user=codex
 ```
 
-## iMessage interface (v0.3.7)
+Log out of and back into the dedicated Messages account after this command.
 
-Normal text goes unchanged to the selected Codex thread. Service commands use a
-slash prefix:
+Prepare the split-user bundle from the controller account:
 
-```text
-/threads
-/recent
-/refresh
-/search words
-/projects
-/thread
-/request
-/turn
-/history 3
-/reasoning high
-/status
-/retry
-/dismiss
-/cancel
-/help
+```bash
+node service/scripts/prepare-split-user-helper.mjs --help
 ```
 
-The local service builds `/threads` on demand. Under each project it shows all
-tasks with pending work first, followed by every task with a turn in the last
-48 hours. Projects with no matching tasks are omitted, and Codex's explicitly
-projectless tasks appear in a final `Other tasks` section. Every row includes
-the latest user-message preview plus a Working, Pending, Idle, or Error label.
-Numbered menus are stable for ten minutes.
+With the dedicated Messages account still logged in, launch the signed installer
+from the controller account (macOS asks for administrator approval), then finish
+configuration:
 
-The interface is intentionally content-first. There is no universal masthead,
-line rule, or active-context footer. Markdown markers are preserved literally
-in the Sendblue body so clients can render them in the future; today they remain
-readable plain text. Emoji are used only for identity and speaker roles.
-
-Every real project and task receives a pseudo-random, deterministic object
-emoji. Task emoji are seeded from the normalized task name and canonical
-creation date; project emoji are seeded from the normalized project name and
-earliest known task start date. This keeps an identity recognizable wherever it
-appears without storing an additional visual preference. `Other tasks` is a
-synthetic group, so it does not receive a project emoji.
-
-`/help` is short and contains only available commands:
-
-```text
-**Browse**
-/threads · Tasks by project
-/refresh · Refresh the task list
-/search (query) · Find a task
-/projects · Browse all projects
-
-**Active task**
-/thread · Status and latest response
-/turn · Show current or last turn
-/history (length) · Completed turn history
-/reasoning (level/none) · View or change reasoning
-/cancel · Stop iMessage-started work in current thread
+```bash
+node service/scripts/install-prepared-helper.mjs --helper-user=codex
+node bin/imessage-handoff.mjs transport finish-helper --helper-user=codex
+node bin/imessage-handoff.mjs transport check
 ```
 
-The recent-thread directory groups qualifying tasks by project, marks the
-selection, and gives each task just enough status and request context to identify
-it:
-
-```text
-▾  ⚙️ **iMessage handoff** · 2 tasks
-
-**Selected**
-1️⃣  🧪 **Polish message formatting**
-   ◷ Working for 4m
-   “Show a full example set of every message type.”
-
-2️⃣  ✏️ Fix duplicate fork history
-   ◷ Working for 8m · 2 queued
-   “Prevent inherited history from replaying.”
-
-▾ **Other tasks** · 1 task
-
-3️⃣  🧲 Compare messaging providers
-   ○ 3h ago · 50 turns
-   “Which provider supports richer iMessage interactions?”
-
-Reply with a number to open that thread. Add “1 (message)” to directly message the thread.
-“/projects” - See all projects
-“/search” - Show threads with specific text
-```
-
-Opening a task sends one compact acknowledgement and its relevant controls:
-
-```text
-Opened  🧪 **Polish message formatting**
-/reasoning (level/none) · /turn · /history · /cancel
-```
-
-After that acknowledgement, the selected task is a content-only live
-subscription. Local user messages carry a small speaker marker; visible Codex
-commentary and final responses are sent without repeated task chrome.
-Consecutive reasoning/commentary updates are grouped with blank lines for
-readability:
-
-```text
-👤 Please rerun the tests after that change.
-```
-
-```text
-I found the duplicate import path.
-
-I’m checking its callers now.
-```
-
-Hidden reasoning, tool output, hook prompts, and system/developer messages are
-never mirrored. An iMessage-origin prompt is suppressed from the live feed
-because it is already visible in Messages. Native typing remains active while
-work is running; structured progress events update typing instead of creating
-progress bubbles.
-
-`/turn` and `/history` return one long role-marked transcript without a heading,
-timestamps, or command footer:
-
-```text
-👤 Normalize all album fields.
-
-
-☁️ I updated the parser and started the tests.
-
-
-👤 Also preserve unknown fields.
-
-
-☁️ Done. All tests pass.
-```
-
-`/reasoning none` removes the task-specific override and returns the task to its
-normal default. `/reasoning` shows the available levels with `●` on the current
-choice; the exact levels follow the task's model capabilities.
-
-When Codex moves the selected task into a locally created active fork, the
-service follows that descendant with a compare-and-swap that cannot overwrite a
-manual Messages selection. It emits the same single `Opened` acknowledgement
-and a current-turn snapshot, then continues the content-only live feed. Existing
-fork history is baselined, so inherited parent turns are not replayed as new
-messages or task completions.
-
-When the paired user has texted Codex within the previous 24 hours, the service
-also watches visible top-level tasks that finish locally and sends their exact
-final response. Results from any task other than the selected one name their
-source first:
-
-```text
-✏️ **Fix duplicate fork history**
-
-All tests pass.
-```
-
-Selected-task results contain only the result body. A background notification
-never changes where the next ordinary message will go.
-
-Existing task history is baselined silently on first start, and iMessage-started
-turns are deduplicated so their requested reply is never followed by a second
-completion notice. The same 24-hour activity window applies to debounced
-`● Codex is online.` and `○ Codex is offline. New messages will wait until it
-reconnects.` notices. Inbound prompts, commands, menu choices, media, and pairing
-all refresh the window; outbound notices do not.
+`finish-helper` saves only the private helper-client path and the pinned chat
+identity. Configuration is owner-only (`0600`). Outdated configuration is
+rejected and must be recreated with `finish-helper`.
 
 ## Service commands
 
 ```bash
+node bin/imessage-handoff.mjs service install
 node bin/imessage-handoff.mjs service status
-node bin/imessage-handoff.mjs service stop
-node bin/imessage-handoff.mjs service start
 node bin/imessage-handoff.mjs service restart
-node bin/imessage-handoff.mjs service pause
-node bin/imessage-handoff.mjs service run
+node bin/imessage-handoff.mjs service stop
 node bin/imessage-handoff.mjs service uninstall
+node bin/imessage-handoff.mjs service run
 ```
 
-`service run` keeps the daemon in the foreground for development or platforms
-without LaunchAgent support.
+Install and restart wait for truthful readiness. If the helper, watch stream,
+or shared backend does not become healthy, startup fails rather than reporting
+a false ready state.
 
-## How it works
+Transport diagnostics are intentionally small:
 
-1. The service reads the local Codex thread catalog in read-only mode and
-   removes automated/subagent sessions using Codex's canonical metadata.
-   Same-lineage forks and unrelated same-title sessions remain independently
-   reachable and receive stable `Fork N` or `Session N` display labels.
-2. It synchronizes bounded title/project routing metadata to the relay.
-3. One authenticated installation WebSocket receives pending thread/reply IDs.
-4. The service immediately claims each notified message into a private local
-   queue so Cloudflare hibernation cannot lose it. Other tasks are marked
-   Pending and distinct tasks run concurrently within a small bound. Claimed
-   work and completed-but-undelivered output survive a service restart.
-5. It passes the exact message through stdin to `codex exec resume --json`.
-6. A private cursor tails only canonical local user messages and visible Codex
-   commentary for the task currently selected in Messages. Selection changes
-   baseline the new rollout; same-selection restarts resume the cursor.
-7. Structured lifecycle events drive typing while visible commentary is
-   mirrored as content.
-8. The final response is sent through Sendblue without adding transport text to
-   Codex history.
-9. A separate private incremental watcher detects locally completed top-level
-   tasks without reinstalling Codex Stop hooks.
-10. The Codex child process exits; the small service returns to idle. A heartbeat
-   keeps relay presence accurate across sleep and network loss.
+```bash
+node bin/imessage-handoff.mjs transport status
+node bin/imessage-handoff.mjs transport check
+```
 
-## Self-hosting
+Status output redacts the chat GUID, sender identity, and helper-client path.
 
-See [relay/README.md](relay/README.md). Existing self-hosted deployments keep
-their Cloudflare Worker/D1 database, Sendblue credentials, webhook, phone
-number, domain, install token, and phone pairing. Apply the included migrations
-and redeploy the Worker before starting the service.
+## Messages interface
 
-## Security model
+Each Codex task owns a durable native Messages reply thread. Replying to a task
+message routes to that exact Codex task. An unthreaded message routes to the
+task most recently addressed by the user, not the task that most recently sent
+a notification.
 
-- Prompt and response bodies are not stored in D1.
-- D1 stores only the paired phone's last inbound timestamp plus opaque
-  completion IDs and multipart counters for idempotent delivery; it never
-  stores task content. Retryable completion output remains only in the local
-  mode-`0600` service state until it is sent or intentionally suppressed.
-- Inbound content lives in the relay only until the connected service
-  immediately claims it into its mode-`0600` local queue.
-- Thread history, full local paths, and git remotes stay local. Directory
-  previews are read locally only when requested, sent transiently to Sendblue,
-  and never written to D1 or menu snapshots.
-- The live cursor is mode `0600` local state and contains offsets, opaque IDs,
-  and one-shot body hashes—not conversation text. The relay persists only
-  opaque live-delivery IDs and multipart counters for idempotency.
-- A fork context awaiting provider acknowledgement is kept as an exact,
-  mode-`0600` local retry record and removed after a terminal delivery result;
-  its text is never stored by the relay.
-- Tokens, media, logs, and service state are owner-readable only.
-- User text is passed through stdin, not process arguments.
-- Raw JSONL reasoning, tool output, hooks, system/developer records, and secrets
-  are never sent as progress or live conversation.
-- Per-task reasoning overrides are stored only in the private local service
-  directory and applied to the next iMessage-started turn. The service does not
-  remotely change approval, sandbox, deletion, or archival settings.
+Directory browsing uses rich project/task polls. Poll selection is task-local,
+expires after five minutes, and never pauses unrelated task updates. Expired or
+unknown votes produce a fresh directory rather than silently changing context.
 
-Keep `~/.codex/imessage-handoff/config.json` private. Resetting the install token
-revokes the paired phone.
+Available commands:
+
+```text
+/threads        Browse tasks by project
+/refresh        Refresh the directory
+/search query   Search every visible task
+/projects       Browse projects
+/thread         Current status and latest response
+/request        Latest user request
+/turn           Current or latest turn
+/history 3      Completed turn history
+/reasoning high View or change reasoning
+/listen         Stream the next turn's visible updates
+/link           Open the task in Codex
+/mute           Mute automatic task updates
+/unmute         Resume automatic task updates
+/retry          Retry failed iMessage work
+/dismiss        Dismiss failed iMessage work
+/cancel         Cancel iMessage-started work
+/help           Show command help
+```
+
+Task-scoped commands sent outside a native reply thread open a task picker.
+Notifications cannot silently retarget them.
+
+## Delivery and recovery
+
+- Inbound text and imported images are persisted locally before a Codex run is
+  queued.
+- The service uses one Codex run at a time through the shared app-server.
+- Text and generated-image acceptance are checkpointed so a restart does not
+  replay an already accepted part.
+- Native message GUID routing, poll state, mute/listen state, run state, and
+  live-mirror offsets are private local files.
+- Helper/watch degradation changes service readiness immediately and recovers
+  without claiming a healthy state prematurely.
+- No operation falls back to another transport or to `imsg send`.
+
+## Privacy and security
+
+- Conversation content, credentials, catalogs, and attachments remain on the
+  Mac.
+- Exact chat and expected-sender pins are verified on both sides of the helper
+  boundary.
+- Attachments are copied into owner-only local storage and validated before use.
+- The dedicated Messages account should remain a standard user with no admin or
+  broad privileged-group membership.
+- Never put helper keys, chat handles, or private client configuration in logs,
+  shell history, or source control.
 
 ## Development
 
 ```bash
 pnpm test
 pnpm typecheck
+git diff --check
 ```
+
+The implementation is in `service/src/`; the shared message grammar is in
+`protocol/`. See `docs/PERSISTENT_SERVICE_PLAN.md` for the runtime invariants
+and failure model.

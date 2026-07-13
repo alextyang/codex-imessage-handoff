@@ -1,0 +1,24 @@
+diff --git a/Sources/imsg/Commands/RpcCommand.swift b/Sources/imsg/Commands/RpcCommand.swift
+--- a/Sources/imsg/Commands/RpcCommand.swift
++++ b/Sources/imsg/Commands/RpcCommand.swift
+@@ -23,7 +23,7 @@ enum RpcCommand {
+       await RPCStartupErrorServer(error: error).run()
+       throw CommandOutputEmittedError()
+     }
+-    let contacts = await ContactResolver.create()
++    let contacts = await ContactResolver.create(accessPolicy: .skipIfNotDetermined)
+     let server = RPCServer(store: store, verbose: runtime.verbose, contactResolver: contacts)
+     try await server.run()
+   }
+diff --git a/Sources/imsg/Commands/WatchCommand.swift b/Sources/imsg/Commands/WatchCommand.swift
+--- a/Sources/imsg/Commands/WatchCommand.swift
++++ b/Sources/imsg/Commands/WatchCommand.swift
+@@ -55,7 +55,7 @@ enum WatchCommand {
+     runtime: RuntimeOptions,
+     storeFactory: @escaping (String) throws -> MessageStore = { try MessageStore(path: $0) },
+     contactResolverFactory: @escaping () async -> any ContactResolving = {
+-      await ContactResolver.create()
++      await ContactResolver.create(accessPolicy: .skipIfNotDetermined)
+     },
+     streamProvider:
+       @escaping (

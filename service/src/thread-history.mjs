@@ -416,6 +416,25 @@ export function getThreadState(threadOrPath) {
   return state;
 }
 
+/**
+ * Refuse to start an iMessage-owned turn when the rollout already contains a
+ * live turn. RunManager serializes turns started by this daemon, so a running
+ * boundary observed at this preflight belongs to Codex outside the pending
+ * service run (normally the local app).
+ *
+ * This is deliberately an optimistic filesystem preflight, not a lock. Codex's
+ * app-server's own session lock remains the authority if another turn starts
+ * after this read and before the service opens the shared thread.
+ */
+export function assertThreadReadyForIMessageRun(threadOrPath) {
+  const state = getThreadState(threadOrPath);
+  if (state.state !== "running") return state;
+  throw Object.assign(new Error("Thread is already running outside this iMessage request."), {
+    code: "BUSY",
+    currentTurnId: state.currentTurnId,
+  });
+}
+
 export function getTurn(threadOrPath) {
   const history = readThreadHistory(threadOrPath);
   return history.currentTurn || history.latestTurn;

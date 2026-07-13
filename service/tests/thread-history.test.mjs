@@ -1,9 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { appendFileSync, mkdtempSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import {
+  assertThreadReadyForIMessageRun,
   getHistory,
   getLatestRequest,
   getThreadDetail,
@@ -146,6 +147,40 @@ test("state lookup expands its tail until it finds a long-running turn boundary"
   ));
   writeFileSync(rollout, `${start}\n${noise.join("\n")}\n`, "utf8");
   assert.equal(getThreadState(rollout).state, "running");
+});
+
+test("iMessage run preflight rejects an already-running local turn as BUSY", () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "imessage-thread-run-guard-"));
+  const rollout = path.join(directory, "rollout.jsonl");
+  writeFileSync(rollout, `${record("2026-07-12T05:30:00.000Z", "event_msg", {
+    type: "task_started",
+    turn_id: "local-turn",
+  })}\n`, "utf8");
+
+  assert.throws(
+    () => assertThreadReadyForIMessageRun({ id: "thread-guard", rolloutPath: rollout }),
+    (error) => error?.code === "BUSY" && error?.currentTurnId === "local-turn",
+  );
+});
+
+test("iMessage run preflight observes a turn started after an earlier idle state read", () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "imessage-thread-fresh-guard-"));
+  const rollout = path.join(directory, "rollout.jsonl");
+  writeFileSync(rollout, [
+    record("2026-07-12T05:40:00.000Z", "event_msg", { type: "task_started", turn_id: "finished-turn" }),
+    record("2026-07-12T05:40:01.000Z", "event_msg", { type: "task_complete", turn_id: "finished-turn" }),
+  ].join("\n") + "\n", "utf8");
+
+  assert.equal(getThreadState(rollout).state, "idle", "prime the catalog-era state cache");
+  appendFileSync(rollout, `${record("2026-07-12T05:41:00.000Z", "event_msg", {
+    type: "task_started",
+    turn_id: "new-local-turn",
+  })}\n`, "utf8");
+
+  assert.throws(
+    () => assertThreadReadyForIMessageRun(rollout),
+    (error) => error?.code === "BUSY" && error?.currentTurnId === "new-local-turn",
+  );
 });
 
 test("recent rollout metadata without a turn does not become recent turn activity", () => {

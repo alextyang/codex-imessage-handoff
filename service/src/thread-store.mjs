@@ -9,6 +9,9 @@ import { readWorkspaceState } from "./workspace-state.mjs";
 
 const execFileAsync = promisify(execFile);
 const MAX_THREADS = 500;
+const SQLITE_BUSY_TIMEOUT_MS = 2_000;
+const SQLITE_QUERY_ATTEMPTS = 4;
+const SQLITE_RETRY_BASE_MS = 50;
 
 function iso(ms, seconds) {
   const value = Number(ms) || Number(seconds) * 1000;
@@ -74,11 +77,44 @@ const THREAD_COLUMNS = `
   t.git_origin_url,
   t.git_branch`;
 
+function retryableSqliteError(error) {
+  const text = `${error?.message || ""}\n${error?.stderr || ""}`;
+  return /database is locked|database is busy|unable to open database file|SQLITE_BUSY|SQLITE_CANTOPEN/i.test(text);
+}
+
+function pause(milliseconds) {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+async function queryWithRetry(database, sql, options = {}) {
+  const execute = options.execute || execFileAsync;
+  const wait = options.wait || pause;
+  const attempts = Math.max(1, Number(options.attempts) || SQLITE_QUERY_ATTEMPTS);
+  let lastError;
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    try {
+      const { stdout } = await execute("sqlite3", [
+        "-readonly",
+        "-json",
+        "-cmd",
+        `.timeout ${SQLITE_BUSY_TIMEOUT_MS}`,
+        database,
+        sql,
+      ], { maxBuffer: 16 * 1024 * 1024 });
+      return stdout.trim() ? JSON.parse(stdout) : [];
+    } catch (error) {
+      lastError = error;
+      if (!retryableSqliteError(error) || attempt + 1 >= attempts) throw error;
+      await wait(SQLITE_RETRY_BASE_MS * (2 ** attempt));
+    }
+  }
+  throw lastError;
+}
+
 async function query(sql) {
   const database = servicePaths().stateDb;
   if (!existsSync(database)) throw new Error(`Codex state database not found: ${database}`);
-  const { stdout } = await execFileAsync("sqlite3", ["-readonly", "-json", database, sql], { maxBuffer: 16 * 1024 * 1024 });
-  return stdout.trim() ? JSON.parse(stdout) : [];
+  return queryWithRetry(database, sql);
 }
 
 function threadFromRow(row, workspaceState = readWorkspaceState()) {
@@ -242,6 +278,13 @@ function disambiguateProjectLabels(threads) {
   }
   return threads.map((thread) => labels.has(thread.projectKey) ? { ...thread, projectLabel: labels.get(thread.projectKey) } : thread);
 }
+
+export const threadStoreInternals = Object.freeze({
+  queryWithRetry,
+  retryableSqliteError,
+  sqliteBusyTimeoutMs: SQLITE_BUSY_TIMEOUT_MS,
+  sqliteQueryAttempts: SQLITE_QUERY_ATTEMPTS,
+});
 
 function disambiguateDisplayDuplicates(threads, roots) {
   const groups = new Map();

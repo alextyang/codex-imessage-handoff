@@ -37,12 +37,18 @@ test("help is exactly the minimal two-section command reference", () => {
     "/search (query) · Find a task",
     "/projects · Browse all projects",
     "",
-    "**Active task**",
+    "**Task commands**",
     "/thread · Status and latest response",
     "/turn · Show current or last turn",
     "/history (length) · Completed turn history",
     "/reasoning (level/none) · View or change reasoning",
-    "/cancel · Stop iMessage-started work in current thread",
+    "/listen · Stream the next turn’s live updates",
+    "/link · Show the Codex task link",
+    "/mute · Pause automatic updates",
+    "/unmute · Resume automatic updates",
+    "/cancel · Stop iMessage-started work in this task",
+    "/retry · Retry failed iMessage-started work",
+    "/dismiss · Remove failed work from the queue",
   ].join("\n"));
 });
 
@@ -170,7 +176,7 @@ test("thread and project identity seeds normalize name plus start date", () => {
   const normalizedProject = { projectLabel: " IMESSAGE   HANDOFF ", startedAt: "2026-07-01T00:00:00.000Z" };
   assert.equal(projectIdentityEmoji(project), "📐");
   assert.equal(projectIdentityEmoji(normalizedProject), "📐");
-  assert.equal(projectIdentityEmoji({ ...project, projectLabel: "iMessage relay" }), "📡");
+  assert.equal(projectIdentityEmoji({ ...project, projectLabel: "iMessage service" }), "🧭");
   assert.equal(projectIdentityEmoji({ ...project, startedAt: "2026-07-02T00:00:00Z" }), "🪁");
 });
 
@@ -282,6 +288,30 @@ test("history is one minimal transcript with triple-newline role blocks", () => 
   ].join("\n\n\n"));
 });
 
+test("detail and history disclose omitted content with actionable commands", () => {
+  assert.deepEqual(renderOutboundMessages({
+    kind: "thread.detail",
+    thread: ACTIVE,
+    state: "idle",
+    requestPreview: { body: "A shortened request…", truncated: true },
+    historyTruncated: true,
+  }, activeOptions), [
+    "👤 A shortened request…\n\nRequest shortened · /request shows it in full.",
+    "Older task context wasn’t loaded · /turn or /history 5",
+  ]);
+
+  assert.equal(renderOutboundEvent({
+    kind: "thread.history",
+    thread: ACTIVE,
+    turns: [{ request: "Newest request.", finalResponse: "Newest result." }],
+    hasMore: true,
+  }, activeOptions), [
+    "👤 Newest request.",
+    "☁️ Newest result.",
+    "Earlier completed turns exist · /history 5 shows the newest five.",
+  ].join("\n\n\n"));
+});
+
 test("a command response that loses the selection race identifies its source once", () => {
   assert.equal(renderOutboundEvent({
     kind: "thread.history",
@@ -315,7 +345,7 @@ test("reasoning view, changed, removed, and invalid states are minimal and exact
       { value: "high", selected: true },
       { value: "xhigh", selected: false },
     ],
-  }, activeOptions), "**Reasoning**\n○ none\n● high\n○ xhigh\n\n/reasoning (level/none)");
+  }, activeOptions), "**Reasoning**\n○ none\n● high · selected\n○ xhigh\n\n/reasoning (level/none)");
 
   assert.equal(renderOutboundEvent({
     kind: "service.reasoning",

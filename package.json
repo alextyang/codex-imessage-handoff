@@ -1,6 +1,6 @@
 {
   "name": "@gaberagland/imessage-handoff",
-  "version": "0.3.7",
+  "version": "0.4.0",
   "description": "Run a persistent iMessage service for continuing Codex threads from Messages.",
   "type": "module",
   "bin": {
@@ -8,17 +8,18 @@
   },
   "files": [
     "bin/",
+    "protocol/",
     "service/",
     "docs/"
   ],
   "packageManager": "pnpm@10.26.0",
   "scripts": {
-    "build": "pnpm --filter @gaberagland/imessage-handoff-relay build",
-    "test": "pnpm --filter @gaberagland/imessage-handoff-relay test && pnpm --filter @gaberagland/imessage-handoff-service test && node --experimental-strip-types --test tests/skill/*.test.ts",
-    "typecheck": "pnpm --filter @gaberagland/imessage-handoff-relay typecheck"
+    "build": "pnpm typecheck",
+    "test": "pnpm --filter @gaberagland/imessage-handoff-service test",
+    "typecheck": "node --check bin/imessage-handoff.mjs && for file in service/src/*.mjs; do node --check \"$file\"; done"
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=22.6"
   },
   "dependencies": {
     "ws": "^8.18.3"
