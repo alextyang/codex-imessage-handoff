@@ -71,6 +71,11 @@ export function saveClaimedJob(event, state = "queued") {
     recoveredTurnId: typeof event.recoveredTurnId === "string" && event.recoveredTurnId.length <= 256
       ? event.recoveredTurnId
       : null,
+    recoveryMissingSince: typeof event.recoveryMissingSince === "string"
+      && event.recoveryMissingSince.length <= 64
+      && Number.isFinite(Date.parse(event.recoveryMissingSince))
+      ? event.recoveryMissingSince
+      : null,
     state,
     updatedAt: new Date().toISOString(),
   };

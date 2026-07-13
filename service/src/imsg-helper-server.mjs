@@ -22,7 +22,8 @@ import { execFileSync } from "node:child_process";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
-import { ImsgClient } from "./imsg-client.mjs";
+import { ImsgClient, REQUIRED_PINNED_IMSG_CAPABILITIES } from "./imsg-client.mjs";
+import { safeImsgFailureDetails } from "./imsg-rpc-diagnostics.mjs";
 import { inspectLocalImsgChat } from "./imsg-chat.mjs";
 import {
   IMSG_IPC_ATTACHMENT_CHUNK_BYTES,
@@ -52,6 +53,12 @@ const MAX_OPERATION_RESULT_BYTES = 64 * 1024;
 const MAX_IN_FLIGHT_REQUESTS = 64;
 const MAX_OPEN_ATTACHMENT_HANDLES = 8;
 const AUTH_TIMEOUT_MS = 5_000;
+const SAFE_AMBIGUOUS_REASONS = new Set([
+  "invalid-result",
+  "status-query-failure",
+  "timeout",
+  "transport-or-send-failure",
+]);
 
 class SupervisedImsgClient extends ImsgClient {
   constructor(options) {
@@ -732,8 +739,8 @@ export class ImsgHelperServer {
 
   #assertPinnedCapabilities(status) {
     const capabilities = status?.capabilities || {};
-    const required = ["watch", "richText", "replies", "polls", "pollVoting", "typing", "attachments"];
-    if (!status?.available || status?.advanced !== true || required.some((name) => capabilities[name] !== true)) {
+    if (!status?.available || status?.advanced !== true
+      || REQUIRED_PINNED_IMSG_CAPABILITIES.some((name) => capabilities[name] !== true)) {
       throw codedError("IMSG_PINNED_MODE_UNAVAILABLE", "The full pinned advanced imsg bridge is unavailable.");
     }
     return status;
@@ -787,7 +794,19 @@ export class ImsgHelperServer {
       if (/^IMSG_(?:RPC|MALFORMED|OUTPUT)/.test(clean(error?.code))) this.#scheduleFatal(error);
       throw error;
     }
+    if (result?.classification === "ambiguous") {
+      result = {
+        classification: "ambiguous",
+        accepted: false,
+        ambiguous: true,
+        unsupported: false,
+        retrySafe: false,
+        reason: SAFE_AMBIGUOUS_REASONS.has(result.reason) ? result.reason : "transport-or-send-failure",
+        ...safeImsgFailureDetails(result),
+      };
+    }
     if ((result?.classification === "ambiguous"
+        && result?.failureSource !== "remote-error"
         && new Set(["timeout", "transport-or-send-failure", "status-query-failure"]).has(result.reason))
       || (result?.classification === "unsupported"
         && new Set(["rpc-unavailable", "rpc-method-unavailable"]).has(result.reason))) {

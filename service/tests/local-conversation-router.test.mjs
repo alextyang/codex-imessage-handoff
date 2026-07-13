@@ -79,17 +79,219 @@ test("menu references remain selectable after service restart", () => {
   assert.equal(resumed.ingest(message(7, "2")).projectKey, "project-c");
 });
 
-test("reply targets override the active task without changing it", () => {
+test("native originators route replies while incidental reply parents do not change the default task", () => {
   const { router } = fixture();
   router.setActiveThread("thread-a");
-  router.routeOutboundGuid("assistant-guid", "thread-b");
-  const action = router.ingest(message(20, "Continue there.", { reply_to_guid: "assistant-guid" }));
-  assert.equal(action.threadId, "thread-b");
-  assert.equal(action.replyToGuid, "assistant-guid");
+  router.routeOutboundGuid("root-a", "thread-a", { root: true });
+  router.routeOutboundGuid("root-b", "thread-b", { root: true });
+  const seed = router.ingest(message(19, "Work in A.", { thread_originator_guid: "root-a" }));
+  router.acknowledge(seed.messageKey);
+
+  const topLevel = router.ingest(message(20, "Continue my default.", { reply_to_guid: "root-b" }));
+  assert.equal(topLevel.threadId, "thread-a");
+  assert.equal(topLevel.replyToGuid, "root-b");
+  router.acknowledge(topLevel.messageKey);
+
+  const nativeReply = router.ingest(message(21, "Actually reply in B.", {
+    thread_originator_guid: "root-b",
+    reply_to_guid: "root-a",
+  }));
+  assert.equal(nativeReply.threadId, "thread-b");
+  assert.equal(nativeReply.threadOriginatorGuid, "root-b");
   assert.equal(router.activeThreadId, "thread-a");
 });
 
-test("poll votes resolve only registered, unexpired task actions", () => {
+test("authoritative native Reply context outranks an active numeric menu", () => {
+  const { router, stateFile } = fixture();
+  router.routeOutboundGuid("root-a", "thread-a", { root: true });
+  router.setMenu(["thread:thread-b", "project:project-c"]);
+
+  const numericReply = router.ingest(message(2_900, "1", {
+    thread_originator_guid: "root-a",
+    reply_to_guid: "hostile-menu-parent",
+  }));
+  assert.equal(numericReply.kind, "prompt");
+  assert.equal(numericReply.threadId, "thread-a");
+  assert.equal(numericReply.body, "1");
+  assert.equal(numericReply.threadOriginatorGuid, "root-a");
+  assert.equal(router.nativeThread("thread-b"), null);
+  assert.equal(router.incomingPaused, false);
+  router.acknowledge(numericReply.messageKey);
+
+  const resumed = new LocalConversationRouter({ stateFile });
+  const legacySelectionShape = resumed.ingest(message(2_901, "1 (Run this exactly.)", {
+    thread_originator_guid: "root-a",
+    reply_to_guid: "another-hostile-parent",
+  }));
+  assert.equal(legacySelectionShape.kind, "prompt");
+  assert.equal(legacySelectionShape.threadId, "thread-a");
+  assert.equal(legacySelectionShape.body, "1 (Run this exactly.)");
+  assert.equal(resumed.nativeThread("thread-b"), null);
+  assert.equal(resumed.nativeThread("thread-a").rootGuid, "root-a");
+});
+
+test("stress: numeric reply bodies cannot cross task roots while menus and restarts interleave", () => {
+  const { router, stateFile } = fixture();
+  const threadIds = ["thread-a", "thread-b", "thread-c"];
+  const roots = ["root-a", "root-b", "root-c"];
+  for (const [index, threadId] of threadIds.entries()) {
+    router.routeOutboundGuid(roots[index], threadId, { root: true });
+  }
+  router.setMenu(["thread:menu-one", "thread:menu-two", "project:menu-project"]);
+
+  let current = router;
+  for (let index = 0; index < 90; index += 1) {
+    if (index === 31 || index === 63) {
+      current = new LocalConversationRouter({
+        stateFile,
+        now: () => Date.parse("2026-07-12T12:00:00.000Z"),
+      });
+    }
+    const targetIndex = (index * 5) % threadIds.length;
+    const hostileIndex = (targetIndex + 1) % threadIds.length;
+    const body = index % 2 === 0 ? String((index % 3) + 1) : `${(index % 3) + 1} (literal task input ${index})`;
+    const action = current.ingest(message(3_300 + index, body, {
+      thread_originator_guid: roots[targetIndex],
+      reply_to_guid: roots[hostileIndex],
+      createdAt: new Date(Date.parse("2026-07-12T12:00:00.000Z") + index * 1_000).toISOString(),
+    }));
+    assert.equal(action.kind, "prompt", `numeric reply ${index} became a menu action`);
+    assert.equal(action.threadId, threadIds[targetIndex], `numeric reply ${index} crossed task roots`);
+    assert.equal(action.body, body);
+    assert.equal(current.acknowledge(action.messageKey), true);
+  }
+
+  const resumed = new LocalConversationRouter({ stateFile });
+  for (const [index, threadId] of threadIds.entries()) {
+    assert.equal(resumed.nativeThread(threadId).rootGuid, roots[index]);
+  }
+  assert.equal(resumed.nativeThread("menu-one"), null);
+  assert.equal(resumed.nativeThread("menu-two"), null);
+});
+
+test("stress: interleaved native descendants keep command and prompt context across restarts and hostile reply parents", () => {
+  const { router, stateFile } = fixture();
+  const threadIds = ["thread-a", "thread-b", "thread-c"];
+  const roots = ["root-a", "root-b", "root-c"];
+  for (const [index, threadId] of threadIds.entries()) {
+    router.routeOutboundGuid(roots[index], threadId, { root: true });
+    for (let descendant = 0; descendant < 12; descendant += 1) {
+      router.routeOutboundGuid(`${threadId}-descendant-${descendant}`, threadId);
+    }
+  }
+  const messages = [
+    "Continue this task.",
+    "/thread",
+    "/request",
+    "/message",
+    "/turn",
+    "/history 5",
+    "/reasoning high",
+    "/listen",
+    "/link",
+    "/mute",
+    "/unmute",
+    "/retry",
+    "/dismiss",
+    "/cancel",
+    "/not-a-command",
+  ];
+  let current = router;
+  let expectedLastThread = null;
+  for (let index = 0; index < 120; index += 1) {
+    if (index === 47 || index === 89) {
+      current = new LocalConversationRouter({
+        stateFile,
+        now: () => Date.parse("2026-07-12T12:00:00.000Z"),
+      });
+    }
+    const targetIndex = (index * 7) % threadIds.length;
+    const otherIndex = (targetIndex + 1) % threadIds.length;
+    const threadId = threadIds[targetIndex];
+    const originator = index % 4 === 0
+      ? roots[targetIndex]
+      : `${threadId}-descendant-${index % 12}`;
+    const hostileParent = index % 2 === 0
+      ? roots[otherIndex]
+      : `${threadIds[otherIndex]}-descendant-${index % 12}`;
+    const action = current.ingest(message(3_000 + index, messages[index % messages.length], {
+      thread_originator_guid: originator,
+      reply_to_guid: hostileParent,
+      createdAt: new Date(Date.parse("2026-07-12T12:00:00.000Z") + index * 1_000).toISOString(),
+    }));
+    assert.ok(action, `stress action ${index} was dropped`);
+    assert.equal(action.threadId, threadId, `stress action ${index} crossed native task context`);
+    assert.equal(action.threadOriginatorGuid, originator);
+    assert.equal(action.replyToGuid, hostileParent);
+    assert.ok(!["stale-reply-context", "ambiguous-reply-context"].includes(action.kind));
+    assert.equal(current.acknowledge(action.messageKey), true);
+    expectedLastThread = threadId;
+  }
+
+  const resumed = new LocalConversationRouter({
+    stateFile,
+    now: () => Date.parse("2026-07-12T12:02:01.000Z"),
+  });
+  assert.equal(resumed.lastUserThreadId, expectedLastThread);
+  const topLevel = resumed.ingest(message(3_200, "Continue the default task.", {
+    reply_to_guid: roots[(threadIds.indexOf(expectedLastThread) + 1) % roots.length],
+    createdAt: "2026-07-12T12:02:01.000Z",
+  }));
+  assert.equal(topLevel.kind, "prompt");
+  assert.equal(topLevel.threadId, expectedLastThread);
+});
+
+test("unknown and corrupt native originators fail closed without falling back to the default task", () => {
+  const { router, stateFile } = fixture();
+  router.routeOutboundGuid("root-a", "thread-a", { root: true });
+  const seed = router.ingest(message(22, "Seed A", { thread_originator_guid: "root-a" }));
+  router.acknowledge(seed.messageKey);
+
+  const stale = router.ingest(message(23, "Must not reach A", {
+    thread_originator_guid: "deleted-native-root",
+    reply_to_guid: "root-a",
+  }));
+  assert.equal(stale.kind, "stale-reply-context");
+  assert.equal(stale.threadId, undefined);
+  assert.equal(router.lastUserThreadId, "thread-a");
+  router.acknowledge(stale.messageKey);
+
+  const invalid = router.ingest(message(24, "Also must not reach A", {
+    thread_originator_guid: "x".repeat(300),
+  }));
+  assert.equal(invalid.kind, "stale-reply-context");
+  assert.equal(invalid.threadId, undefined);
+  router.acknowledge(invalid.messageKey);
+
+  const stored = JSON.parse(readFileSync(stateFile, "utf8"));
+  stored.threads["thread-b"] = {
+    rootGuid: "root-a",
+    latestGuid: null,
+    muted: false,
+    listen: false,
+    lastActivityAt: "2026-07-12T12:00:00.000Z",
+  };
+  writeFileSync(stateFile, `${JSON.stringify(stored)}\n`);
+  const corrupted = new LocalConversationRouter({ stateFile });
+  const ambiguous = corrupted.ingest(message(25, "Do not guess", { thread_originator_guid: "root-a" }));
+  assert.equal(ambiguous.kind, "ambiguous-reply-context");
+  assert.equal(ambiguous.threadId, undefined);
+});
+
+test("unknown commands preserve an authoritative native task context", () => {
+  const { router } = fixture();
+  router.routeOutboundGuid("root-a", "thread-a", { root: true });
+  router.routeOutboundGuid("root-b", "thread-b", { root: true });
+  const action = router.ingest(message(26, "/not-a-command", {
+    thread_originator_guid: "root-a",
+    reply_to_guid: "root-b",
+  }));
+  assert.equal(action.kind, "unknown-command");
+  assert.equal(action.threadId, "thread-a");
+  assert.equal(action.threadOriginatorGuid, "root-a");
+});
+
+test("poll votes resolve registered actions and refresh stale reasoning context", () => {
   const { router, advance } = fixture();
   router.registerPoll("poll-guid", {
     optionHigh: { kind: "control", command: "reasoning", threadId: "thread-a", argument: "high" },
@@ -107,13 +309,420 @@ test("poll votes resolve only registered, unexpired task actions", () => {
     guid: "guid-30",
     createdAt: "2026-07-12T12:00:00.000Z",
   });
-  advance(61_000);
-  assert.deepEqual(router.ingest(vote(31)), {
-    kind: "stale-poll",
+  assert.deepEqual(router.ingest(message(31, "", {
+    poll: { kind: "vote", original_guid: "poll-guid", vote: { option_id: "not-registered" } },
+  })), {
+    kind: "control",
     messageKey: "guid-31",
+    threadId: "thread-a",
+    command: "reasoning",
     guid: "guid-31",
     createdAt: "2026-07-12T12:00:00.000Z",
   });
+  advance(61_000);
+  assert.deepEqual(router.ingest(vote(32)), {
+    kind: "control",
+    messageKey: "guid-32",
+    threadId: "thread-a",
+    command: "reasoning",
+    guid: "guid-32",
+    createdAt: "2026-07-12T12:00:00.000Z",
+  });
+});
+
+test("expired command pickers preserve command arguments across restart", () => {
+  const { router, stateFile } = fixture();
+  router.registerPoll("history-picker", {
+    alpha: { kind: "control", command: "history", threadId: "thread-a", argument: "5" },
+    beta: { kind: "control", command: "history", threadId: "thread-b", argument: "5" },
+  }, {
+    ttlMs: 1_000,
+    addChoiceCommand: "history",
+    addChoiceArgument: "5",
+  });
+  const resumed = new LocalConversationRouter({
+    stateFile,
+    now: () => Date.parse("2026-07-12T12:00:02.000Z"),
+  });
+  assert.deepEqual(resumed.ingest(message(3_200, "", {
+    poll: { kind: "vote", original_guid: "history-picker", vote: { option_id: "alpha" } },
+  })), {
+    kind: "thread-picker",
+    messageKey: "guid-3200",
+    command: "history",
+    argument: "5",
+    guid: "guid-3200",
+    createdAt: "2026-07-12T12:00:00.000Z",
+  });
+});
+
+test("expired generic directory polls retain the safe directory fallback", () => {
+  const { router, advance } = fixture();
+  router.registerPoll("directory-picker", {
+    projects: { kind: "projects" },
+    threads: { kind: "threads" },
+  }, 1_000);
+  advance(2_000);
+  assert.equal(router.ingest(message(3_201, "", {
+    poll: { kind: "vote", original_guid: "directory-picker", vote: { option_id: "threads" } },
+  })).kind, "stale-poll");
+});
+
+test("cross-device poll votes resolve by one unique stable option UUID and survive restart", () => {
+  const { router, stateFile } = fixture();
+  router.registerPoll("local-poll-guid", {
+    "stable-option-high": { kind: "control", command: "reasoning", threadId: "thread-a", argument: "high" },
+    "stable-option-low": { kind: "control", command: "reasoning", threadId: "thread-a", argument: "low" },
+  }, 60_000);
+  const resumed = new LocalConversationRouter({
+    stateFile,
+    now: () => Date.parse("2026-07-12T12:00:00.000Z"),
+  });
+  const action = resumed.ingest(message(33, "", {
+    poll: {
+      kind: "vote",
+      original_guid: "different-guid-on-sender-device",
+      vote: { option_id: "stable-option-high" },
+    },
+  }));
+  assert.deepEqual(action, {
+    kind: "control",
+    messageKey: "guid-33",
+    threadId: "thread-a",
+    command: "reasoning",
+    argument: "high",
+    guid: "guid-33",
+    createdAt: "2026-07-12T12:00:00.000Z",
+  });
+});
+
+test("cross-device poll option collisions and unknown UUIDs fail closed", () => {
+  const { router } = fixture();
+  router.registerPoll("local-poll-a", {
+    collision: { kind: "control", command: "reasoning", threadId: "thread-a", argument: "high" },
+  }, 60_000);
+  router.registerPoll("local-poll-b", {
+    collision: { kind: "control", command: "reasoning", threadId: "thread-b", argument: "low" },
+  }, 60_000);
+  assert.equal(router.ingest(message(34, "", {
+    poll: {
+      kind: "vote",
+      original_guid: "different-guid-on-sender-device",
+      vote: { option_id: "collision" },
+    },
+  })), null);
+  assert.equal(router.ingest(message(35, "", {
+    poll: {
+      kind: "vote",
+      original_guid: "another-foreign-guid",
+      vote: { option_id: "unknown-option" },
+    },
+  })), null);
+  assert.equal(router.lastRowId, 35);
+  assert.deepEqual(router.pendingActions(), []);
+});
+
+test("foreign native poll creation snapshots and votes are durably ignored", () => {
+  const { router, stateFile } = fixture();
+  router.routeOutboundGuid("known-task-root", "thread-a", { root: true });
+
+  // Messages emits the poll's initial choices as a `created` snapshot. These
+  // are not Add Choice search terms unless we previously registered the poll.
+  const initialSnapshot = message(32, "Weekend plans", {
+    thread_originator_guid: "foreign-poll-root",
+    poll: {
+      kind: "created",
+      original_guid: "foreign-poll",
+      options: [
+        { option_id: "foreign-a", text: "Dinner" },
+        { option_id: "foreign-b", text: "Movie" },
+      ],
+    },
+  });
+  assert.equal(router.ingest(initialSnapshot), null);
+  assert.equal(router.lastRowId, 32);
+  assert.deepEqual(router.pendingActions(), []);
+
+  const unknownVote = message(33, "Voted for Dinner", {
+    thread_originator_guid: "foreign-poll-root",
+    poll: {
+      kind: "vote",
+      original_guid: "foreign-poll",
+      vote: { option_id: "foreign-a" },
+    },
+  });
+  assert.equal(router.ingest(unknownVote), null);
+  assert.equal(router.lastRowId, 33);
+  assert.deepEqual(router.pendingActions(), []);
+
+  // Both events were durably consumed and cannot replay after restart.
+  const resumed = new LocalConversationRouter({ stateFile });
+  assert.equal(resumed.ingest(initialSnapshot), null);
+  assert.equal(resumed.ingest(unknownVote), null);
+  assert.equal(resumed.lastRowId, 33);
+  assert.deepEqual(resumed.pendingActions(), []);
+});
+
+test("explicitly enabled native Add Choice updates become durable search actions after restart", () => {
+  const { router, stateFile } = fixture();
+  router.registerPoll("browse-poll", {
+    recent: { kind: "switch", threadId: "thread-a" },
+    projects: { kind: "projects" },
+  }, {
+    ttlMs: 60_000,
+    allowAddedChoiceSearch: true,
+    optionLabels: { recent: "Recent tasks", projects: "Projects" },
+  });
+
+  const resumed = new LocalConversationRouter({
+    stateFile,
+    now: () => Date.parse("2026-07-12T12:00:00.000Z"),
+  });
+  const update = message(32, "", {
+    poll: {
+      kind: "created",
+      original_guid: "browse-poll",
+      options: [
+        { option_id: "recent", text: "Recent tasks" },
+        { option_id: "projects", text: "Projects" },
+        { option_id: "added-search", text: "router timeout" },
+      ],
+    },
+  });
+  assert.deepEqual(resumed.ingest(update), {
+    kind: "search",
+    messageKey: "guid-32",
+    command: "search",
+    argument: "router timeout",
+    guid: "guid-32",
+    createdAt: "2026-07-12T12:00:00.000Z",
+  });
+  const pendingAfterRestart = new LocalConversationRouter({
+    stateFile,
+    now: () => Date.parse("2026-07-12T12:00:00.000Z"),
+  });
+  assert.equal(pendingAfterRestart.pendingActions()[0].argument, "router timeout");
+  pendingAfterRestart.acknowledge("guid-32");
+
+  // A later full poll snapshot containing the same added option is a no-op,
+  // but still advances the durable watch cursor so it cannot replay forever.
+  const duplicate = message(33, "", {
+    poll: {
+      kind: "created",
+      original_guid: "browse-poll",
+      options: [{ option_id: "added-search", text: "router timeout" }],
+    },
+  });
+  assert.equal(pendingAfterRestart.ingest(duplicate), null);
+  assert.equal(pendingAfterRestart.lastRowId, 33);
+  assert.equal(new LocalConversationRouter({ stateFile }).lastRowId, 33);
+});
+
+test("Add Choice preserves command-picker intent instead of opening generic search results", () => {
+  const { router, stateFile } = fixture();
+  const commands = ["mute", "unmute", "cancel", "reasoning"];
+  for (const command of commands) {
+    router.registerPoll(`picker-${command}`, {
+      [`${command}-thread-a`]: { kind: "control", command, threadId: "thread-a" },
+      [`${command}-thread-b`]: { kind: "control", command, threadId: "thread-b" },
+      [`${command}-recent`]: { kind: "threads" },
+    }, {
+      ttlMs: 60_000,
+      allowAddedChoiceSearch: true,
+      optionLabels: {
+        [`${command}-thread-a`]: "Alpha task",
+        [`${command}-thread-b`]: "Beta task",
+        [`${command}-recent`]: "Recent tasks",
+      },
+    });
+  }
+
+  const resumed = new LocalConversationRouter({
+    stateFile,
+    now: () => Date.parse("2026-07-12T12:00:00.000Z"),
+  });
+  for (const [index, command] of commands.entries()) {
+    const id = 40 + index;
+    const action = resumed.ingest(message(id, "", {
+      poll: {
+        kind: "created",
+        original_guid: `picker-${command}`,
+        options: [
+          { option_id: `${command}-thread-a`, text: "Alpha task" },
+          { option_id: `${command}-thread-b`, text: "Beta task" },
+          { option_id: `${command}-recent`, text: "Recent tasks" },
+          { option_id: `${command}-query`, text: `find ${command} target` },
+        ],
+      },
+    }));
+    assert.equal(action.kind, "search");
+    assert.equal(action.command, command);
+    assert.equal(action.argument, `find ${command} target`);
+    assert.equal(resumed.acknowledge(action.messageKey), true);
+  }
+});
+
+test("Add Choice preserves a command picker's argument across restart", () => {
+  const { router, stateFile } = fixture();
+  router.registerPoll("picker-history-five", {
+    "history-thread-a": { kind: "control", command: "history", threadId: "thread-a", argument: "5" },
+    "history-thread-b": { kind: "control", command: "history", threadId: "thread-b", argument: "5" },
+  }, {
+    ttlMs: 60_000,
+    allowAddedChoiceSearch: true,
+    addChoiceCommand: "history",
+    addChoiceArgument: "5",
+    optionLabels: {
+      "history-thread-a": "Alpha task",
+      "history-thread-b": "Beta task",
+    },
+  });
+
+  const resumed = new LocalConversationRouter({
+    stateFile,
+    now: () => Date.parse("2026-07-12T12:00:00.000Z"),
+  });
+  const action = resumed.ingest(message(48, "", {
+    poll: {
+      kind: "created",
+      original_guid: "picker-history-five",
+      options_diff: [{ option_id: "history-query", text: "older rollout" }],
+    },
+  }));
+  assert.deepEqual({
+    kind: action.kind,
+    command: action.command,
+    argument: action.argument,
+    commandArgument: action.commandArgument,
+  }, {
+    kind: "search",
+    command: "history",
+    argument: "older rollout",
+    commandArgument: "5",
+  });
+  assert.equal(new LocalConversationRouter({ stateFile }).pendingActions()[0].commandArgument, "5");
+});
+
+test("cross-device Add Choice resolves by a unique known option UUID and survives restart", () => {
+  const { router, stateFile } = fixture();
+  router.registerPoll("local-directory-guid", {
+    "stable-task-option": { kind: "switch", threadId: "thread-a" },
+    "stable-projects-option": { kind: "projects" },
+  }, {
+    ttlMs: 60_000,
+    allowAddedChoiceSearch: true,
+    optionLabels: {
+      "stable-task-option": "Alpha task",
+      "stable-projects-option": "Projects",
+    },
+  });
+
+  const resumed = new LocalConversationRouter({
+    stateFile,
+    now: () => Date.parse("2026-07-12T12:00:00.000Z"),
+  });
+  assert.deepEqual(resumed.ingest(message(44, "", {
+    poll: {
+      kind: "created",
+      original_guid: "different-guid-on-sender-device",
+      options: [
+        { id: "stable-task-option", text: "Alpha task" },
+        { id: "stable-projects-option", text: "Projects" },
+        { id: "new-search-option", text: "native reply routing" },
+      ],
+    },
+  })), {
+    kind: "search",
+    messageKey: "guid-44",
+    command: "search",
+    argument: "native reply routing",
+    guid: "guid-44",
+    createdAt: "2026-07-12T12:00:00.000Z",
+  });
+});
+
+test("cross-device Add Choice collisions, unknown UUIDs, and missing origins fail closed", () => {
+  const { router, stateFile } = fixture();
+  for (const [guid, threadId] of [["local-picker-a", "thread-a"], ["local-picker-b", "thread-b"]]) {
+    router.registerPoll(guid, {
+      "colliding-stable-option": { kind: "control", command: "mute", threadId },
+    }, {
+      ttlMs: 60_000,
+      allowAddedChoiceSearch: true,
+      optionLabels: { "colliding-stable-option": `${threadId} task` },
+    });
+  }
+
+  const ambiguous = message(45, "", {
+    poll: {
+      kind: "created",
+      original_guid: "remote-ambiguous-guid",
+      options: [
+        { id: "colliding-stable-option", text: "thread-a task" },
+        { id: "ambiguous-query", text: "must not run" },
+      ],
+    },
+  });
+  const foreign = message(46, "", {
+    poll: {
+      kind: "created",
+      original_guid: "foreign-guid",
+      options: [
+        { id: "foreign-stable-option", text: "Foreign choice" },
+        { id: "foreign-query", text: "also must not run" },
+      ],
+    },
+  });
+  const missingOrigin = message(47, "", {
+    poll: {
+      kind: "created",
+      options: [
+        { id: "colliding-stable-option", text: "thread-a task" },
+        { id: "originless-query", text: "still must not run" },
+      ],
+    },
+  });
+  assert.equal(router.ingest(ambiguous), null);
+  assert.equal(router.ingest(foreign), null);
+  assert.equal(router.ingest(missingOrigin), null);
+  assert.equal(router.lastRowId, 47);
+  assert.deepEqual(router.pendingActions(), []);
+
+  const resumed = new LocalConversationRouter({ stateFile });
+  assert.equal(resumed.ingest(ambiguous), null);
+  assert.equal(resumed.ingest(foreign), null);
+  assert.equal(resumed.ingest(missingOrigin), null);
+  assert.equal(resumed.lastRowId, 47);
+});
+
+test("Add Choice is ignored unless enabled and non-action poll updates are durably discarded", () => {
+  const { router, stateFile } = fixture();
+  router.registerPoll("reasoning-poll", {
+    high: { kind: "control", command: "reasoning", threadId: "thread-a", argument: "high" },
+  }, 60_000);
+  const created = message(34, "", {
+    poll: {
+      kind: "created",
+      original_guid: "reasoning-poll",
+      options: [{ option_id: "search", text: "must not search" }],
+    },
+  });
+  assert.equal(router.ingest(created), null);
+  assert.equal(router.lastRowId, 34);
+  assert.deepEqual(router.pendingActions(), []);
+
+  const unvote = message(35, "", {
+    poll: {
+      kind: "unvote",
+      original_guid: "reasoning-poll",
+      vote: { option_id: "high" },
+    },
+  });
+  assert.equal(router.ingest(unvote), null);
+  assert.equal(router.lastRowId, 35);
+  const resumed = new LocalConversationRouter({ stateFile });
+  assert.equal(resumed.ingest(unvote), null);
+  assert.equal(resumed.lastRowId, 35);
 });
 
 test("expired and out-of-range snapshots fail closed", () => {
@@ -125,11 +734,16 @@ test("expired and out-of-range snapshots fail closed", () => {
   assert.equal(router.ingest(message(41, "1")).kind, "stale-menu");
 });
 
-test("reaction rows are ignored and activity/cursor advance only for durable actions", () => {
-  const { router } = fixture();
+test("reaction rows are durably discarded without creating user activity or work", () => {
+  const { router, stateFile } = fixture();
   router.setActiveThread("thread-a");
   assert.equal(router.ingest(message(50, "Liked", { is_reaction: true })), null);
-  assert.equal(router.lastRowId, 0);
+  assert.equal(router.lastRowId, 50);
+  assert.equal(router.lastUserMessageAt, null);
+  assert.deepEqual(router.pendingActions(), []);
+  const resumed = new LocalConversationRouter({ stateFile });
+  assert.equal(resumed.ingest(message(50, "Liked", { is_reaction: true })), null);
+  assert.equal(resumed.lastRowId, 50);
   router.ingest(message(51, "Hello"));
   assert.equal(router.lastRowId, 51);
   assert.equal(router.lastUserMessageAt, "2026-07-12T12:00:00.000Z");
@@ -248,7 +862,7 @@ test("persists independent native roots, latest GUIDs, mute, listen, and activit
   assert.equal(new LocalConversationRouter({ stateFile }).nativeThread("thread-a").listen, false);
 });
 
-test("routes direct parents, native thread originators, and earlier inbound GUIDs after restart", () => {
+test("routes native thread originators and preserves their inbound descendants after restart", () => {
   const { router, stateFile } = fixture();
   router.routeOutboundGuid("root-a", "thread-a", { root: true });
   router.routeOutboundGuid("child-a", "thread-a");
@@ -272,12 +886,13 @@ test("routes direct parents, native thread originators, and earlier inbound GUID
 
   const byEarlierInbound = resumed.ingest(message(62, "Reply to my earlier message", {
     reply_to_guid: "inbound-a",
+    thread_originator_guid: "root-a",
   }));
   assert.equal(byEarlierInbound.threadId, "thread-a");
   assert.equal(resumed.nativeThread("thread-a").latestGuid, "guid-62");
 });
 
-test("explicit inbound route registration persists the message, parent, and originator", () => {
+test("explicit inbound route registration persists the message and authoritative originator only", () => {
   const { router, stateFile } = fixture();
   router.routeInboundGuid("inbound-child", "thread-a", {
     replyToGuid: "assistant-child",
@@ -287,15 +902,59 @@ test("explicit inbound route registration persists the message, parent, and orig
   const resumed = new LocalConversationRouter({ stateFile });
   assert.equal(resumed.nativeThread("thread-a").rootGuid, "assistant-root");
   assert.equal(resumed.nativeThread("thread-a").latestGuid, "inbound-child");
-  assert.equal(resumed.ingest(message(63, "Reply again", { reply_to_guid: "inbound-child" })).threadId, "thread-a");
-  assert.equal(resumed.ingest(message(64, "Reply at root", { reply_to_guid: "assistant-root" })).threadId, "thread-a");
-  assert.equal(resumed.ingest(message(65, "Reply at parent", { reply_to_guid: "assistant-child" })).threadId, "thread-a");
+  assert.equal(resumed.ingest(message(63, "Reply again", {
+    thread_originator_guid: "assistant-root",
+    reply_to_guid: "inbound-child",
+  })).threadId, "thread-a");
+  resumed.acknowledge("guid-63");
+  assert.equal(resumed.ingest(message(64, "Reply at root", { thread_originator_guid: "assistant-root" })).threadId, "thread-a");
+  resumed.acknowledge("guid-64");
+  const incidentalParent = resumed.ingest(message(65, "Top-level parent metadata", { reply_to_guid: "assistant-child" }));
+  assert.equal(incidentalParent.threadId, "thread-a");
+  assert.equal(resumed.ingest(message(66, "Unknown parent remains top-level", { reply_to_guid: "not-routed" })).threadId, "thread-a");
+});
+
+test("a conflicting originator can never become another task's native root", () => {
+  const { router, stateFile } = fixture();
+  router.routeOutboundGuid("root-a", "thread-a", { root: true });
+  router.routeInboundGuid("inbound-b", "thread-b", {
+    threadOriginatorGuid: "root-a",
+    replyToGuid: "incidental-parent",
+    createdAt: "2026-07-12T12:00:00.000Z",
+  });
+
+  assert.equal(router.nativeThread("thread-a").rootGuid, "root-a");
+  assert.equal(router.nativeThread("thread-b").rootGuid, null);
+  assert.equal(router.nativeThread("thread-b").latestGuid, "inbound-b");
+
+  const resumed = new LocalConversationRouter({ stateFile });
+  const reply = resumed.ingest(message(2_902, "Still belongs to A.", {
+    thread_originator_guid: "root-a",
+    reply_to_guid: "inbound-b",
+  }));
+  assert.equal(reply.kind, "prompt");
+  assert.equal(reply.threadId, "thread-a");
+  assert.equal(resumed.nativeThread("thread-b").rootGuid, null);
+});
+
+test("remembering an inbound message never turns its incidental parent into reply context", () => {
+  const { router } = fixture();
+  router.routeOutboundGuid("root-a", "thread-a", { root: true });
+  router.routeOutboundGuid("root-b", "thread-b", { root: true });
+  router.routeInboundGuid("inbound-a", "thread-a", {
+    replyToGuid: "incidental-unmapped-parent",
+    threadOriginatorGuid: "root-a",
+  });
+  const seedDefault = router.ingest(message(67, "Use B by default", { thread_originator_guid: "root-b" }));
+  router.acknowledge(seedDefault.messageKey);
+  const topLevel = router.ingest(message(68, "Still B", { reply_to_guid: "incidental-unmapped-parent" }));
+  assert.equal(topLevel.threadId, "thread-b");
 });
 
 test("background output cannot redirect an unthreaded prompt away from the last user task", () => {
   const { router } = fixture();
   router.routeOutboundGuid("root-a", "thread-a", { root: true, createdAt: "2026-07-12T11:59:58.000Z" });
-  const initial = router.ingest(message(69, "Work here.", { reply_to_guid: "root-a" }));
+  const initial = router.ingest(message(69, "Work here.", { thread_originator_guid: "root-a" }));
   router.acknowledge(initial.messageKey);
   router.routeOutboundGuid("root-b", "thread-b", { createdAt: "2026-07-12T12:00:01.000Z" });
   assert.equal(router.mostRecentThreadId, "thread-b");
@@ -341,7 +1000,7 @@ test("structured poll actions support projects, task selection, pages, and comma
   assert.deepEqual(resumed.awaitingPrompt, {
     threadId: "thread-b",
     selectedAt: "2026-07-12T12:00:00.000Z",
-    expiresAt: "2026-07-12T12:05:00.000Z",
+    expiresAt: "2026-07-12T12:02:00.000Z",
   });
   const prompt = resumed.ingest(message(82, "Now run the tests."));
   assert.equal(prompt.kind, "prompt");
@@ -364,7 +1023,10 @@ test("all task commands require native reply context or a picker", () => {
   const { router } = fixture();
   router.routeOutboundGuid("root-a", "thread-a");
 
-  const listen = router.ingest(message(90, "/listen", { reply_to_guid: "root-a" }));
+  const listen = router.ingest(message(90, "/listen", {
+    thread_originator_guid: "root-a",
+    reply_to_guid: "unrelated-latest-message",
+  }));
   assert.equal(listen.kind, "control");
   assert.equal(listen.command, "listen");
   assert.equal(listen.threadId, "thread-a");
@@ -406,10 +1068,63 @@ test("awaiting-prompt pause is task-local, expiring, and explicitly clearable", 
   assert.equal(router.shouldPauseIncoming("thread-a"), false);
 });
 
+test("manual selection defaults to a 120 second pause with exact expiry semantics", () => {
+  const { router, advance } = fixture();
+  router.setMenu(["thread:thread-a"]);
+  const selected = router.ingest(message(100, "1"));
+  assert.equal(selected.kind, "switch");
+  assert.equal(router.awaitingPrompt.expiresAt, "2026-07-12T12:02:00.000Z");
+  advance(119_999);
+  assert.equal(router.shouldPauseIncoming("thread-a"), true);
+  advance(2);
+  assert.equal(router.shouldPauseIncoming("thread-a"), false);
+  assert.equal(router.awaitingPrompt, null);
+});
+
+test("a native reply prompt to the manually selected task consumes the pause durably", () => {
+  const { router, stateFile } = fixture();
+  router.routeOutboundGuid("root-a", "thread-a", { root: true });
+  router.routeOutboundGuid("root-b", "thread-b", { root: true });
+  router.setAwaitingPrompt("thread-a");
+
+  const other = router.ingest(message(101, "Work in B", { thread_originator_guid: "root-b" }));
+  assert.equal(other.threadId, "thread-b");
+  assert.equal(router.shouldPauseIncoming("thread-a"), true);
+  router.acknowledge(other.messageKey);
+
+  const selected = router.ingest(message(102, "Now work in A", {
+    thread_originator_guid: "root-a",
+    reply_to_guid: "root-b",
+  }));
+  assert.equal(selected.kind, "prompt");
+  assert.equal(selected.threadId, "thread-a");
+  assert.equal(selected.fromAwaitingPrompt, true);
+  assert.equal(router.incomingPaused, false);
+  assert.equal(new LocalConversationRouter({ stateFile }).incomingPaused, false);
+});
+
+test("top-level cancel targets and releases a pending manual selection", () => {
+  const { router, stateFile } = fixture();
+  router.setAwaitingPrompt("thread-a");
+  const action = router.ingest(message(103, "/cancel", { reply_to_guid: "incidental-parent" }));
+  assert.deepEqual(action, {
+    kind: "control",
+    messageKey: "guid-103",
+    threadId: "thread-a",
+    command: "cancel",
+    guid: "guid-103",
+    replyToGuid: "incidental-parent",
+    createdAt: "2026-07-12T12:00:00.000Z",
+    fromAwaitingPrompt: true,
+  });
+  assert.equal(router.incomingPaused, false);
+  assert.equal(new LocalConversationRouter({ stateFile }).incomingPaused, false);
+});
+
 test("v5 state persists the last user task independently from background activity", () => {
   const { router, stateFile } = fixture();
   router.routeOutboundGuid("root-a", "thread-a", { root: true });
-  const action = router.ingest(message(110, "Reply", { reply_to_guid: "root-a" }));
+  const action = router.ingest(message(110, "Reply", { thread_originator_guid: "root-a" }));
   router.acknowledge(action.messageKey);
   router.routeOutboundGuid("root-b", "thread-b", { root: true });
   const resumed = new LocalConversationRouter({ stateFile });

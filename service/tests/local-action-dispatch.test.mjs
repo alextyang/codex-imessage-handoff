@@ -1,0 +1,76 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+import { isTerminalLocalActionFailure, LocalActionDispatch } from "../src/local-action-dispatch.mjs";
+
+test("ambiguous sends remain retryable while structural delivery failures fail closed", () => {
+  assert.equal(isTerminalLocalActionFailure("AMBIGUOUS"), false);
+  assert.equal(isTerminalLocalActionFailure("IMSG_IPC_DISCONNECTED"), false);
+  for (const code of ["NO_POLL", "POLL_GUID_MISSING", "POLL_OPTIONS_MISSING", "ROOT_GUID_MISSING", "UNSUPPORTED"]) {
+    assert.equal(isTerminalLocalActionFailure(code), true, code);
+  }
+});
+
+test("coalesces live and recovery copies while preserving ordered actions and later retries", async () => {
+  const started = [];
+  const releases = new Map();
+  const dispatch = new LocalActionDispatch(async (action) => {
+    started.push(action.messageKey);
+    await new Promise((resolve) => { releases.set(action.messageKey, resolve); });
+  });
+
+  const first = dispatch.enqueue({ messageKey: "first" });
+  const recoveryCopy = dispatch.enqueue({ messageKey: "first" });
+  const second = dispatch.enqueue({ messageKey: "second" });
+  assert.equal(recoveryCopy, first);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(started, ["first"]);
+
+  releases.get("first")();
+  await first;
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(started, ["first", "second"]);
+  releases.get("second")();
+  await second;
+
+  const retry = dispatch.enqueue({ messageKey: "first" });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(started, ["first", "second", "first"]);
+  releases.get("first")();
+  await retry;
+});
+
+test("an immediate cancellation bypasses an unrelated blocked action but remains deduplicated", async () => {
+  const started = [];
+  let releaseBlocked;
+  const blocked = new Promise((resolve) => { releaseBlocked = resolve; });
+  const dispatch = new LocalActionDispatch(async (action) => {
+    started.push(action.messageKey);
+    if (action.messageKey === "blocked") await blocked;
+  });
+
+  const first = dispatch.enqueue({ messageKey: "blocked" });
+  await new Promise((resolve) => setImmediate(resolve));
+  const cancel = dispatch.enqueue({ messageKey: "cancel" }, { immediate: true });
+  const duplicateCancel = dispatch.enqueue({ messageKey: "cancel" }, { immediate: true });
+  assert.equal(duplicateCancel, cancel);
+  await cancel;
+  assert.deepEqual(started, ["blocked", "cancel"]);
+  releaseBlocked();
+  await first;
+});
+
+test("a failed prompt admission releases the ordinary queue for later actions", async () => {
+  const started = [];
+  const dispatch = new LocalActionDispatch(async (action) => {
+    started.push(action.messageKey);
+    if (action.messageKey === "store-failure") {
+      throw Object.assign(new Error("disk unavailable"), { code: "CLAIMED_STORE_UNAVAILABLE" });
+    }
+  });
+
+  const failed = dispatch.enqueue({ messageKey: "store-failure" });
+  const later = dispatch.enqueue({ messageKey: "later-unmute" });
+  await assert.rejects(failed, /disk unavailable/);
+  await later;
+  assert.deepEqual(started, ["store-failure", "later-unmute"]);
+});

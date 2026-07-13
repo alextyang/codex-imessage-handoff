@@ -33,9 +33,17 @@ function requestCandidate(value, fallbackAt = null) {
   return { body: value ?? "", at: fallbackAt };
 }
 
+function isActiveStatus(value) {
+  return value === "working" || value === "running" || value === "pending" || value === "queued";
+}
+
+function isPendingStatus(value) {
+  return value === "pending" || value === "queued";
+}
+
 function rowActivity(row) {
   return Math.max(
-    dateMs(row.lastTurnAt) || 0,
+    dateMs(row.thread?.lastTurnAtMs) || dateMs(row.thread?.lastTurnAt) || 0,
     dateMs(row.state.latestRequestAt) || 0,
     dateMs(row.state.stateSince) || 0,
   );
@@ -43,6 +51,7 @@ function rowActivity(row) {
 
 function compareRows(left, right) {
   return Number(right.pending) - Number(left.pending)
+    || Number(right.active) - Number(left.active)
     || rowActivity(right) - rowActivity(left)
     || left.thread.id.localeCompare(right.thread.id);
 }
@@ -50,8 +59,16 @@ function compareRows(left, right) {
 function compareGroups(left, right) {
   if (left.other !== right.other) return left.other ? 1 : -1;
   return Number(right.hasPending) - Number(left.hasPending)
+    || Number(right.hasActive) - Number(left.hasActive)
     || right.activityMs - left.activityMs
     || left.projectLabel.localeCompare(right.projectLabel);
+}
+
+function groupStatus(rows) {
+  if (rows.some((row) => row.state.status === "working" || row.state.status === "running")) return "working";
+  if (rows.some((row) => isPendingStatus(row.state.status) || row.pendingCount > 0)) return "pending";
+  if (rows.some((row) => ["error", "failed", "aborted"].includes(row.state.status))) return "error";
+  return "idle";
 }
 
 export async function buildThreadDirectory(threads, options = {}) {
@@ -81,9 +98,10 @@ export async function buildThreadDirectory(threads, options = {}) {
     seen.add(id);
     const state = stateForThread(thread, stateFor);
     const pendingCount = Math.max(0, Number(state.pendingCount) || 0);
-    const pending = state.status === "pending" || pendingCount > 0;
+    const pending = isPendingStatus(state.status) || pendingCount > 0;
+    const active = isActiveStatus(state.status) || pendingCount > 0;
     const lastTurnMs = dateMs(thread.lastTurnAtMs) ?? dateMs(thread.lastTurnAt);
-    if (!pending && (lastTurnMs === null || lastTurnMs < cutoff)) continue;
+    if (!active && (lastTurnMs === null || lastTurnMs < cutoff)) continue;
     // Directory commands make one complete history read per visible thread and
     // reuse it for both the preview and the turn count.
     const history = historyFor ? await historyFor(thread) : null;
@@ -106,6 +124,7 @@ export async function buildThreadDirectory(threads, options = {}) {
     eligible.push({
       thread,
       state,
+      active,
       pending,
       pendingCount,
       preview: requestPreview(request),
@@ -127,6 +146,7 @@ export async function buildThreadDirectory(threads, options = {}) {
   const groups = [...byProject.values()].map((group) => {
     group.rows.sort(compareRows);
     group.hasPending = group.rows.some((row) => row.pending);
+    group.hasActive = group.rows.some((row) => row.active);
     group.activityMs = group.rows.reduce((latest, row) => Math.max(latest, rowActivity(row)), 0);
     return group;
   }).sort(compareGroups);
@@ -141,6 +161,8 @@ export async function buildThreadDirectory(threads, options = {}) {
       : { startedAt: new Date(projectStartedAtMs.get(group.projectKey)).toISOString() }),
     threadCount: group.rows.length,
     hiddenCount: 0,
+    status: groupStatus(group.rows),
+    activityAt: group.activityMs > 0 ? new Date(group.activityMs).toISOString() : null,
     threads: group.rows.map((row) => {
       references.push(`thread:${row.thread.id}`);
       return {
@@ -164,7 +186,7 @@ export async function buildThreadDirectory(threads, options = {}) {
     directory: {
       label: "THREADS",
       totalTasks: eligible.length,
-      criteria: "pending + activity in last 48h",
+      criteria: "working/pending + activity in last 48h",
       groups: renderedGroups,
       collapsedProjects: [],
       note: eligible.length

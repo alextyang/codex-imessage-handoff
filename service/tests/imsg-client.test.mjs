@@ -8,6 +8,7 @@ const fullStatus = {
   version: "0.13.0",
   basic_features: true,
   advanced_features: true,
+  poll_caption_control: true,
   typing_indicators: true,
   read_receipts: true,
   sip: "disabled",
@@ -140,6 +141,7 @@ test("locates imsg and reports normalized basic and bridge capabilities", async 
   assert.equal(status.capabilities.richText, true);
   assert.equal(status.capabilities.urlPreviews, true);
   assert.equal(status.capabilities.polls, true);
+  assert.equal(status.capabilities.pollCaptionControl, true);
   assert.equal(status.capabilities.pollVoting, true);
   assert.equal(status.capabilities.typing, true);
   assert.equal(status.capabilities.readReceipts, true);
@@ -240,7 +242,7 @@ test("sends rich text, native polls, votes, tapbacks, typing, read receipts, and
   const reply = await client.sendRich({ chat_id: 42, text: "threaded", reply_to: "PARENT" });
   const attachment = await client.sendRich({ chat_id: 42, file: "/tmp/image.png", reply_to: "PARENT" });
   const link = await client.sendRich({ chat_id: 42, url: "https://example.com/card" });
-  const poll = await client.sendPoll({ chat_id: 42, question: "Dinner?", options: ["Pizza", "Sushi"] });
+  const poll = await client.sendPoll({ chat_id: 42, question: "Dinner?", options: ["Pizza", "Sushi"], sendCaption: false });
   const vote = await client.votePoll({ chat_id: 42, poll_guid: "POLL", option_id: "PIZZA" });
   const reaction = await client.tapback({ chat_id: 42, message_guid: "MESSAGE", reaction: "love" });
   const typing = await client.setTyping({ chat_id: 42 }, true);
@@ -258,9 +260,165 @@ test("sends rich text, native polls, votes, tapbacks, typing, read receipts, and
   assert.equal(child.requests[2].params.reply_to, "PARENT");
   assert.equal(child.requests[3].params.file, "/tmp/image.png");
   assert.equal(child.requests[4].params.url, "https://example.com/card");
+  assert.deepEqual(child.requests[5].params, {
+    chat_id: 42,
+    question: "Dinner?",
+    options: ["Pizza", "Sushi"],
+    send_caption: false,
+  });
   assert.deepEqual(child.requests[11].params, { chat_id: 42, message_guid: "MESSAGE", text: "Revised", part_index: 0 });
   assert.deepEqual(child.requests[12].params, { chat_id: 42, message_guid: "MESSAGE", part_index: 0 });
   await client.stop();
+});
+
+test("preserves only bounded content-free diagnostics for explicit RPC send errors", async () => {
+  const sensitiveGuid = "p:0/01234567-89AB-CDEF-0123-456789ABCDEF";
+  const sensitiveIdentity = "private-person@example.com";
+  const child = respondingChild({
+    "poll.send": (request, process) => queueMicrotask(() => process.json({
+      jsonrpc: "2.0",
+      id: request.id,
+      error: {
+        code: -32603,
+        message: "Internal error",
+        data: `Could not resolve reply target for poll: ${sensitiveGuid} ${sensitiveIdentity}`,
+      },
+    })),
+  });
+  const { client } = createClient({ child });
+  const result = await client.sendPoll({
+    chat_id: 42,
+    question: "Choose",
+    options: ["One", "Two"],
+    reply_to: sensitiveGuid,
+  });
+
+  assert.deepEqual(result, {
+    classification: "ambiguous",
+    accepted: false,
+    ambiguous: true,
+    unsupported: false,
+    retrySafe: false,
+    reason: "transport-or-send-failure",
+    failureSource: "remote-error",
+    remoteCode: -32603,
+    remoteCategory: "poll-reply-target-unresolved",
+    remoteMessage: "The poll reply target could not be resolved.",
+  });
+  const serialized = JSON.stringify(result);
+  assert.equal(serialized.includes(sensitiveGuid), false);
+  assert.equal(serialized.includes(sensitiveIdentity), false);
+  await client.stop();
+});
+
+test("classifies an oversized native poll payload without retaining its labels", async () => {
+  const privateLabel = "private menu label";
+  const child = respondingChild({
+    "poll.send": (request, process) => queueMicrotask(() => process.json({
+      jsonrpc: "2.0",
+      id: request.id,
+      error: {
+        code: -32603,
+        message: "Internal error",
+        data: `Poll definition payload exceeds 4096 bytes: ${privateLabel}`,
+      },
+    })),
+  });
+  const { client } = createClient({ child });
+  const result = await client.sendPoll({ chat_id: 42, question: "Choose", options: ["One", "Two"] });
+
+  assert.equal(result.remoteCategory, "poll-payload-too-large");
+  assert.equal(result.remoteMessage, "The native poll payload exceeded the Messages size limit.");
+  assert.equal(JSON.stringify(result).includes(privateLabel), false);
+  await client.stop();
+});
+
+test("classifies only the helper's fixed poll-construction stage codes", async () => {
+  const stages = new Map([
+    ["missing-class", "poll-construction-missing-class"],
+    ["empty-balloon", "poll-construction-empty-balloon"],
+    ["legacy-item-alloc", "poll-construction-legacy-item-allocation"],
+    ["legacy-item-init", "poll-construction-legacy-item-initialization"],
+    ["legacy-wrap", "poll-construction-legacy-wrapper"],
+    ["atomic-selector", "poll-construction-atomic-selector"],
+    ["atomic-init-nil", "poll-construction-atomic-initialization"],
+  ]);
+  for (const [code, category] of stages) {
+    const child = respondingChild({
+      "poll.send": (request, process) => queueMicrotask(() => process.json({
+        jsonrpc: "2.0",
+        id: request.id,
+        error: {
+          code: -32603,
+          message: "Internal error",
+          data: `Could not construct poll IMMessage [${code}] private-person@example.com`,
+        },
+      })),
+    });
+    const { client } = createClient({ child });
+    const result = await client.sendPoll({ chat_id: 42, question: "Choose", options: ["One", "Two"] });
+    assert.equal(result.remoteCategory, category);
+    assert.equal(JSON.stringify(result).includes("private-person"), false);
+    await client.stop();
+  }
+
+  const unknownChild = respondingChild({
+    "poll.send": (request, process) => queueMicrotask(() => process.json({
+      jsonrpc: "2.0",
+      id: request.id,
+      error: {
+        code: -32603,
+        message: "Internal error",
+        data: "Could not construct poll IMMessage [private-user-supplied-code]",
+      },
+    })),
+  });
+  const unknown = createClient({ child: unknownChild });
+  const unknownResult = await unknown.client.sendPoll({ chat_id: 42, question: "Choose", options: ["One", "Two"] });
+  assert.equal(unknownResult.remoteCategory, "poll-message-construction-failed");
+  assert.equal(JSON.stringify(unknownResult).includes("private-user-supplied-code"), false);
+  await unknown.client.stop();
+});
+
+test("drops unsafe or unbounded remote diagnostics and distinguishes timeout from EOF", async () => {
+  const unsafeChild = respondingChild({
+    "poll.send": (request, process) => queueMicrotask(() => process.json({
+      jsonrpc: "2.0",
+      id: request.id,
+      error: {
+        code: Number.MAX_SAFE_INTEGER,
+        message: "private-person@example.com said a private message",
+        data: "x".repeat(3_000),
+      },
+    })),
+  });
+  const unsafe = createClient({ child: unsafeChild });
+  const unsafeResult = await unsafe.client.sendPoll({ chat_id: 42, question: "Choose", options: ["One", "Two"] });
+  assert.deepEqual(unsafeResult, {
+    classification: "ambiguous",
+    accepted: false,
+    ambiguous: true,
+    unsupported: false,
+    retrySafe: false,
+    reason: "transport-or-send-failure",
+    failureSource: "remote-error",
+  });
+  await unsafe.client.stop();
+
+  const timedOut = createClient({ child: respondingChild({ "poll.send": () => {} }) });
+  const timeoutResult = await timedOut.client.sendPoll({ chat_id: 42, question: "Choose", options: ["One", "Two"] });
+  assert.equal(timeoutResult.reason, "timeout");
+  assert.equal(timeoutResult.failureSource, "timeout");
+  await timedOut.client.stop();
+
+  const closedChild = respondingChild({
+    "poll.send": (_request, process) => queueMicrotask(() => process.close(1)),
+  });
+  const closed = createClient({ child: closedChild });
+  const closedResult = await closed.client.sendPoll({ chat_id: 42, question: "Choose", options: ["One", "Two"] });
+  assert.equal(closedResult.reason, "transport-or-send-failure");
+  assert.equal(closedResult.failureSource, "eof");
+  await closed.client.stop();
 });
 
 test("caps native Apple polls at twelve options before any send attempt", async () => {
@@ -281,6 +439,37 @@ test("caps native Apple polls at twelve options before any send attempt", async 
   assert.equal(invalid.retrySafe, true);
   assert.equal(child.requests.filter((request) => request.method === "poll.send").length, 1);
   await client.stop();
+});
+
+test("caption-free polls fail closed when the patched imsg capability is absent", async () => {
+  const status = { ...fullStatus, poll_caption_control: false };
+  const { client, child } = createClient({ status });
+
+  const result = await client.sendPoll({
+    chat_id: 42,
+    question: "Choose",
+    options: ["One", "Two"],
+    send_caption: false,
+  });
+
+  assert.equal((await client.status()).capabilities.pollCaptionControl, false);
+  assert.equal(result.classification, "unsupported");
+  assert.equal(result.reason, "pollCaptionControl-unavailable");
+  assert.equal(child.requests.length, 0, "caption suppression must not be attempted on an unpatched imsg");
+});
+
+test("poll caption control rejects non-boolean values before any send attempt", async () => {
+  const { client, child } = createClient();
+  const result = await client.sendPoll({
+    chat_id: 42,
+    question: "Choose",
+    options: ["One", "Two"],
+    send_caption: "false",
+  });
+
+  assert.equal(result.classification, "unsupported");
+  assert.equal(result.reason, "IMSG_INVALID_INPUT");
+  assert.equal(child.requests.length, 0);
 });
 
 test("rejects malformed edit and unsend mutations before writing RPC", async () => {

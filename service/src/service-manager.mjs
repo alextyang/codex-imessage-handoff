@@ -505,6 +505,9 @@ export function requestSharedBackendActivation() {
   const paths = servicePaths();
   const status = sharedBackendSupervisorStatus();
   if (!status.running || !status.fresh || !status.healthy) throw new Error("The shared app-server supervisor is not healthy.");
+  if (status.activationConflict) {
+    throw new Error("Shared backend activation conflicts with an environment value the supervisor does not own.");
+  }
   const config = ownedSupervisorConfig(paths);
   if (!config || config.instanceId !== status.state?.instanceId) throw new Error("The shared app-server supervisor configuration is stale.");
   const buildFingerprint = sharedBackendSupervisorBuildFingerprint();
@@ -568,7 +571,17 @@ export function sharedBackendSupervisorStatus(options = {}) {
   const jobRunning = /\bstate = running\b/.test(output);
   const running = jobRunning && currentInstance && currentPid && currentBuild && fresh;
   const rawHealthy = jobRunning && currentInstance && currentPid && fresh && state?.healthy === true;
-  const activationEnabled = runLaunchctl(["getenv", localDaemonEnvironment], true).trim() === "1";
+  const activationValue = runLaunchctl(["getenv", localDaemonEnvironment], true).trim();
+  const activationEnabled = activationValue === "1";
+  const activationOwned = state?.activationOwned === true;
+  const activationConflict = state?.activationConflict === true
+    || Boolean(activationValue && (activationValue !== "1" || !activationOwned));
+  const activationReady = activationEnabled
+    && activationOwned
+    && state?.activationEnabled === true
+    && !activationConflict
+    && config?.activationRequested === true
+    && config?.failOpenLatched !== true;
   return {
     installed: existsSync(paths.sharedBackendSupervisorPlist),
     running,
@@ -582,6 +595,9 @@ export function sharedBackendSupervisorStatus(options = {}) {
     desiredBuildFingerprint,
     pid,
     activationEnabled,
+    activationOwned,
+    activationConflict,
+    activationReady,
     state,
     config,
     logs: [paths.sharedBackendSupervisorStdoutLog, paths.sharedBackendSupervisorStderrLog],
@@ -602,9 +618,10 @@ export function installService(options = {}) {
   }
   const supervisor = options.supervisor || sharedBackendSupervisorStatus({ paths, launchctlImpl: options.launchctlImpl });
   const desktop = options.desktop || (options.inspectDesktopImpl || inspectDesktopSharedConnection)();
-  if (!supervisor.running || !supervisor.healthy || !supervisor.activationEnabled
-    || supervisor.config?.activationRequested !== true || supervisor.config?.failOpenLatched === true
-    || !desktop.shared) {
+  if (supervisor.activationConflict) {
+    throw new Error("The iMessage service will not start while shared backend activation is owned by an unknown process.");
+  }
+  if (!supervisor.running || !supervisor.healthy || !supervisor.activationReady || !desktop.shared) {
     throw new Error("The split-user Messages helper will not start until Codex Desktop and the service share the healthy supervised app-server.");
   }
   mkdirSync(paths.home, { recursive: true, mode: 0o700 });

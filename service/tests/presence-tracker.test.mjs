@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -25,6 +25,18 @@ test("initial readiness and same-state restarts do not emit startup boilerplate"
   assert.deepEqual(delivered, []);
 });
 
+test("an offline startup baseline does not produce an unmatched online notice", async () => {
+  const { create } = fixture();
+  const delivered = [];
+  assert.equal((await create().observe("offline", { active: true })).baseline, true);
+  const recovered = await create().observe("online", {
+    active: true,
+    deliver: async (event) => { delivered.push(event); return { terminal: true, sent: true }; },
+  });
+  assert.equal(recovered.collapsed, true);
+  assert.deepEqual(delivered, []);
+});
+
 test("real offline and recovery edges emit once and survive restarts without duplicates", async () => {
   const { create } = fixture();
   const delivered = [];
@@ -39,7 +51,7 @@ test("real offline and recovery edges emit once and survive restarts without dup
   assert.equal(new Set(delivered.map((event) => event.deliveryId)).size, 2);
 });
 
-test("inactive edges are settled without stale notification and pending delivery retries stably", async () => {
+test("inactive edges and their unmatched recovery are settled without stale notifications", async () => {
   const { create } = fixture();
   const delivered = [];
   await create().observe("online", { active: false });
@@ -50,6 +62,87 @@ test("inactive edges are settled without stale notification and pending delivery
     deliver: async (event) => { delivered.push(event); return { terminal: true, sent: true }; },
   })).changed, false);
   assert.deepEqual(delivered, []);
+
+  const recovered = await create().observe("online", {
+    active: true,
+    deliver: async (event) => { delivered.push(event); return { terminal: true, sent: true }; },
+  });
+  assert.equal(recovered.collapsed, true);
+  assert.equal(recovered.suppressed, true);
+  assert.deepEqual(delivered, []);
+});
+
+test("an undelivered offline-to-online flap collapses durably without an unsolicited recovery", async () => {
+  const { create } = fixture();
+  const delivered = [];
+  await create().observe("online", { active: true });
+
+  const offline = await create().observe("offline", {
+    active: true,
+    deliver: async (event) => { delivered.push(event); return { terminal: false, sent: false }; },
+  });
+  assert.equal(offline.pending, true);
+
+  const recovered = await create().observe("online", {
+    active: true,
+    deliver: async (event) => { delivered.push(event); return { terminal: true, sent: true }; },
+  });
+  assert.equal(recovered.collapsed, true);
+  assert.equal(recovered.sent, false);
+  assert.deepEqual(delivered.map((event) => event.state), ["offline"]);
+
+  const afterRestart = await create().observe("online", {
+    active: true,
+    deliver: async (event) => { delivered.push(event); return { terminal: true, sent: true }; },
+  });
+  assert.equal(afterRestart.changed, false);
+  assert.deepEqual(delivered.map((event) => event.state), ["offline"]);
+});
+
+test("a rejected offline delivery is still collapsed when health immediately recovers", async () => {
+  const { create } = fixture();
+  const delivered = [];
+  await create().observe("online", { active: true });
+  await assert.rejects(create().observe("offline", {
+    active: true,
+    deliver: async () => { throw new Error("transport unavailable"); },
+  }), /transport unavailable/);
+
+  const recovered = await create().observe("online", {
+    active: true,
+    deliver: async (event) => { delivered.push(event); return { terminal: true, sent: true }; },
+  });
+  assert.equal(recovered.collapsed, true);
+  assert.deepEqual(delivered, []);
+});
+
+test("a new process collapses a pending offline record left by an older deployment", async () => {
+  const { file, create } = fixture();
+  writeFileSync(file, `${JSON.stringify({
+    version: 1,
+    observedState: "offline",
+    transitionId: "legacy-offline-edge",
+    transitionAt: "2026-07-13T11:59:00.000Z",
+    settledTransitionId: null,
+    delivery: "pending",
+  })}\n`, { mode: 0o600 });
+  const delivered = [];
+
+  const recovered = await create().observe("online", {
+    active: true,
+    deliver: async (event) => { delivered.push(event); return { terminal: true, sent: true }; },
+  });
+  assert.equal(recovered.collapsed, true);
+  assert.equal(recovered.suppressed, true);
+  assert.deepEqual(delivered, []);
+});
+
+test("online delivery retries stably after a confirmed offline notification", async () => {
+  const { create } = fixture();
+  const delivered = [];
+  const success = async (event) => { delivered.push(event); return { terminal: true, sent: true }; };
+  await create().observe("online", { active: true });
+  assert.equal((await create().observe("offline", { active: true, deliver: success })).sent, true);
 
   const failedIds = [];
   const pending = await create().observe("online", {

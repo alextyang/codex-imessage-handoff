@@ -5,7 +5,7 @@ import { parseMenuSelection, parseSlashCommand } from "../../protocol/presentati
 
 const STATE_VERSION = 5;
 const DEFAULT_MENU_TTL_MS = 10 * 60 * 1000;
-const DEFAULT_AWAITING_PROMPT_TTL_MS = 5 * 60 * 1000;
+const DEFAULT_AWAITING_PROMPT_TTL_MS = 2 * 60 * 1000;
 const MAX_PENDING = 128;
 const MAX_SEEN = 512;
 const MAX_GUID_ROUTES = 512;
@@ -118,6 +118,101 @@ function normalizePollAction(value) {
   return action;
 }
 
+function normalizePollMetadata(value) {
+  const metadata = value && typeof value === "object" && !Array.isArray(value) ? value : {};
+  const knownOptionIds = new Set();
+  const knownOptionLabels = new Set();
+  const addId = (item) => {
+    const clean = cleanString(item, 256);
+    if (clean) knownOptionIds.add(clean);
+  };
+  const addLabel = (item) => {
+    const clean = cleanString(item, 2_000);
+    if (clean) knownOptionLabels.add(clean.toLocaleLowerCase());
+  };
+  const collect = (items) => {
+    if (Array.isArray(items)) {
+      for (const item of items) {
+        if (typeof item === "string") addLabel(item);
+        else if (item && typeof item === "object") {
+          addId(item.id ?? item.option_id ?? item.optionId ?? item.guid);
+          addLabel(item.text ?? item.title ?? item.label ?? item.value ?? item.name);
+        }
+      }
+    } else if (items && typeof items === "object") {
+      for (const [id, item] of Object.entries(items)) {
+        addId(id);
+        if (typeof item === "string") addLabel(item);
+        else if (item && typeof item === "object") {
+          addId(item.id ?? item.option_id ?? item.optionId ?? item.guid);
+          addLabel(item.text ?? item.title ?? item.label ?? item.value ?? item.name);
+        }
+      }
+    }
+  };
+  for (const item of Array.isArray(metadata.knownOptionIds) ? metadata.knownOptionIds : []) addId(item);
+  for (const item of Array.isArray(metadata.knownOptionLabels) ? metadata.knownOptionLabels : []) addLabel(item);
+  collect(metadata.options);
+  collect(metadata.optionLabels);
+  collect(metadata.knownOptions);
+  return {
+    addChoiceSearch: metadata.addChoiceSearch === true
+      || metadata.allowAddChoiceSearch === true
+      || metadata.allowAddedChoiceSearch === true
+      || metadata.addChoiceAsSearch === true,
+    addChoiceCommand: cleanString(
+      metadata.addChoiceCommand
+        ?? metadata.addedChoiceCommand
+        ?? metadata.addChoiceSearchCommand,
+      40,
+    ),
+    addChoiceArgument: cleanString(
+      metadata.addChoiceArgument
+        ?? metadata.addedChoiceArgument
+        ?? metadata.addChoiceCommandArgument,
+      512,
+    ),
+    refreshAction: normalizePollAction(metadata.refreshAction ?? metadata.staleAction),
+    knownOptionIds: [...knownOptionIds].slice(-500),
+    knownOptionLabels: [...knownOptionLabels].slice(-500),
+  };
+}
+
+function inferredAddChoiceCommand(options, explicitCommand = null) {
+  const requested = cleanString(explicitCommand, 40)?.toLowerCase();
+  if (requested && THREAD_COMMANDS.has(requested)) return requested;
+  const controls = Object.values(options || {}).filter((action) => action?.kind === "control");
+  if (!controls.length || controls.some((action) => action.argument)) return null;
+  const commands = new Set(controls.map((action) => cleanString(action.command, 40)?.toLowerCase()).filter(Boolean));
+  return commands.size === 1 && THREAD_COMMANDS.has([...commands][0]) ? [...commands][0] : null;
+}
+
+function inferredPollRefreshAction(options, metadata = {}) {
+  const explicit = normalizePollAction(metadata.refreshAction);
+  if (explicit) return explicit;
+
+  const pickerCommand = cleanString(metadata.addChoiceCommand, 40)?.toLowerCase();
+  if (pickerCommand && THREAD_COMMANDS.has(pickerCommand)) {
+    const action = { kind: "thread-picker", command: pickerCommand };
+    const argument = cleanString(metadata.addChoiceArgument, 512);
+    if (argument) action.argument = argument;
+    return action;
+  }
+
+  const controls = Object.values(options || {}).filter((action) => action?.kind === "control");
+  const commands = new Set(controls.map((action) => cleanString(action.command, 40)?.toLowerCase()).filter(Boolean));
+  const threadIds = new Set(controls.map((action) => cleanString(action.threadId, 200)).filter(Boolean));
+  if (!controls.length || commands.size !== 1) return null;
+  const command = [...commands][0];
+  if (command === "reasoning" && threadIds.size === 1) {
+    return { kind: "control", command, threadId: [...threadIds][0] };
+  }
+  const action = { kind: "thread-picker", command };
+  const argumentsFound = new Set(controls.map((item) => cleanString(item.argument, 512)).filter(Boolean));
+  if (argumentsFound.size === 1) action.argument = [...argumentsFound][0];
+  return action;
+}
+
 function cleanReferences(value) {
   if (!Array.isArray(value)) return [];
   return value.flatMap((item) => {
@@ -134,7 +229,7 @@ function cleanAction(value) {
   if (!kind || !messageKey) return null;
   const action = { kind, messageKey };
   if (threadId) action.threadId = threadId;
-  for (const key of ["command", "argument", "body", "prompt", "projectKey", "guid", "replyToGuid", "threadOriginatorGuid", "createdAt"]) {
+  for (const key of ["command", "argument", "commandArgument", "body", "prompt", "projectKey", "guid", "replyToGuid", "threadOriginatorGuid", "createdAt"]) {
     const item = cleanString(value[key], key === "body" || key === "prompt" ? 32_000 : 512);
     if (item) action[key] = item;
   }
@@ -211,7 +306,21 @@ function normalizeState(value, expectedConversationKey = null) {
           return cleanId && cleanValue ? [[cleanId, cleanValue]] : [];
         }))
         : {};
-      if (expiresAt && Object.keys(options).length) state.polls[cleanGuid] = { expiresAt, options };
+      if (expiresAt && Object.keys(options).length) {
+        const metadata = normalizePollMetadata(poll);
+        const addChoiceCommand = inferredAddChoiceCommand(options, metadata.addChoiceCommand);
+        const refreshAction = inferredPollRefreshAction(options, { ...metadata, addChoiceCommand });
+        state.polls[cleanGuid] = {
+          expiresAt,
+          options,
+          ...(metadata.addChoiceSearch ? { addChoiceSearch: true } : {}),
+          ...(addChoiceCommand ? { addChoiceCommand } : {}),
+          ...(metadata.addChoiceArgument ? { addChoiceArgument: metadata.addChoiceArgument } : {}),
+          ...(refreshAction ? { refreshAction } : {}),
+          knownOptionIds: [...new Set([...Object.keys(options), ...metadata.knownOptionIds])].slice(-500),
+          knownOptionLabels: metadata.knownOptionLabels,
+        };
+      }
     }
   }
   if (value.outboundReceipts && typeof value.outboundReceipts === "object" && !Array.isArray(value.outboundReceipts)) {
@@ -302,17 +411,6 @@ function routeGuid(state, guid, threadId) {
   return true;
 }
 
-function threadForGuid(state, guid) {
-  const cleanGuid = cleanString(guid, 256);
-  if (!cleanGuid) return null;
-  const routed = state.guidRoutes[cleanGuid];
-  if (routed) return routed;
-  for (const [threadId, thread] of Object.entries(state.threads)) {
-    if (thread?.rootGuid === cleanGuid || thread?.latestGuid === cleanGuid) return threadId;
-  }
-  return null;
-}
-
 function touchThreadState(state, threadId, at, { latestGuid = null, rootGuid = null } = {}) {
   const cleanThread = cleanString(threadId, 200);
   if (!cleanThread) return null;
@@ -348,32 +446,186 @@ function pruneOutboundEchoes(state, nowMs) {
 function normalizeMessage(message) {
   const key = messageKey(message);
   if (!key) return null;
+  const rawReplyToGuid = message?.reply_to_guid ?? message?.replyToGuid;
+  const rawThreadOriginatorGuid = message?.thread_originator_guid ?? message?.threadOriginatorGuid;
   return {
     key,
     id: finiteRowId(message?.id),
     guid: cleanString(message?.guid, 256),
     text: typeof message?.text === "string" ? message.text.trim() : "",
     createdAt: cleanString(message?.created_at || message?.createdAt, 64) || new Date().toISOString(),
-    replyToGuid: cleanString(message?.reply_to_guid || message?.replyToGuid, 256),
-    threadOriginatorGuid: cleanString(message?.thread_originator_guid || message?.threadOriginatorGuid, 256),
+    replyToGuid: cleanString(rawReplyToGuid, 256),
+    threadOriginatorGuid: cleanString(rawThreadOriginatorGuid, 256),
+    hasThreadOriginatorGuid: typeof rawThreadOriginatorGuid === "string" && rawThreadOriginatorGuid.trim().length > 0,
     attachments: Array.isArray(message?.attachments) ? message.attachments.slice(0, 5) : [],
     poll: message?.poll && typeof message.poll === "object" ? message.poll : null,
     isReaction: message?.is_reaction === true || message?.isReaction === true,
   };
 }
 
+function threadsForGuid(state, guid) {
+  const cleanGuid = cleanString(guid, 256);
+  if (!cleanGuid) return [];
+  const matches = new Set();
+  const routed = state.guidRoutes[cleanGuid];
+  if (routed) matches.add(routed);
+  for (const [threadId, thread] of Object.entries(state.threads)) {
+    if (thread?.rootGuid === cleanGuid || thread?.latestGuid === cleanGuid) matches.add(threadId);
+  }
+  return [...matches];
+}
+
+function routeOriginatorGuid(state, guid, threadId) {
+  const cleanGuid = cleanString(guid, 256);
+  const cleanThread = cleanString(threadId, 200);
+  if (!cleanGuid || !cleanThread) return false;
+  const matches = threadsForGuid(state, cleanGuid);
+  if (matches.some((match) => match !== cleanThread)) return false;
+  return routeGuid(state, cleanGuid, cleanThread);
+}
+
+function resolveNativeReplyContext(message, state) {
+  // Messages populates reply_to_guid on ordinary top-level messages with the
+  // immediately preceding message. Only thread_originator_guid denotes a
+  // native Reply conversation and is therefore safe to use for task routing.
+  if (!message.hasThreadOriginatorGuid) return { explicit: false, threadId: null, error: null };
+  const matches = threadsForGuid(state, message.threadOriginatorGuid);
+  if (matches.length > 1) return { explicit: true, threadId: null, error: { kind: "ambiguous-reply-context" } };
+  if (matches.length === 0) return { explicit: true, threadId: null, error: { kind: "stale-reply-context" } };
+  return { explicit: true, threadId: matches[0], error: null };
+}
+
+function uniquePollRegistrationForOption(state, optionId) {
+  const cleanOptionId = cleanString(optionId, 256);
+  if (!cleanOptionId) return null;
+  const matches = Object.entries(state.polls).filter(([, registration]) => (
+    registration?.options
+    && Object.prototype.hasOwnProperty.call(registration.options, cleanOptionId)
+  ));
+  return matches.length === 1 ? matches[0][1] : null;
+}
+
+function uniquePollRegistrationForKnownOptions(state, candidates) {
+  const candidateIds = new Set(candidates.map((candidate) => cleanString(candidate?.id, 256)).filter(Boolean));
+  if (!candidateIds.size) return null;
+  const matches = Object.values(state.polls).filter((registration) => {
+    const knownIds = new Set([
+      ...Object.keys(registration?.options || {}),
+      ...(Array.isArray(registration?.knownOptionIds) ? registration.knownOptionIds : []),
+    ]);
+    return [...candidateIds].some((id) => knownIds.has(id));
+  });
+  return matches.length === 1 ? matches[0] : null;
+}
+
 function pollSelection(message, state, nowMs) {
   const poll = message.poll;
-  if (!poll || String(poll.kind || "").toLowerCase() !== "vote") return null;
+  if (!poll || String(poll.kind || "").toLowerCase() !== "vote") return { action: null, consumed: false };
   const originalGuid = cleanString(poll.original_guid || poll.originalGuid, 256);
   const optionId = cleanString(poll.vote?.option_id || poll.vote?.optionId, 256);
-  const registration = originalGuid ? state.polls[originalGuid] : null;
-  if (!registration || !optionId || Date.parse(registration.expiresAt) <= nowMs) return { kind: "stale-poll" };
-  return normalizePollAction(registration.options[optionId]) || { kind: "stale-poll" };
+  const directRegistration = originalGuid ? state.polls[originalGuid] : null;
+  // Messages assigns different local GUIDs to the same poll on its sender and
+  // receiver. Native votes preserve the poll option UUID, however. When the
+  // remote poll GUID is unknown, resolve that UUID only if it identifies one
+  // and only one active service registration; collisions and foreign polls
+  // remain consumed without side effects.
+  const registration = directRegistration
+    || (originalGuid && optionId ? uniquePollRegistrationForOption(state, optionId) : null);
+  // Poll rows are emitted for every native poll in the conversation, not just
+  // polls created by this service. An unknown poll is therefore ordinary
+  // ambient Messages traffic and must not produce a stale-poll response.
+  if (!registration) return { action: null, consumed: true };
+  const expiresAtMs = Date.parse(registration.expiresAt);
+  if (!optionId || !Number.isFinite(expiresAtMs) || expiresAtMs <= nowMs) {
+    return { action: normalizePollAction(registration.refreshAction) || { kind: "stale-poll" }, consumed: true };
+  }
+  return {
+    action: normalizePollAction(registration.options[optionId])
+      || normalizePollAction(registration.refreshAction)
+      || { kind: "stale-poll" },
+    consumed: true,
+  };
+}
+
+function pollOptionEntries(value) {
+  const entries = [];
+  const append = (item, fallbackId = null) => {
+    if (typeof item === "string") {
+      const text = cleanString(item, 2_000);
+      if (text) entries.push({ id: cleanString(fallbackId, 256), text });
+      return;
+    }
+    if (!item || typeof item !== "object" || Array.isArray(item)) return;
+    const id = cleanString(item.id ?? item.option_id ?? item.optionId ?? item.guid ?? fallbackId, 256);
+    const text = cleanString(item.text ?? item.title ?? item.label ?? item.value ?? item.name, 2_000);
+    if (id || text) entries.push({ id, text });
+  };
+  if (Array.isArray(value)) {
+    for (const item of value) append(item);
+  } else if (value && typeof value === "object") {
+    for (const [id, item] of Object.entries(value)) append(item, id);
+  }
+  return entries;
+}
+
+function pollAddedChoice(message, state, nowMs) {
+  const poll = message.poll;
+  if (!poll || String(poll.kind || "").toLowerCase() !== "created") return { action: null, consumed: false };
+  const originalGuid = cleanString(poll.original_guid || poll.originalGuid, 256);
+  const candidates = [
+    ...pollOptionEntries(poll.options_diff ?? poll.optionsDiff),
+    ...pollOptionEntries(poll.created?.options_diff ?? poll.created?.optionsDiff),
+    ...pollOptionEntries(poll.options),
+    ...pollOptionEntries(poll.created?.options),
+    ...pollOptionEntries(poll.option),
+    ...pollOptionEntries(poll.created?.option),
+  ];
+  const directRegistration = originalGuid ? state.polls[originalGuid] : null;
+  // Poll GUIDs are device-local. A cross-device Add Choice snapshot can still
+  // be attributed safely when its stable option UUIDs identify exactly one
+  // active registration. Unknown and colliding snapshots remain ambient
+  // Messages traffic and are consumed without side effects.
+  const registration = directRegistration
+    || (originalGuid ? uniquePollRegistrationForKnownOptions(state, candidates) : null);
+  // Initial snapshots for user-created polls look the same as Add Choice
+  // updates. Only a durable registration proves the poll belongs to us.
+  if (!registration) return { action: null, consumed: true };
+  const expiresAtMs = Date.parse(registration.expiresAt);
+  if (!Number.isFinite(expiresAtMs) || expiresAtMs <= nowMs) {
+    return { action: normalizePollAction(registration.refreshAction) || { kind: "stale-poll" }, consumed: true };
+  }
+  if (registration.addChoiceSearch !== true) return { action: null, consumed: true };
+
+  const knownIds = new Set(Array.isArray(registration.knownOptionIds) ? registration.knownOptionIds : Object.keys(registration.options));
+  const knownLabels = new Set(Array.isArray(registration.knownOptionLabels) ? registration.knownOptionLabels : []);
+  const added = [];
+  for (const candidate of candidates) {
+    const normalizedLabel = candidate.text?.toLocaleLowerCase() || null;
+    const isKnown = (candidate.id && knownIds.has(candidate.id)) || (normalizedLabel && knownLabels.has(normalizedLabel));
+    if (!isKnown && candidate.text) added.push(candidate);
+    if (candidate.id) knownIds.add(candidate.id);
+    if (normalizedLabel) knownLabels.add(normalizedLabel);
+  }
+  registration.knownOptionIds = [...knownIds].slice(-500);
+  registration.knownOptionLabels = [...knownLabels].slice(-500);
+  const query = added.at(-1)?.text || null;
+  return {
+    action: query ? {
+      kind: "search",
+      command: registration.addChoiceCommand || "search",
+      argument: query,
+      ...(registration.addChoiceArgument ? { commandArgument: registration.addChoiceArgument } : {}),
+    } : null,
+    consumed: true,
+  };
 }
 
 function actionFromPoll(message, state, nowMs) {
-  return pollSelection(message, state, nowMs);
+  const vote = pollSelection(message, state, nowMs);
+  if (vote.consumed) return vote;
+  const addedChoice = pollAddedChoice(message, state, nowMs);
+  if (addedChoice.consumed) return addedChoice;
+  return message.poll ? { action: null, consumed: true } : { action: null, consumed: false };
 }
 
 export class LocalConversationRouter {
@@ -538,11 +790,11 @@ export class LocalConversationRouter {
     if (!cleanGuid || !cleanThread) return null;
     routeGuid(this.state, cleanGuid, cleanThread);
     const originator = cleanString(options.threadOriginatorGuid || options.thread_originator_guid, 256);
-    const parent = cleanString(options.replyToGuid || options.reply_to_guid, 256);
-    if (originator) routeGuid(this.state, originator, cleanThread);
-    if (parent) routeGuid(this.state, parent, cleanThread);
+    const originatorRouted = originator
+      ? routeOriginatorGuid(this.state, originator, cleanThread)
+      : false;
     const current = threadState(this.state, cleanThread);
-    const rootGuid = !current?.rootGuid && originator ? originator : null;
+    const rootGuid = !current?.rootGuid && originatorRouted ? originator : null;
     const item = touchThreadState(this.state, cleanThread, options.createdAt || new Date(this.now()).toISOString(), {
       rootGuid,
       latestGuid: cleanGuid,
@@ -551,7 +803,7 @@ export class LocalConversationRouter {
     return structuredClone(item);
   }
 
-  registerPoll(guid, options, ttlMs = this.menuTtlMs) {
+  registerPoll(guid, options, ttlOrMetadata = this.menuTtlMs) {
     const cleanGuid = cleanString(guid, 256);
     if (!cleanGuid || !options || typeof options !== "object") return;
     const cleanOptions = Object.fromEntries(Object.entries(options).flatMap(([id, action]) => {
@@ -560,9 +812,25 @@ export class LocalConversationRouter {
       return cleanId && cleanActionValue ? [[cleanId, cleanActionValue]] : [];
     }));
     if (!Object.keys(cleanOptions).length) return;
+    const metadata = normalizePollMetadata(
+      ttlOrMetadata && typeof ttlOrMetadata === "object" && !Array.isArray(ttlOrMetadata)
+        ? ttlOrMetadata
+        : {},
+    );
+    const configuredTtlMs = ttlOrMetadata && typeof ttlOrMetadata === "object" && !Array.isArray(ttlOrMetadata)
+      ? Number(ttlOrMetadata.ttlMs)
+      : Number(ttlOrMetadata);
+    const addChoiceCommand = inferredAddChoiceCommand(cleanOptions, metadata.addChoiceCommand);
+    const refreshAction = inferredPollRefreshAction(cleanOptions, { ...metadata, addChoiceCommand });
     this.state.polls[cleanGuid] = {
-      expiresAt: new Date(this.now() + Math.max(1_000, Number(ttlMs) || this.menuTtlMs)).toISOString(),
+      expiresAt: new Date(this.now() + Math.max(1_000, configuredTtlMs || this.menuTtlMs)).toISOString(),
       options: cleanOptions,
+      ...(metadata.addChoiceSearch ? { addChoiceSearch: true } : {}),
+      ...(addChoiceCommand ? { addChoiceCommand } : {}),
+      ...(metadata.addChoiceArgument ? { addChoiceArgument: metadata.addChoiceArgument } : {}),
+      ...(refreshAction ? { refreshAction } : {}),
+      knownOptionIds: [...new Set([...Object.keys(cleanOptions), ...metadata.knownOptionIds])].slice(-500),
+      knownOptionLabels: metadata.knownOptionLabels,
     };
     const entries = Object.entries(this.state.polls);
     if (entries.length > MAX_POLLS) this.state.polls = Object.fromEntries(entries.slice(-MAX_POLLS));
@@ -696,18 +964,31 @@ export class LocalConversationRouter {
 
   #ingest(rawMessage) {
     const message = normalizeMessage(rawMessage);
-    if (!message || message.isReaction) return null;
+    if (!message) return null;
+    if (message.isReaction) {
+      this.#discard(rawMessage);
+      return null;
+    }
     const existing = this.state.pending.find((item) => item.messageKey === message.key);
     if (existing) return structuredClone(existing);
     if (this.state.seen.includes(message.key)) return null;
 
     const nowMs = this.now();
-    const replyThreadId = threadForGuid(this.state, message.replyToGuid);
-    const originatorThreadId = threadForGuid(this.state, message.threadOriginatorGuid);
-    const explicitThreadId = replyThreadId || originatorThreadId || null;
+    const replyContext = resolveNativeReplyContext(message, this.state);
+    const explicitThreadId = replyContext.threadId;
     const awaitingPrompt = this.#currentAwaitingPrompt();
     let targetThreadId = explicitThreadId || this.state.lastUserThreadId;
-    let action = actionFromPoll(message, this.state, nowMs);
+    const pollResult = actionFromPoll(message, this.state, nowMs);
+    if (pollResult.consumed && !pollResult.action) {
+      // Poll rows can carry a visible question/caption in `text`; never let
+      // that transport metadata fall through and become a Codex prompt.
+      this.#discard(rawMessage);
+      return null;
+    }
+    // Poll registrations are the authoritative context for poll events. This
+    // also prevents a foreign poll's native reply metadata from being treated
+    // as a stale task reply before the poll can be silently discarded.
+    let action = pollResult.consumed ? pollResult.action : replyContext.error;
     const slash = message.text ? parseSlashCommand(message.text) : null;
     const selection = message.text ? parseMenuSelection(message.text) : null;
     const menuValid = this.state.menu && Date.parse(this.state.menu.expiresAt) > nowMs;
@@ -716,14 +997,20 @@ export class LocalConversationRouter {
     if (!action && slash) {
       const command = slash.command === "recent" ? "threads" : slash.command;
       if (THREAD_COMMANDS.has(command) && !explicitThreadId) {
-        action = { kind: "thread-picker", command, argument: slash.argument };
+        if (command === "cancel" && awaitingPrompt?.threadId) {
+          targetThreadId = awaitingPrompt.threadId;
+          consumedAwaitingPrompt = true;
+          action = { kind: "control", command, argument: slash.argument, threadId: targetThreadId };
+        } else {
+          action = { kind: "thread-picker", command, argument: slash.argument };
+        }
       } else {
         const globalCommand = command === "help" || command === "projects" || command === "search" || command === "threads" || command === "refresh";
         action = globalCommand
           ? { kind: command, command, argument: slash.argument }
           : { kind: "control", command, threadId: targetThreadId, argument: slash.argument };
       }
-    } else if (!action && selection && this.state.menu) {
+    } else if (!action && selection && this.state.menu && !explicitThreadId) {
       const reference = menuValid ? this.state.menu.references[selection.index] : null;
       if (!reference) action = { kind: "stale-menu", threadId: targetThreadId };
       else if (reference.startsWith("project:")) action = { kind: "project", projectKey: reference.slice("project:".length) };
@@ -739,7 +1026,14 @@ export class LocalConversationRouter {
         ? { kind: "prompt", threadId: targetThreadId, body: message.text, attachments: message.attachments }
         : { kind: "no-thread" };
     }
-    if (!action) return null;
+    if (!action) {
+      if (pollResult.consumed) this.#discard(rawMessage);
+      return null;
+    }
+
+    if (action.kind === "prompt" && explicitThreadId && awaitingPrompt?.threadId === explicitThreadId) {
+      consumedAwaitingPrompt = true;
+    }
 
     if (action.kind === "switch" && action.threadId) {
       if (action.prompt) {
@@ -773,11 +1067,12 @@ export class LocalConversationRouter {
         && (action.kind !== "switch" || Boolean(action.prompt) || Boolean(explicitThreadId));
       if (shouldRouteMessage && message.guid) {
         routeGuid(this.state, message.guid, action.threadId);
-        if (message.replyToGuid) routeGuid(this.state, message.replyToGuid, action.threadId);
-        if (message.threadOriginatorGuid) routeGuid(this.state, message.threadOriginatorGuid, action.threadId);
+        const originatorRouted = message.threadOriginatorGuid
+          ? routeOriginatorGuid(this.state, message.threadOriginatorGuid, action.threadId)
+          : false;
         const current = threadState(this.state, action.threadId);
         touchThreadState(this.state, action.threadId, message.createdAt, {
-          rootGuid: !current?.rootGuid && message.threadOriginatorGuid ? message.threadOriginatorGuid : null,
+          rootGuid: !current?.rootGuid && originatorRouted ? message.threadOriginatorGuid : null,
           latestGuid: message.guid,
         });
       } else {

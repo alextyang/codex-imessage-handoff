@@ -10,6 +10,7 @@ import {
   renderSharedBackendSupervisorLaunchAgent,
   resolveCodexBinary,
   sharedBackendSupervisorBuildFingerprint,
+  sharedBackendSupervisorStatus,
 } from "../src/service-manager.mjs";
 
 const fingerprint = "a".repeat(64);
@@ -38,6 +39,7 @@ function transactionFixture() {
     deployments: path.join(home, "deployments"),
     stateDb: path.join(directory, ".codex", "state.sqlite"),
     serviceReadinessState: path.join(home, "service-readiness.json"),
+    runState: path.join(home, "run-state.json"),
     serviceDeploymentState: path.join(home, "service-deployment.json"),
     sharedBackendDeploymentState: path.join(home, "shared-backend-deployment.json"),
     sharedBackendSupervisorState: path.join(home, "shared-backend-supervisor-state.json"),
@@ -74,6 +76,19 @@ function writeReadiness(file, pid) {
     heartbeatAt: new Date().toISOString(),
     health: { healthy: true, activeWatch: true },
   }));
+}
+
+function activeSupervisor(overrides = {}) {
+  return {
+    running: true,
+    healthy: true,
+    activationEnabled: true,
+    activationOwned: true,
+    activationConflict: false,
+    activationReady: true,
+    config: { activationRequested: true, failOpenLatched: false },
+    ...overrides,
+  };
 }
 
 test("LaunchAgent pins an executable Codex binary and the shared app-server backend", () => {
@@ -144,6 +159,84 @@ test("shared backend build fingerprint changes with deployed source content", ()
   assert.notEqual(after, before);
 });
 
+test("shared backend status rejects a raw activation value the supervisor does not own", () => {
+  const run = transactionFixture();
+  const instanceId = "activation-ownership-test";
+  const buildFingerprint = sharedBackendSupervisorBuildFingerprint();
+  const config = {
+    schemaVersion: 1,
+    owner: "codex-imessage-handoff",
+    instanceId,
+    implementationVersion: 7,
+    buildFingerprint,
+    deploymentFingerprint: fingerprint,
+    activationRequested: true,
+    failOpenLatched: false,
+  };
+  const state = {
+    schemaVersion: 1,
+    owner: "codex-imessage-handoff",
+    pid: 41,
+    instanceId,
+    buildFingerprint,
+    binary: run.codex,
+    healthy: true,
+    activationOwned: false,
+    activationEnabled: false,
+    updatedAt: new Date().toISOString(),
+  };
+  writeFileSync(run.paths.sharedBackendSupervisorConfig, JSON.stringify(config));
+  writeFileSync(run.paths.sharedBackendSupervisorState, JSON.stringify(state));
+  writeFileSync(run.paths.sharedBackendSupervisorPlist, renderSharedBackendSupervisorLaunchAgent(
+    run.paths,
+    run.codex,
+    instanceId,
+    buildFingerprint,
+    run.runtime,
+  ));
+  const launchctlImpl = (args) => args[0] === "print" ? "state = running\npid = 41\n" : "1\n";
+
+  const conflicted = sharedBackendSupervisorStatus({ paths: run.paths, launchctlImpl });
+  assert.equal(conflicted.running, true);
+  assert.equal(conflicted.healthy, true);
+  assert.equal(conflicted.activationEnabled, true);
+  assert.equal(conflicted.activationOwned, false);
+  assert.equal(conflicted.activationConflict, true);
+  assert.equal(conflicted.activationReady, false);
+
+  writeFileSync(run.paths.sharedBackendSupervisorState, JSON.stringify({
+    ...state,
+    activationOwned: true,
+    activationEnabled: true,
+    updatedAt: new Date().toISOString(),
+  }));
+  const owned = sharedBackendSupervisorStatus({ paths: run.paths, launchctlImpl });
+  assert.equal(owned.activationOwned, true);
+  assert.equal(owned.activationConflict, false);
+  assert.equal(owned.activationReady, true);
+});
+
+test("service installation fails closed before staging when activation is unowned", () => {
+  const run = transactionFixture();
+  let staged = false;
+  assert.throws(() => installService({
+    platform: "darwin",
+    paths: run.paths,
+    config: { imsg: { mode: "helper" } },
+    supervisor: activeSupervisor({
+      activationOwned: false,
+      activationConflict: true,
+      activationReady: false,
+    }),
+    desktop: { shared: true },
+    stageDeploymentImpl: () => {
+      staged = true;
+      return run.deployment;
+    },
+  }), /activation is owned by an unknown process/);
+  assert.equal(staged, false);
+});
+
 test("helper-mode LaunchAgent omits local imsg and private IPC configuration", () => {
   const directory = mkdtempSync(path.join(os.tmpdir(), "imessage-service-manager-helper-"));
   const codex = path.join(directory, "codex");
@@ -200,7 +293,7 @@ test("service installation activates only a ready versioned deployment", () => {
     paths: run.paths,
     codexBin: run.codex,
     config: { imsg: { mode: "helper" } },
-    supervisor: { running: true, healthy: true, activationEnabled: true, config: { activationRequested: true, failOpenLatched: false } },
+    supervisor: activeSupervisor(),
     desktop: { shared: true },
     stageDeploymentImpl: () => run.deployment,
     plistLintImpl: () => {},
@@ -242,7 +335,7 @@ test("service installation restores the prior ready LaunchAgent when candidate r
     paths: run.paths,
     codexBin: run.codex,
     config: { imsg: { mode: "helper" } },
-    supervisor: { running: true, healthy: true, activationEnabled: true, config: { activationRequested: true, failOpenLatched: false } },
+    supervisor: activeSupervisor(),
     desktop: { shared: true },
     stageDeploymentImpl: () => run.deployment,
     plistLintImpl: () => {},
@@ -258,6 +351,8 @@ test("forced restart transaction replaces an already-ready matching deployment",
   const run = transactionFixture();
   writeFileSync(run.paths.plist, renderLaunchAgent(run.paths, run.codex, { ...run.runtime, deploymentFingerprint: fingerprint }));
   writeReadiness(run.paths.serviceReadinessState, 41);
+  const activeRunState = JSON.stringify({ version: 2, jobs: { active: { state: "running" } } });
+  writeFileSync(run.paths.runState, activeRunState);
   let pid = 41;
   let bootstraps = 0;
   const launchctlImpl = (args) => {
@@ -275,7 +370,7 @@ test("forced restart transaction replaces an already-ready matching deployment",
     paths: run.paths,
     codexBin: run.codex,
     config: { imsg: { mode: "helper" } },
-    supervisor: { running: true, healthy: true, activationEnabled: true, config: { activationRequested: true, failOpenLatched: false } },
+    supervisor: activeSupervisor(),
     desktop: { shared: true },
     stageDeploymentImpl: () => run.deployment,
     plistLintImpl: () => {},
@@ -284,6 +379,7 @@ test("forced restart transaction replaces an already-ready matching deployment",
   });
   assert.equal(result.changed, true);
   assert.equal(bootstraps, 1);
+  assert.equal(readFileSync(run.paths.runState, "utf8"), activeRunState, "restart must leave durable active-run claims intact");
 });
 
 test("shared backend installation rolls back its plist and config after candidate health failure", () => {

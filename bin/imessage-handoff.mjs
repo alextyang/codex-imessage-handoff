@@ -121,8 +121,7 @@ async function handleTransport(action) {
   if (action === "finish-helper") {
     const desktop = inspectDesktopSharedConnection();
     const supervisor = sharedBackendSupervisorStatus();
-    if (!desktop.shared || !supervisor.running || !supervisor.healthy || !supervisor.activationEnabled
-      || supervisor.config?.activationRequested !== true || supervisor.config?.failOpenLatched === true) {
+    if (!desktop.shared || !supervisor.running || !supervisor.healthy || !supervisor.activationReady) {
       throw new Error("Codex Desktop must be connected to the healthy supervised shared app-server before enabling the split-user Messages helper.");
     }
     const finished = await finishSplitUserHelper({ dedicatedUser: dedicatedHelperUser() });
@@ -166,6 +165,9 @@ async function handleDesktopSync(action) {
       activation: {
         requested: supervisor.config?.activationRequested === true,
         enabled: supervisor.activationEnabled,
+        owned: supervisor.activationOwned,
+        conflict: supervisor.activationConflict,
+        ready: supervisor.activationReady,
         failOpenLatched: supervisor.config?.failOpenLatched === true,
       },
       service: serviceStatus(),
@@ -203,11 +205,11 @@ async function handleDesktopSync(action) {
       requestSharedBackendActivation();
       let activated = sharedBackendSupervisorStatus();
       for (let attempt = 0; attempt < 90; attempt += 1) {
-        if (activated.running && activated.healthy && activated.activationEnabled) break;
+        if (activated.running && activated.healthy && activated.activationReady) break;
         await new Promise((resolve) => setTimeout(resolve, 500));
         activated = sharedBackendSupervisorStatus();
       }
-      if (!activated.activationEnabled) {
+      if (!activated.activationReady) {
         disableSharedBackendActivation("activation-timeout");
         throw new Error("Shared mode did not pass its activation soak.");
       }
@@ -226,9 +228,7 @@ async function handleDesktopSync(action) {
     if (
       !supervisor.running
       || !supervisor.healthy
-      || !supervisor.activationEnabled
-      || supervisor.config?.activationRequested !== true
-      || supervisor.config?.failOpenLatched === true
+      || !supervisor.activationReady
     ) {
       throw new Error("The shared app-server supervisor is not healthy; the iMessage service remains stopped.");
     }

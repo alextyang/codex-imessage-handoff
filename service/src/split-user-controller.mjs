@@ -35,6 +35,7 @@ import {
 import { inspectMacGroup, verifyHelperBundle } from "./split-user-helper-installer.mjs";
 import { execFileSync } from "node:child_process";
 import { createImsgIpcClientFromConfig } from "./imsg-ipc-client.mjs";
+import { REQUIRED_PINNED_IMSG_CAPABILITIES } from "./imsg-client.mjs";
 import {
   imsgConversationHash,
   imsgIdentityHashes,
@@ -381,9 +382,10 @@ export async function finishSplitUserHelper(options = {}) {
     runtimeProfile = verifyRuntimeProfile(helperStatus, verified, activeState, dedicatedUser);
     capabilities = await client.status({ refresh: true });
     if (!capabilities?.available || !capabilities?.basic || !capabilities?.advanced
-      || capabilities?.v2Ready !== true || capabilities?.capabilities?.watch !== true
-      || capabilities?.capabilities?.replies !== true || capabilities?.capabilities?.richText !== true
-      || capabilities?.capabilities?.polls !== true) {
+      || capabilities?.v2Ready !== true
+      || REQUIRED_PINNED_IMSG_CAPABILITIES.some(
+        (name) => capabilities?.capabilities?.[name] !== true,
+      )) {
       throw codedError("SPLIT_USER_CAPABILITIES_MISSING", "The dedicated helper did not expose the required advanced Messages capabilities.");
     }
     const latest = await client.latestMessage({ chat_id: runtimeProfile.chatId });

@@ -60,13 +60,14 @@ test("Markdown headings lose only their marker and become bold", () => {
 });
 
 test("rich text intents retain an exact Markdown fallback", () => {
-  const fallbackText = "Opened  🧪 **A task**\n/reasoning (level/none) · /turn";
+  const fallbackText = "🧪 **A task**\n\n▲ Needs attention\nReasoning: high\n\ncodex://threads/a-task\n\n/listen · /link · /mute\n/turn · /history · /reasoning · /cancel";
   const intent = richTextIntent(fallbackText);
   assert.equal(intent.fallbackText, fallbackText);
-  assert.equal(intent.text, "Opened  🧪 A task\n/reasoning (level/none) · /turn");
+  assert.equal(intent.text, "🧪 A task\n\n▲ Needs attention\nReasoning: high\n\ncodex://threads/a-task\n\n/listen · /link · /mute\n/turn · /history · /reasoning · /cancel");
   assert.ok(rangeFor(intent.ranges, "bold", intent.text.indexOf("A task"), "A task".length));
-  assert.ok(rangeFor(intent.ranges, "bold", intent.text.indexOf("/reasoning"), "/reasoning".length));
-  assert.ok(rangeFor(intent.ranges, "bold", intent.text.indexOf("/turn"), "/turn".length));
+  for (const command of ["/listen", "/link", "/mute", "/turn", "/history", "/reasoning", "/cancel"]) {
+    assert.ok(rangeFor(intent.ranges, "bold", intent.text.indexOf(command), command.length));
+  }
 
   assert.deepEqual(richTextIntent(fallbackText, { richText: false }), {
     kind: "text",

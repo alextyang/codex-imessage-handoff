@@ -10,13 +10,15 @@ export class RunManager {
     this.active = new Map();
     this.blockedUntil = new Map();
     this.knownReplyIds = new Set();
+    this.deferTimers = new Set();
+    this.closed = false;
     this.sequence = 0;
   }
 
   enqueue(event) {
     const threadId = String(event?.threadId || "");
     const replyId = String(event?.replyId || "");
-    if (!threadId || !replyId || this.knownReplyIds.has(replyId)) return false;
+    if (this.closed || !threadId || !replyId || this.knownReplyIds.has(replyId)) return false;
     this.knownReplyIds.add(replyId);
     const entry = { ...event, threadId, replyId, queuedAt: event.queuedAt || new Date().toISOString(), sequence: this.sequence++ };
     const queue = this.queues.get(threadId) || [];
@@ -92,6 +94,22 @@ export class RunManager {
     for (const active of this.active.values()) active.cancel?.();
   }
 
+  // Service shutdown is a transport detach, not a user cancellation. Keep the
+  // durable queue untouched and, by default, do not interrupt canonical Codex
+  // turns that can be reconciled by the next daemon process.
+  shutdown({ interrupt = false } = {}) {
+    if (this.closed) return { active: this.active.size, pending: [...this.queues.values()].reduce((sum, queue) => sum + queue.length, 0) };
+    this.closed = true;
+    for (const timer of this.deferTimers) clearTimeout(timer);
+    this.deferTimers.clear();
+    this.blockedUntil.clear();
+    if (interrupt) this.cancelAll();
+    return {
+      active: this.active.size,
+      pending: [...this.queues.values()].reduce((sum, queue) => sum + queue.length, 0),
+    };
+  }
+
   #next() {
     return [...this.queues.entries()]
       .filter(([threadId, queue]) => queue.length && !this.active.has(threadId))
@@ -101,6 +119,7 @@ export class RunManager {
   }
 
   #drain() {
+    if (this.closed) return;
     while (this.active.size < this.maxConcurrent) {
       const next = this.#next();
       if (!next) return;
@@ -132,6 +151,10 @@ export class RunManager {
         })
         .finally(() => {
           this.active.delete(next.threadId);
+          if (this.closed) {
+            this.#changed();
+            return;
+          }
           if (slot.cancelRequested) {
             this.blockedUntil.delete(next.threadId);
             this.knownReplyIds.delete(entry.replyId);
@@ -144,9 +167,11 @@ export class RunManager {
             this.queues.set(next.threadId, deferred);
             this.blockedUntil.set(next.threadId, Date.now() + slot.deferMs);
             const timer = setTimeout(() => {
+              this.deferTimers.delete(timer);
               this.blockedUntil.delete(next.threadId);
               this.#drain();
             }, slot.deferMs);
+            this.deferTimers.add(timer);
             timer.unref?.();
           } else {
             this.knownReplyIds.delete(entry.replyId);

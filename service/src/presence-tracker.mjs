@@ -62,11 +62,29 @@ export class PresenceTracker {
 
     let value = prior;
     if (prior.observedState !== state) {
+      const transitionId = this.randomUUID();
+      const transitionAt = new Date(this.now()).toISOString();
+      if (state === "online" && prior.observedState === "offline" && prior.delivery !== "sent") {
+        // An online notice only makes sense after the matching offline notice was
+        // confirmed sent. If transport health recovers while that offline edge
+        // is still pending (or it was intentionally suppressed), collapse the
+        // flap instead of announcing a recovery the user never saw fail.
+        value = {
+          version: 1,
+          observedState: state,
+          transitionId,
+          transitionAt,
+          settledTransitionId: transitionId,
+          delivery: "suppressed-undelivered-offline",
+        };
+        writeState(this.file, value);
+        return { changed: true, sent: false, suppressed: true, collapsed: true, state };
+      }
       value = {
         version: 1,
         observedState: state,
-        transitionId: this.randomUUID(),
-        transitionAt: new Date(this.now()).toISOString(),
+        transitionId,
+        transitionAt,
         settledTransitionId: null,
         delivery: "pending",
       };

@@ -1,13 +1,46 @@
 import path from "node:path";
 import { createHash } from "node:crypto";
+import { REQUIRED_PINNED_IMSG_CAPABILITIES } from "./imsg-client.mjs";
 import { createImsgIpcClientFromConfig } from "./imsg-ipc-client.mjs";
+import { safeImsgFailureDetails } from "./imsg-rpc-diagnostics.mjs";
 import { LocalConversationRouter } from "./local-conversation-router.mjs";
 import { renderRichOutboundIntents, richTextIntent } from "../../protocol/rich-presentation.ts";
-import { projectIdentityEmoji, relativeTime, threadIdentityEmoji } from "../../protocol/presentation.ts";
+import {
+  projectIdentityEmoji,
+  relativeTime,
+  renderThreadHeader,
+  statusGlyph,
+  threadIdentityEmoji,
+} from "../../protocol/presentation.ts";
 
 const ACTIVITY_WINDOW_MS = 24 * 60 * 60 * 1000;
-const MAX_POLL_OPTIONS = 12;
+// Apple's Polls extension duplicates each option label in its JSON payload and
+// rejects definitions larger than 4 KiB. Seven compact menu rows fit beneath
+// that limit in the deployed bridge while keeping multi-part directories
+// balanced; the native UI's nominal option count is not the real limit.
+const MAX_POLL_OPTIONS = 7;
 const MIN_POLL_OPTIONS = 2;
+const MAX_POLL_DEFINITION_BYTES = 4096;
+const POLL_PAYLOAD_SAFETY_BYTES = 32;
+// Apple's poll JSON repeats the active sender on the item and every option.
+// An iMessage phone/email handle is bounded well below this reserve, so model
+// that hidden bridge field while keeping the identity itself out of the
+// controller process.
+const POLL_CREATOR_HANDLE_RESERVE_BYTES = 300;
+const MAX_POLL_QUESTION_BYTES = 256;
+const POLL_OPTION_IDENTIFIER = "00000000-0000-0000-0000-000000000000";
+// Stay comfortably below imsg's 128 KiB per-text-field boundary so native
+// formatting and JSON framing never turn a valid transcript into a retry loop.
+const MAX_TEXT_BUBBLE_BYTES = 96 * 1024;
+const MULTIPART_PREFIX_RESERVE_BYTES = 32;
+const ACTION_CONFIRMATION_COMMANDS = new Set([
+  "cancel",
+  "dismiss",
+  "listen",
+  "mute",
+  "retry",
+  "unmute",
+]);
 
 function clean(value) {
   return typeof value === "string" ? value.trim() : "";
@@ -49,31 +82,79 @@ function nativeFormatting(ranges) {
   return [...grouped.values()].sort((left, right) => left.start - right.start || left.length - right.length);
 }
 
+function maxUtf8ChunkEnd(text, start, byteBudget) {
+  let end = start;
+  let bytes = 0;
+  for (const character of text.slice(start)) {
+    const nextBytes = Buffer.byteLength(character, "utf8");
+    if (bytes + nextBytes > byteBudget) break;
+    bytes += nextBytes;
+    end += character.length;
+  }
+  if (end >= text.length || end <= start) return end;
+
+  // Prefer a readable boundary, but never shrink a part below half of the
+  // payload that already fits. This keeps pathological long lines bounded.
+  const earliest = start + Math.floor((end - start) / 2);
+  for (const separator of ["\n\n", "\n", " "]) {
+    const boundary = text.lastIndexOf(separator, end - 1);
+    if (boundary >= earliest) return boundary + separator.length;
+  }
+  return end;
+}
+
+function splitTextIntent(intent, maxBytes = MAX_TEXT_BUBBLE_BYTES) {
+  if (intent?.kind !== "text" || Buffer.byteLength(intent.text, "utf8") <= maxBytes) return [intent];
+  const contentBudget = Math.max(1, maxBytes - MULTIPART_PREFIX_RESERVE_BYTES);
+  const slices = [];
+  for (let start = 0; start < intent.text.length;) {
+    const end = maxUtf8ChunkEnd(intent.text, start, contentBudget);
+    if (end <= start) throw new TypeError("A Messages text part could not be bounded safely.");
+    slices.push({ start, end });
+    start = end;
+  }
+  return slices.map(({ start, end }, index) => {
+    const prefix = `(${index + 1}/${slices.length})\n\n`;
+    const ranges = (intent.ranges || []).flatMap((range) => {
+      const rangeStart = Number(range.location);
+      const rangeEnd = rangeStart + Number(range.length);
+      const intersectionStart = Math.max(start, rangeStart);
+      const intersectionEnd = Math.min(end, rangeEnd);
+      return intersectionEnd > intersectionStart
+        ? [{
+          location: prefix.length + intersectionStart - start,
+          length: intersectionEnd - intersectionStart,
+          style: range.style,
+        }]
+        : [];
+    });
+    const text = `${prefix}${intent.text.slice(start, end)}`;
+    return { kind: "text", text, fallbackText: text, ranges };
+  });
+}
+
 function messageGuid(result) {
   return clean(result?.guid || result?.message_guid || result?.messageGuid);
 }
 
 function resultStatus(result) {
   if (result?.classification === "accepted") return { sent: true, status: "SENT", terminal: true, guid: messageGuid(result) || null };
-  if (result?.classification === "ambiguous") return { sent: false, status: "AMBIGUOUS", terminal: false };
+  if (result?.classification === "ambiguous") {
+    return {
+      sent: false,
+      status: "AMBIGUOUS",
+      terminal: false,
+      ...safeImsgFailureDetails(result),
+    };
+  }
   return { sent: false, status: "UNSUPPORTED", terminal: false };
 }
 
-function markdownEscape(value) {
-  return clean(value).replaceAll("\\", "\\\\").replaceAll("*", "\\*").replaceAll("_", "\\_");
+function taskHeader(thread, now = Date.now()) {
+  return clean(thread?.id) ? renderThreadHeader(thread, now) : "";
 }
 
-function taskHeader(thread) {
-  const id = clean(thread?.id);
-  if (!id) return "";
-  return `${threadIdentityEmoji(thread)} **${markdownEscape(thread?.title) || "Untitled task"}**\n`
-    + `codex://threads/${encodeURIComponent(id)}\n`
-    + "/listen · /link · /mute";
-}
-
-function pollChunks(items) {
-  if (!Array.isArray(items) || items.length < MIN_POLL_OPTIONS) return [];
-  const count = Math.ceil(items.length / MAX_POLL_OPTIONS);
+function balancedPollChunks(items, count) {
   const base = Math.floor(items.length / count);
   const remainder = items.length % count;
   const chunks = [];
@@ -86,9 +167,110 @@ function pollChunks(items) {
   return chunks.every((chunk) => chunk.length >= MIN_POLL_OPTIONS && chunk.length <= MAX_POLL_OPTIONS) ? chunks : [];
 }
 
+function truncateUtf8(value, maxBytes, suffix = "…") {
+  const text = String(value || "").toWellFormed();
+  const limit = Math.max(0, Number(maxBytes) || 0);
+  if (Buffer.byteLength(text, "utf8") <= limit) return text;
+  const ending = Buffer.byteLength(suffix, "utf8") <= limit ? suffix : "";
+  const contentLimit = limit - Buffer.byteLength(ending, "utf8");
+  let result = "";
+  let bytes = 0;
+  for (const character of text) {
+    const size = Buffer.byteLength(character, "utf8");
+    if (bytes + size > contentLimit) break;
+    result += character;
+    bytes += size;
+  }
+  return `${result.trimEnd()}${ending}`;
+}
+
+function pollDefinitionPayloadBytes(question, choices, creatorHandleBytes = POLL_CREATOR_HANDLE_RESERVE_BYTES) {
+  const creatorHandle = "x".repeat(Math.max(0, Number(creatorHandleBytes) || 0));
+  const labels = (choices || []).map((choice) => clean(choice?.label ?? choice).toWellFormed());
+  const root = {
+    item: {
+      title: clean(question).toWellFormed(),
+      orderedPollOptions: labels.map((label) => ({
+        canBeEdited: false,
+        attributedText: label,
+        text: label,
+        optionIdentifier: POLL_OPTION_IDENTIFIER,
+        creatorHandle,
+      })),
+      creatorHandle,
+    },
+    version: 1,
+  };
+  return Buffer.byteLength(JSON.stringify(root), "utf8");
+}
+
+function multipartPollQuestion(question, index, count) {
+  const base = clean(question).toWellFormed() || "Choose";
+  if (count <= 1) return truncateUtf8(base, MAX_POLL_QUESTION_BYTES);
+  const suffix = ` · ${index + 1}/${count}`;
+  return `${truncateUtf8(base, MAX_POLL_QUESTION_BYTES - Buffer.byteLength(suffix, "utf8"), "")}${suffix}`;
+}
+
+function fitPollChunk(question, choices) {
+  const limit = MAX_POLL_DEFINITION_BYTES - POLL_PAYLOAD_SAFETY_BYTES;
+  const normalized = choices.map((choice) => ({
+    ...choice,
+    label: clean(choice?.label).toWellFormed() || "Task",
+  }));
+  if (pollDefinitionPayloadBytes(question, normalized) <= limit) return normalized;
+
+  let low = 1;
+  let high = Math.max(...normalized.map((choice) => Buffer.byteLength(choice.label, "utf8")));
+  let fitted = null;
+  while (low <= high) {
+    const budget = Math.floor((low + high) / 2);
+    const candidate = normalized.map((choice) => ({
+      ...choice,
+      label: truncateUtf8(choice.label, budget),
+    }));
+    if (candidate.every((choice) => choice.label)
+      && pollDefinitionPayloadBytes(question, candidate) <= limit) {
+      fitted = candidate;
+      low = budget + 1;
+    } else {
+      high = budget - 1;
+    }
+  }
+  return fitted || [];
+}
+
+function pollPlan(question, items) {
+  if (!Array.isArray(items) || items.length < MIN_POLL_OPTIONS) return { questions: [], chunks: [] };
+  const minimumCount = Math.ceil(items.length / MAX_POLL_OPTIONS);
+  const maximumCount = Math.max(minimumCount, Math.floor(items.length / MIN_POLL_OPTIONS));
+  for (let count = minimumCount; count <= maximumCount; count += 1) {
+    const chunks = balancedPollChunks(items, count);
+    if (!chunks.length) continue;
+    const questions = chunks.map((_chunk, index) => multipartPollQuestion(question, index, count));
+    if (chunks.every((chunk, index) => pollDefinitionPayloadBytes(questions[index], chunk)
+      <= MAX_POLL_DEFINITION_BYTES - POLL_PAYLOAD_SAFETY_BYTES)) {
+      return { questions, chunks };
+    }
+  }
+
+  const chunks = balancedPollChunks(items, maximumCount);
+  const questions = chunks.map((_chunk, index) => multipartPollQuestion(question, index, maximumCount));
+  const fitted = chunks.map((chunk, index) => fitPollChunk(questions[index], chunk));
+  return fitted.every((chunk) => chunk.length >= MIN_POLL_OPTIONS)
+    ? { questions, chunks: fitted }
+    : { questions: [], chunks: [] };
+}
+
+function pollChunks(items, question = "Choose") {
+  return pollPlan(question, items).chunks;
+}
+
 function compact(value, limit = 72) {
-  const text = clean(value).replace(/\s+/g, " ");
-  return text.length <= limit ? text : `${text.slice(0, Math.max(1, limit - 1)).trimEnd()}…`;
+  const text = clean(value).replace(/\s+/g, " ").toWellFormed();
+  const characters = [...text];
+  return characters.length <= limit
+    ? text
+    : `${characters.slice(0, Math.max(1, limit - 1)).join("").trimEnd()}…`;
 }
 
 function taskChoice(thread, action = null, now = Date.now()) {
@@ -112,7 +294,7 @@ function taskChoice(thread, action = null, now = Date.now()) {
     thread?.requestPreview ? `“${compact(thread.requestPreview, 54)}”` : "",
   ].filter(Boolean).join(" · ");
   return {
-    label: compact(`${threadIdentityEmoji(thread)} ${clean(thread?.title) || "Untitled task"}${context ? ` · ${context}` : ""}`, 160),
+    label: compact(`${statusGlyph(status)} ${threadIdentityEmoji(thread)} ${clean(thread?.title) || "Untitled task"}${context ? ` · ${context}` : ""}`, 160),
     action: action || { kind: "switch", threadId: id, awaitingPrompt: true },
   };
 }
@@ -122,31 +304,26 @@ function projectChoice(project, now = Date.now()) {
   if (!projectKey) return null;
   const projectLabel = clean(project?.projectLabel || project?.title) || "Project";
   const threads = Array.isArray(project?.threads) ? project.threads : [];
-  const threadCount = Math.max(0, Number(project?.threadCount) || threads.length);
-  const pendingCount = threads.filter((thread) => ["pending", "queued", "working", "running"].includes(clean(thread?.status).toLowerCase())
-    || Number(thread?.pendingCount) > 0).length;
+  const status = clean(project?.status).toLowerCase();
   const latestAt = project?.activityAt || threads.map((thread) => thread?.activityAt || thread?.stateSince)
     .filter(Boolean).sort().at(-1);
-  const context = [
-    threadCount ? `${threadCount} ${threadCount === 1 ? "task" : "tasks"}` : "",
-    pendingCount ? `${pendingCount} active` : "",
-    latestAt ? relativeTime(latestAt, now) : "",
-  ].filter(Boolean).join(" · ");
+  const context = latestAt ? relativeTime(latestAt, now) : "";
   return {
-    label: compact(`${projectIdentityEmoji(project)} ${projectLabel}${context ? ` · ${context}` : ""}`, 160),
+    label: compact(`${statusGlyph(status)} ${projectIdentityEmoji(project)} ${projectLabel}${context ? ` · ${context}` : ""}`, 160),
     action: { kind: "project", projectKey },
+  };
+}
+
+function navigationChoice(label, action) {
+  return {
+    label: `${projectIdentityEmoji({ projectLabel: label })} ${label}`,
+    action,
   };
 }
 
 function directoryChoices(event, now = Date.now()) {
   if (event?.kind !== "service.directory") return { question: null, choices: [] };
   const groups = event.directory?.groups || [];
-  const projects = [
-    ...groups.map((group) => projectChoice(group, now)),
-    ...(event.directory?.collapsedProjects || []).map((project) => projectChoice(project, now)),
-  ].filter(Boolean);
-  const uniqueProjects = [...new Map(projects.map((choice) => [choice.action.projectKey, choice])).values()];
-  if (uniqueProjects.length >= MIN_POLL_OPTIONS) return { question: "Choose a project", choices: uniqueProjects };
   const threads = groups
     .flatMap((group) => (group.threads || []).map((thread) => ({
       ...thread,
@@ -156,7 +333,12 @@ function directoryChoices(event, now = Date.now()) {
     .sort((left, right) => Number(left.index || 0) - Number(right.index || 0))
     .map((thread) => taskChoice(thread, null, now))
     .filter(Boolean);
-  return { question: "Choose a task", choices: threads };
+  const choices = [...threads, navigationChoice("Projects", { kind: "projects" })];
+  if (choices.length < MIN_POLL_OPTIONS) choices.unshift(navigationChoice("Refresh", { kind: "refresh" }));
+  return {
+    question: "Recent tasks",
+    choices,
+  };
 }
 
 function menuChoices(event, now = Date.now()) {
@@ -164,14 +346,23 @@ function menuChoices(event, now = Date.now()) {
     return { question: null, choices: [] };
   }
   const items = event.items || [];
-  return event.label === "PROJECTS"
-    ? { question: "Choose a project", choices: items.map((item) => projectChoice(item, now)).filter(Boolean) }
-    : { question: "Choose a task", choices: items.map((item) => taskChoice(item, null, now)).filter(Boolean) };
+  const choices = event.label === "PROJECTS"
+    ? [...items.map((item) => projectChoice(item, now)).filter(Boolean), navigationChoice("Recent tasks", { kind: "threads" })]
+    : [...items.map((item) => taskChoice(item, null, now)).filter(Boolean), navigationChoice("Projects", { kind: "projects" })];
+  if (choices.length < MIN_POLL_OPTIONS) choices.unshift(navigationChoice("Refresh", { kind: "refresh" }));
+  return { question: event.label === "PROJECTS" ? "Projects" : "Tasks", choices };
 }
 
 function exactURL(value) {
   const text = clean(value);
   return /^https?:\/\/[^\s]+$/i.test(text) ? text : null;
+}
+
+function shouldConfirmWithReaction(action) {
+  if (action?.kind !== "control") return false;
+  const command = clean(action.command).toLowerCase();
+  if (ACTION_CONFIRMATION_COMMANDS.has(command)) return true;
+  return command === "reasoning" && Boolean(clean(action.argument));
 }
 
 function pollOptionMap(result, commands) {
@@ -180,6 +371,16 @@ function pollOptionMap(result, commands) {
   for (let index = 0; index < Math.min(options.length, commands.length); index += 1) {
     const id = clean(options[index]?.id || options[index]?.option_id || options[index]?.optionId);
     if (id) mapping[id] = commands[index];
+  }
+  return mapping;
+}
+
+function pollOptionLabels(result) {
+  const mapping = {};
+  for (const option of Array.isArray(result?.poll?.options) ? result.poll.options : []) {
+    const id = clean(option?.id || option?.option_id || option?.optionId);
+    const label = clean(option?.text || option?.label || option?.title || option?.value);
+    if (id && label) mapping[id] = label;
   }
   return mapping;
 }
@@ -223,7 +424,10 @@ export class ImsgTransport {
     this.subscription = null;
     this.activeThread = null;
     this.typing = false;
+    this.typingClearConfirmed = true;
+    this.typingCleanupPromise = null;
     this.typingThreads = new Set();
+    this.readObservation = null;
     this.sendQueue = Promise.resolve();
     this.watchCallbacks = null;
     this.watchSubscribePromise = null;
@@ -250,6 +454,7 @@ export class ImsgTransport {
       activeWatch: healthy,
       recovering: Boolean(this.recoveryPromise || this.watchRetryTimer),
       mode: this.mode,
+      readObservation: this.readObservation ? { ...this.readObservation } : null,
     };
   }
 
@@ -311,8 +516,8 @@ export class ImsgTransport {
     await this.helperStatus();
     const status = await this.client.status({ refresh });
     const capabilities = status?.capabilities || {};
-    const required = ["watch", "richText", "replies", "polls", "pollVoting", "typing", "attachments"];
-    if (!status?.available || status?.advanced !== true || required.some((name) => capabilities[name] !== true)) {
+    if (!status?.available || status?.advanced !== true
+      || REQUIRED_PINNED_IMSG_CAPABILITIES.some((name) => capabilities[name] !== true)) {
       throw Object.assign(
         new Error("The authenticated advanced Messages bridge is unavailable or incomplete."),
         { code: "IMSG_ADVANCED_REQUIRED" },
@@ -329,6 +534,7 @@ export class ImsgTransport {
       effects: available && this.capabilityStatus?.capabilities?.effects === true,
       urlPreviews: available && this.capabilityStatus?.capabilities?.urlPreviews === true,
       polls: available && this.capabilityStatus?.capabilities?.polls === true,
+      pollCaptionControl: available && this.capabilityStatus?.capabilities?.pollCaptionControl === true,
       replies: available && this.capabilityStatus?.capabilities?.replies === true,
       typing: available && this.capabilityStatus?.capabilities?.typing === true,
       readReceipts: available && this.capabilityStatus?.capabilities?.readReceipts === true,
@@ -445,12 +651,12 @@ export class ImsgTransport {
 
   _handleWatchError(error, generation) {
     if (this.stopped || generation !== this.watchGeneration || !error) return;
+    this._queueTypingCleanup();
     this.subscription = null;
     this.watchGeneration += 1;
     this._setWatchHealth(false);
     this.verifiedHelperStatus = null;
     this.capabilityStatus = null;
-    this.typing = false;
     try { this.watchCallbacks?.onError?.(error); } catch {}
     this._scheduleWatchRecovery();
   }
@@ -481,6 +687,7 @@ export class ImsgTransport {
     if (this.recoveryPromise) return this.recoveryPromise;
     const lifecycleGeneration = this.lifecycleGeneration;
     const attempt = (async () => {
+      const pendingTypingCleanup = this.typingCleanupPromise;
       this.subscription = null;
       this._setWatchHealth(false);
       this.verifiedHelperStatus = null;
@@ -490,12 +697,14 @@ export class ImsgTransport {
       // Reconnect from a clean socket so recovery always reauthenticates,
       // reprobes, restarts the pinned RPC child, and only then resubscribes.
       await this.client.resetConnection?.();
+      if (pendingTypingCleanup) await pendingTypingCleanup;
       await this.helperStatus();
       await this.probe({ refresh: true });
       await this.client.start();
       if (this.stopped || lifecycleGeneration !== this.lifecycleGeneration) return false;
       const subscribed = await this._subscribeWatch();
       if (!subscribed || this.stopped || lifecycleGeneration !== this.lifecycleGeneration) return false;
+      const subscribedGeneration = this.watchGeneration;
       try {
         for (const action of this.router.pendingActions()) {
           await this.watchCallbacks?.onAction?.(action, null);
@@ -506,6 +715,18 @@ export class ImsgTransport {
         this._setWatchHealth(false);
         throw error;
       }
+      // A recovered subscription can fail again while durable actions are
+      // replaying. Do not let the earlier recovery report success after its
+      // generation was invalidated: the retry timer awaiting this promise
+      // must see a failure so it schedules the next resubscription.
+      if (this.stopped || lifecycleGeneration !== this.lifecycleGeneration) return false;
+      if (subscribedGeneration !== this.watchGeneration || !this.subscription || !this.watchHealthy) {
+        throw Object.assign(new Error("The recovered Messages watch was invalidated during replay."), {
+          code: "IMSG_WATCH_INVALIDATED",
+        });
+      }
+      if (!this.typingClearConfirmed) await this._forceTypingOff();
+      await this._syncDefaultTyping();
       return true;
     })();
     this.recoveryPromise = attempt;
@@ -524,7 +745,8 @@ export class ImsgTransport {
     if (this.watchRetryTimer) clearTimeout(this.watchRetryTimer);
     this.watchRetryTimer = null;
     this.typingThreads.clear();
-    try { await this._setTypingState(false); } catch {}
+    try { await this.typingCleanupPromise; } catch {}
+    await this._forceTypingOff();
     try { await this.subscription?.unsubscribe?.(); } catch {}
     this.subscription = null;
     this.watchCallbacks = null;
@@ -547,10 +769,37 @@ export class ImsgTransport {
     if (id && message) this.router.routeInboundGuid(message, id);
   }
 
-  async acceptInbound(action) {
+  async observeInbound() {
+    const capabilities = this.richCapabilities();
+    const readAttempt = capabilities.readReceipts
+      ? this.client.markRead(target(this.profile))
+      : null;
+    const [readResult, typingResult] = await Promise.allSettled([
+      readAttempt || Promise.resolve({ classification: "unsupported" }),
+      this._syncDefaultTyping(),
+    ]);
+    const readValue = readResult.status === "fulfilled" ? readResult.value : null;
+    const readStatus = !capabilities.readReceipts
+      ? "unsupported"
+      : readResult.status === "rejected"
+        ? "error"
+        : readValue?.classification === "accepted"
+          ? "accepted"
+          : readValue?.classification === "ambiguous"
+            ? "ambiguous"
+            : "unsupported";
+    this.readObservation = {
+      status: readStatus,
+      checkedAt: new Date(this.now()).toISOString(),
+      ...safeImsgFailureDetails(readValue || {}),
+    };
+    return readStatus === "accepted" && typingResult.status === "fulfilled";
+  }
+
+  async acceptInbound(action, options = {}) {
     const threadId = clean(action?.threadId);
     const guid = clean(action?.guid);
-    const hasExplicitReplyContext = Boolean(clean(action?.replyToGuid) || clean(action?.threadOriginatorGuid));
+    const hasExplicitReplyContext = Boolean(clean(action?.threadOriginatorGuid));
     const shouldRouteGuid = action?.kind === "prompt"
       || (action?.kind === "control" && hasExplicitReplyContext)
       || (action?.kind === "switch" && (Boolean(clean(action?.prompt)) || hasExplicitReplyContext));
@@ -566,8 +815,8 @@ export class ImsgTransport {
     const acknowledged = this.acknowledge(action?.messageKey);
     const capabilities = this.richCapabilities();
     await Promise.allSettled([
-      ...(capabilities.readReceipts ? [this.client.markRead(target(this.profile))] : []),
-      ...(capabilities.tapbacks && action?.guid
+      this._syncDefaultTyping(),
+      ...(capabilities.tapbacks && action?.guid && (options.react === true || shouldConfirmWithReaction(action))
         ? [this.client.tapback({ ...target(this.profile), message_guid: action.guid, reaction: "like" })]
         : []),
     ]);
@@ -576,17 +825,56 @@ export class ImsgTransport {
 
   async _setTypingState(typing = true) {
     if (!this.richCapabilities().typing) return { classification: "unsupported" };
-    if (this.typing === typing) return { classification: "accepted", accepted: true };
+    if (this.typing === typing && (typing || this.typingClearConfirmed)) {
+      return { classification: "accepted", accepted: true };
+    }
     const result = await this.client.setTyping(target(this.profile), typing);
-    if (result?.classification === "accepted") this.typing = typing;
+    if (result?.classification === "accepted") {
+      this.typing = typing;
+      this.typingClearConfirmed = !typing;
+    }
     return result;
   }
 
+  async _forceTypingOff() {
+    this.typing = false;
+    try {
+      const result = await this.client.setTyping(target(this.profile), false);
+      const accepted = result?.classification === "accepted";
+      if (accepted) this.typingClearConfirmed = true;
+      return accepted;
+    } catch {
+      return false;
+    }
+  }
+
+  _queueTypingCleanup() {
+    this.typing = false;
+    this.typingClearConfirmed = false;
+    const attempt = this._forceTypingOff();
+    this.typingCleanupPromise = attempt;
+    attempt.then(() => {
+      if (this.typingCleanupPromise === attempt) this.typingCleanupPromise = null;
+    });
+    return attempt;
+  }
+
   async setThreadTyping(threadId, typing = true) {
-    const id = clean(threadId) || "__unscoped__";
+    const id = clean(threadId);
+    if (!id) return this._syncDefaultTyping();
     if (typing) this.typingThreads.add(id);
     else this.typingThreads.delete(id);
-    return this._setTypingState(this.typingThreads.size > 0);
+    return this._syncDefaultTyping();
+  }
+
+  async syncWorkingThreads(threadIds = []) {
+    this.typingThreads = new Set((threadIds || []).map(clean).filter(Boolean));
+    return this._syncDefaultTyping();
+  }
+
+  _syncDefaultTyping() {
+    const defaultThreadId = clean(this.router.lastUserThreadId);
+    return this._setTypingState(Boolean(defaultThreadId && this.typingThreads.has(defaultThreadId)));
   }
 
   _enqueue(operation) {
@@ -632,12 +920,13 @@ export class ImsgTransport {
   async _sendPoll(intent, event, { replyToGuid, operationId } = {}) {
     if (replyToGuid && !this.richCapabilities().replies) return { classification: "unsupported", reason: "native-replies-unavailable" };
     if (!this.richCapabilities().polls) return { classification: "unsupported", reason: "native-polls-unavailable" };
-    const sent = await this._attemptTextSend(intent.question, () => this.client.sendPoll({
+    const sent = await this.client.sendPoll({
       ...target(this.profile),
       question: intent.question,
       options: intent.options.map((option) => option.label),
+      send_caption: false,
       ...(this.richCapabilities().replies && replyToGuid ? { reply_to: replyToGuid } : {}),
-    }, operationId ? { operationId } : undefined));
+    }, operationId ? { operationId } : undefined);
     if (sent.classification === "accepted") {
       const mapping = pollOptionMap(sent, intent.options.map((option) => {
         const threadId = clean(event?.thread?.id);
@@ -645,18 +934,24 @@ export class ImsgTransport {
         return { kind: "control", command: "reasoning", threadId, argument: value };
       }));
       const guid = messageGuid(sent);
-      if (guid && Object.keys(mapping).length) this.router.registerPoll(guid, mapping);
+      if (guid && Object.keys(mapping).length) {
+        this.router.registerPoll(guid, mapping, {
+          allowAddedChoiceSearch: true,
+          optionLabels: pollOptionLabels(sent),
+        });
+      }
       return sent;
     }
     if (sent.classification === "ambiguous") return sent;
     return sent;
   }
 
-  async _sendChoicePolls(question, choices) {
+  async _sendChoicePolls(question, choices, options = {}) {
     if (!this.richCapabilities().polls) {
       return { sent: false, status: "UNSUPPORTED", terminal: false, parts: 0, guids: [], attempted: false };
     }
-    const chunks = pollChunks(choices);
+    const plan = pollPlan(question, choices);
+    const { chunks, questions } = plan;
     if (!chunks.length) {
       return { sent: false, status: "NO_POLL", terminal: false, parts: 0, guids: [], attempted: false };
     }
@@ -664,15 +959,16 @@ export class ImsgTransport {
     const choiceDigest = createHash("sha256")
       .update(JSON.stringify(choices.map((choice) => ({ label: choice.label, action: choice.action }))))
       .digest("hex");
-    const operationScope = `choice:${this.router.lastRowId || "startup"}:${choiceDigest}`;
+    const operationScope = clean(options.operationScope) || `choice:${choiceDigest}`;
     for (let index = 0; index < chunks.length; index += 1) {
       const chunk = chunks[index];
-      const pollQuestion = chunks.length > 1 ? `${question} · ${index + 1}/${chunks.length}` : question;
-      const sent = await this._attemptTextSend(pollQuestion, () => this.client.sendPoll({
+      const pollQuestion = questions[index];
+      const sent = await this.client.sendPoll({
         ...target(this.profile),
         question: pollQuestion,
         options: chunk.map((choice) => choice.label),
-      }, { operationId: outboundOperationId(this.profile.chatGuid, `${operationScope}:part:${index}`) }));
+        send_caption: false,
+      }, { operationId: outboundOperationId(this.profile.chatGuid, `${operationScope}:part:${index}`) });
       const normalized = resultStatus(sent);
       if (!normalized.sent) {
         const safeTextFallback = sent?.classification === "unsupported" && guids.length === 0;
@@ -686,7 +982,12 @@ export class ImsgTransport {
         return { sent: false, status: "POLL_OPTIONS_MISSING", terminal: false, parts: guids.length, guids, attempted: true };
       }
       guids.push(normalized.guid);
-      this.router.registerPoll(normalized.guid, mapping);
+      this.router.registerPoll(normalized.guid, mapping, {
+        allowAddedChoiceSearch: options.allowAddedChoiceSearch !== false,
+        addChoiceCommand: clean(options.addChoiceCommand),
+        addChoiceArgument: clean(options.addChoiceArgument),
+        optionLabels: pollOptionLabels(sent),
+      });
     }
     return { sent: true, status: "SENT", terminal: true, parts: guids.length, guids, attempted: true };
   }
@@ -696,18 +997,29 @@ export class ImsgTransport {
     if (!menu.question || !menu.choices.length) {
       return { sent: false, status: "NO_POLL", terminal: false, parts: 0, guids: [], attempted: false };
     }
-    return this._sendChoicePolls(menu.question, menu.choices);
+    return this._sendChoicePolls(menu.question, menu.choices, {
+      allowAddedChoiceSearch: true,
+      operationScope: eventId(event),
+    });
   }
 
   sendThreadPicker(command, items, options = {}) {
     const normalizedCommand = clean(command).toLowerCase();
+    const commandArgument = clean(options.argument);
     const choices = (items || []).map((thread) => taskChoice(thread, {
       kind: "control",
       command: normalizedCommand,
       threadId: clean(thread?.id),
+      ...(commandArgument ? { argument: commandArgument } : {}),
     }, this.now())).filter(Boolean);
+    if (choices.length < MIN_POLL_OPTIONS) choices.push(navigationChoice("Recent tasks", { kind: "threads" }));
     const question = clean(options.question) || `${normalizedCommand ? `/${normalizedCommand}` : "Choose"} task`;
-    return this._enqueue(() => this._sendChoicePolls(question, choices));
+    return this._enqueue(() => this._sendChoicePolls(question, choices, {
+      allowAddedChoiceSearch: true,
+      addChoiceCommand: normalizedCommand,
+      addChoiceArgument: commandArgument,
+      operationScope: clean(options.operationScope),
+    }));
   }
 
   outbound(event, options = {}) {
@@ -728,52 +1040,59 @@ export class ImsgTransport {
     if (prior?.classification === "accepted") {
       return { sent: true, status: "DUPLICATE", terminal: true, parts: prior.guids.length };
     }
-    if (!threadId && ["service.directory", "service.menu"].includes(event?.kind)) {
+    if (!threadId && (event?.kind === "service.directory"
+      || (event?.kind === "service.menu" && event.label !== "COMMANDS"))) {
       const menuResult = await this._sendNativeMenu(event);
-      if (menuResult.sent || menuResult.attempted) return menuResult;
+      return menuResult;
     }
     let rootGuid = threadId ? clean(this.router.nativeThread(threadId)?.rootGuid) : "";
+    const guids = [];
+    if (threadId && (!rootGuid || event?.kind === "thread.header")) {
+      const header = richTextIntent(taskHeader(event.thread, this.now()), {
+        richText: this.richCapabilities().richText,
+        event: { kind: "thread.header", thread: event.thread },
+      });
+      const establishingRoot = !rootGuid;
+      const headerScope = id
+        ? `${id}:${establishingRoot ? "root" : "header"}`
+        : `thread-header:${threadId}:${establishingRoot ? "root" : "repeat"}`;
+      const headerResult = await this._sendText(header, {
+        replyToGuid: rootGuid,
+        effect: options.effect,
+        subject: options.subject,
+        operationId: outboundOperationId(this.profile.chatGuid, headerScope),
+      });
+      const normalizedHeader = resultStatus(headerResult);
+      if (!normalizedHeader.sent || !normalizedHeader.guid) {
+        if (id && headerResult?.classification !== "accepted") {
+          this.router.recordOutboundReceipt(id, { classification: headerResult?.classification || "unsupported", guids });
+        }
+        return {
+          ...normalizedHeader,
+          sent: false,
+          status: normalizedHeader.sent ? "ROOT_GUID_MISSING" : normalizedHeader.status,
+          terminal: false,
+          parts: guids.length,
+          guids,
+        };
+      }
+      guids.push(normalizedHeader.guid);
+      this.router.routeOutboundGuid(normalizedHeader.guid, threadId, { root: establishingRoot });
+      if (establishingRoot) rootGuid = normalizedHeader.guid;
+      if (event?.kind === "thread.header") {
+        if (id) this.router.recordOutboundReceipt(id, { classification: "accepted", guids });
+        return { sent: true, status: "SENT", terminal: true, parts: 1, guids };
+      }
+    }
     const intents = renderRichOutboundIntents(event, {
       // Native Messages reply threads carry the task context. Rendering as if
       // the event's own task were active prevents presentation.ts from adding
       // a second title to every bubble.
       presentation: { context: { activeThread: threadId ? event.thread : (options.activeThread || this.activeThread) } },
       capabilities: this.richCapabilities(),
-    });
-    const guids = [];
+    }).flatMap((intent) => splitTextIntent(intent));
     for (let index = 0; index < intents.length; index += 1) {
-      let intent = intents[index];
-      let establishingRoot = Boolean(threadId && !rootGuid);
-      if (establishingRoot && intent.kind === "poll") {
-        const header = richTextIntent(taskHeader(event.thread), { richText: this.richCapabilities().richText });
-        const rootResult = await this._sendText(header, {
-          effect: options.effect,
-          subject: options.subject,
-          operationId: outboundOperationId(this.profile.chatGuid, id && `${id}:root`),
-        });
-        const normalizedRoot = resultStatus(rootResult);
-        if (!normalizedRoot.sent || !normalizedRoot.guid) {
-          if (id && rootResult?.classification !== "accepted") {
-            this.router.recordOutboundReceipt(id, { classification: rootResult?.classification || "unsupported", guids });
-          }
-          return {
-            sent: false,
-            status: normalizedRoot.sent ? "ROOT_GUID_MISSING" : normalizedRoot.status,
-            terminal: false,
-            parts: guids.length,
-            guids,
-          };
-        }
-        rootGuid = normalizedRoot.guid;
-        guids.push(rootGuid);
-        this.router.routeOutboundGuid(rootGuid, threadId, { root: true });
-        establishingRoot = false;
-      } else if (establishingRoot && intent.kind === "text") {
-        intent = richTextIntent(`${taskHeader(event.thread)}\n\n${intent.fallbackText}`, {
-          richText: this.richCapabilities().richText,
-          event,
-        });
-      }
+      const intent = intents[index];
       // Only Codex-task output belongs in an iMessage reply thread. Global
       // service responses stay at the conversation's top level.
       const replyToGuid = threadId ? rootGuid : "";
@@ -784,19 +1103,15 @@ export class ImsgTransport {
       const normalized = resultStatus(result);
       if (normalized.guid) {
         guids.push(normalized.guid);
-        if (threadId) {
-          this.router.routeOutboundGuid(normalized.guid, threadId, { root: establishingRoot });
-          if (establishingRoot) rootGuid = normalized.guid;
-        }
+        if (threadId) this.router.routeOutboundGuid(normalized.guid, threadId);
       }
-      if (!normalized.sent || (establishingRoot && !normalized.guid)) {
-        if (id && !(establishingRoot && result?.classification === "accepted")) {
+      if (!normalized.sent) {
+        if (id) {
           this.router.recordOutboundReceipt(id, { classification: result?.classification || "unsupported", guids });
         }
         return {
           ...normalized,
           sent: false,
-          status: normalized.sent ? "ROOT_GUID_MISSING" : normalized.status,
           terminal: false,
           parts: guids.length,
           guids,
@@ -805,11 +1120,10 @@ export class ImsgTransport {
     }
     if (id) this.router.recordOutboundReceipt(id, { classification: "accepted", guids });
     if (["thread.output", "thread.completed"].includes(event?.kind)
-      || (event?.kind === "thread.live-message" && event.role === "assistant" && event.phase !== "commentary")
-      || event?.kind === "service.notice") {
+      || (event?.kind === "thread.live-message" && event.role === "assistant" && event.phase !== "commentary")) {
       await this.setThreadTyping(threadId, false);
     }
-    return { sent: intents.length > 0, status: "SENT", terminal: true, parts: intents.length, guids };
+    return { sent: guids.length > 0, status: "SENT", terminal: true, parts: guids.length, guids };
   }
 
   publishImages(thread, files, options = {}) {
@@ -819,20 +1133,21 @@ export class ImsgTransport {
   async _publishImages(thread, files, options = {}) {
     const threadId = clean(thread?.id);
     const imageScope = clean(options.deliveryId || options.replyToGuid)
-      || `row:${this.router.lastRowId || "startup"}`;
+      || `files:${createHash("sha256").update(JSON.stringify((files || []).map((file) => clean(file)))).digest("hex")}`;
     if (options.proactive === true && this.router.shouldPauseIncoming?.(threadId)) {
       return { sent: false, status: "AWAITING_PROMPT", terminal: false, guids: [] };
     }
     const guids = [];
     let rootGuid = threadId ? clean(this.router.nativeThread(threadId)?.rootGuid) : "";
     if (threadId && !rootGuid && (files || []).length) {
-      const header = richTextIntent(taskHeader(thread), { richText: this.richCapabilities().richText });
+      const header = richTextIntent(taskHeader(thread, this.now()), { richText: this.richCapabilities().richText });
       const rootResult = await this._sendText(header, {
         operationId: outboundOperationId(this.profile.chatGuid, `images:${threadId}:${imageScope}:root`),
       });
       const normalizedRoot = resultStatus(rootResult);
       if (!normalizedRoot.sent || !normalizedRoot.guid) {
         return {
+          ...normalizedRoot,
           sent: false,
           status: normalizedRoot.sent ? "ROOT_GUID_MISSING" : normalizedRoot.status,
           terminal: false,
@@ -913,6 +1228,9 @@ export const imsgTransportInternals = Object.freeze({
   directoryChoices,
   menuChoices,
   pollChunks,
+  pollPlan,
+  pollDefinitionPayloadBytes,
+  truncateUtf8,
   pollOptionMap,
   eventId,
   exactURL,

@@ -105,3 +105,35 @@ test("pending state carries the exact queued request for thread detail", async (
   assert.equal(manager.state("pending").pendingCount, 1);
   release();
 });
+
+test("service shutdown detaches without interrupting or discarding active iMessage work", async () => {
+  let release;
+  let cancelCalled = false;
+  const discarded = [];
+  const started = [];
+  const manager = new RunManager({
+    maxConcurrent: 1,
+    run: (event, context) => new Promise((resolve) => {
+      started.push(event.replyId);
+      context.setCancel(() => { cancelCalled = true; });
+      release = resolve;
+    }),
+    discard: async (event) => { discarded.push(event.replyId); },
+  });
+  manager.enqueue({ threadId: "active", replyId: "active-1" });
+  manager.enqueue({ threadId: "queued", replyId: "queued-1" });
+  await tick();
+
+  assert.deepEqual(manager.shutdown(), { active: 1, pending: 1 });
+  assert.equal(cancelCalled, false);
+  assert.deepEqual(discarded, []);
+  assert.equal(manager.has("active-1"), true);
+  assert.equal(manager.has("queued-1"), true);
+  assert.equal(manager.enqueue({ threadId: "later", replyId: "later-1" }), false);
+
+  release();
+  await tick();
+  await tick();
+  assert.deepEqual(started, ["active-1"], "shutdown must not start another queued turn");
+  assert.deepEqual(discarded, []);
+});

@@ -213,14 +213,21 @@ export function ensureImsgBridgeReady({
   bridgeDylib,
   run = execFileSync,
   attempts = 80,
+  forceRestart = false,
   wait = (milliseconds) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, milliseconds),
 } = {}) {
   if (typeof binary !== "string" || !path.isAbsolute(binary)
     || typeof bridgeDylib !== "string" || !path.isAbsolute(bridgeDylib)) {
     throw codedError("HELPER_BRIDGE_PATH_INVALID", "The private imsg bridge runtime is invalid.");
   }
-  let status = bridgeStatus(binary, run);
-  if (!bridgeReady(status)) {
+  let status = {};
+  if (forceRestart === true) {
+    imsgRun(binary, ["launch", "--kill-only", "--json"], { run, timeout: 30_000 });
+    imsgRun(binary, ["launch", "--json", "--dylib", bridgeDylib], { run, timeout: 30_000 });
+  } else {
+    status = bridgeStatus(binary, run);
+  }
+  if (!bridgeReady(status) && forceRestart !== true) {
     imsgRun(binary, ["launch", "--json", "--dylib", bridgeDylib], { run, timeout: 30_000 });
   }
   for (let attempt = 0; attempt < attempts; attempt += 1) {
@@ -496,6 +503,29 @@ function safeOwnedPath(file, uid, { directory = false } = {}) {
   return metadata;
 }
 
+function existingBridgeRuntime(configPath, privateRoot, uid) {
+  if (!existsSync(configPath)) return null;
+  const metadata = safeOwnedPath(configPath, uid);
+  if ((metadata.mode & 0o077) !== 0 || metadata.size < 2 || metadata.size > 64 * 1024) {
+    throw codedError("HELPER_EXISTING_CONFIG_INVALID", "The existing helper configuration is unsafe.");
+  }
+  let config;
+  try {
+    config = JSON.parse(readFileSync(configPath, "utf8"));
+  } catch (error) {
+    throw codedError("HELPER_EXISTING_CONFIG_INVALID", "The existing helper configuration is invalid.", error);
+  }
+  const binary = typeof config?.imsgBinary === "string" ? path.resolve(config.imsgBinary) : "";
+  const bridgeDylib = typeof config?.bridgeDylib === "string" ? path.resolve(config.bridgeDylib) : "";
+  for (const file of [binary, bridgeDylib]) {
+    if (!file || !path.isAbsolute(file) || !inside(privateRoot, file)) {
+      throw codedError("HELPER_EXISTING_CONFIG_INVALID", "The existing helper runtime escaped its private root.");
+    }
+    safeOwnedPath(file, uid);
+  }
+  return { binary, bridgeDylib };
+}
+
 function createFileRollback(uid) {
   const snapshots = [];
   return {
@@ -767,6 +797,8 @@ export function installDedicatedImsgHelper(options = {}) {
   let plistPath = null;
   let configPath = null;
   let attestationPath = null;
+  let previousBridgeRuntime = null;
+  let bridgeRestarted = false;
   try {
     const imsgBinary = installed.get(bundle.manifest.imsg);
     const bridgeDylib = installed.get(bundle.manifest.bridgeDylib);
@@ -786,13 +818,20 @@ export function installDedicatedImsgHelper(options = {}) {
       throw codedError("HELPER_NODE_RUNTIME_INVALID", "The staged helper-owned Node runtime could not load the helper entrypoint.", error);
     }
 
+    configPath = path.join(privateRoot, "helper-config.json");
+    previousBridgeRuntime = existingBridgeRuntime(configPath, privateRoot, uid);
     if (options.bridgeReady !== true) {
+      const forceRestart = options.forceBridgeRestart === true
+        || (!previousBridgeRuntime
+          || path.resolve(previousBridgeRuntime.bridgeDylib) !== path.resolve(bridgeDylib));
       ensureImsgBridgeReady({
         binary: imsgBinary,
         bridgeDylib,
         run: options.imsgRun || execFileSync,
+        forceRestart,
         wait: options.wait,
       });
+      bridgeRestarted = forceRestart;
     }
     const profileResult = discoverDedicatedImsgProfile({
       binary: imsgBinary,
@@ -805,7 +844,6 @@ export function installDedicatedImsgHelper(options = {}) {
     ensurePrivateDirectory(keyRoot, uid);
     const identity = ensureHelperIdentity(keyRoot, uid);
     const controllerPublicPath = path.join(keyRoot, `controller-${bundle.manifest.controllerPublicKey.fingerprint}.pem`);
-    configPath = path.join(privateRoot, "helper-config.json");
     const socketPath = path.join(bundle.root, bundle.manifest.socket);
     const logs = path.join(privateRoot, "logs");
     ensurePrivateDirectory(logs, uid);
@@ -884,6 +922,17 @@ export function installDedicatedImsgHelper(options = {}) {
     }
     fileTransaction.rollback();
     payloadTransaction.rollback();
+    if (bridgeRestarted && previousBridgeRuntime) {
+      try {
+        ensureImsgBridgeReady({
+          binary: previousBridgeRuntime.binary,
+          bridgeDylib: previousBridgeRuntime.bridgeDylib,
+          run: options.imsgRun || execFileSync,
+          forceRestart: true,
+          wait: options.wait,
+        });
+      } catch {}
+    }
     if (agentMutationStarted && plistPath && fileTransaction.existed(plistPath)) {
       try { launchctl("launchctl", ["bootstrap", domain, plistPath], { stdio: ["ignore", "pipe", "pipe"], timeout: 10_000 }); } catch {}
     }

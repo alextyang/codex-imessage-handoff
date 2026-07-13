@@ -239,6 +239,29 @@ test("bridge setup uses only the staged private runtime and waits for v2 readine
   assert.equal(calls.some((call) => call.join(" ").includes("codex")), false);
 });
 
+test("bridge upgrades restart the dedicated Messages process before validating the staged dylib", () => {
+  const calls = [];
+  const run = (binary, args) => {
+    calls.push([binary, ...args]);
+    if (args[0] === "status") {
+      return '{"advanced_features":true,"v2_ready":true,"rpc_methods":["watch.subscribe"]}\n';
+    }
+    return '{"status":"ok"}\n';
+  };
+  ensureImsgBridgeReady({
+    binary: "/private/runtime/imsg",
+    bridgeDylib: "/private/runtime/bridge.dylib",
+    forceRestart: true,
+    run,
+    wait: () => {},
+  });
+  assert.deepEqual(calls.slice(0, 3), [
+    ["/private/runtime/imsg", "launch", "--kill-only", "--json"],
+    ["/private/runtime/imsg", "launch", "--json", "--dylib", "/private/runtime/bridge.dylib"],
+    ["/private/runtime/imsg", "status", "--json"],
+  ]);
+});
+
 test("LaunchAgent is persistent and contains path-only private configuration", () => {
   const plist = renderHelperLaunchAgent({
     nodePath: "/private/node",

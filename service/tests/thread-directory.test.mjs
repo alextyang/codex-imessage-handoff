@@ -23,11 +23,12 @@ function thread(id, projectKey, projectLabel, lastTurnOffset, extras = {}) {
   };
 }
 
-test("directory includes all pending and 48-hour tasks, orders pending first, and puts Other tasks last", async () => {
+test("directory includes all working, pending, and 48-hour tasks, orders pending first, and puts Other tasks last", async () => {
   const states = new Map([
     ["old-pending", { status: "pending", stateSince: at(-60_000), pendingCount: 1, latestRequest: "Old but queued", latestRequestAt: at(-60_000) }],
     ["recent-pending", { status: "pending", stateSince: at(-120_000), pendingCount: 1, latestRequest: "Queued and recent", latestRequestAt: at(-120_000) }],
     ["working-queued", { status: "working", stateSince: at(-180_000), pendingCount: 2, latestRequest: "Newest\nqueued request", latestRequestAt: at(-30_000) }],
+    ["old-working", { status: "working", stateSince: at(-5 * 60_000), pendingCount: 0, latestRequest: "Still working", latestRequestAt: at(-5 * 60_000) }],
   ]);
   const threads = [
     thread("recent-idle", "alpha", "Alpha", -60 * 60_000),
@@ -35,6 +36,7 @@ test("directory includes all pending and 48-hour tasks, orders pending first, an
     thread("old-pending", "alpha", "Alpha", -7 * 24 * 60 * 60_000),
     thread("recent-pending", "alpha", "Alpha", -30 * 60_000),
     thread("working-queued", "alpha", "Alpha", -7 * 24 * 60 * 60_000),
+    thread("old-working", "alpha", "Alpha", -7 * 24 * 60 * 60_000),
     thread("empty-project", "empty", "Empty project", -49 * 60 * 60_000),
     thread("other-recent", null, null, -2 * 60 * 60_000, { groupKind: "other" }),
     thread("other-old", null, null, -50 * 60 * 60_000, { groupKind: "other" }),
@@ -45,33 +47,66 @@ test("directory includes all pending and 48-hour tasks, orders pending first, an
   const planned = await buildThreadDirectory(threads, {
     now: NOW,
     activeThreadId: "recent-idle",
-    stateFor: (item) => states.get(item.id) || { status: "idle", stateSince: item.lastTurnAt, pendingCount: 0, latestRequest: null },
+    // Idle state metadata can omit stateSince; the catalog turn remains the
+    // authoritative activity timestamp for grouping and recency display.
+    stateFor: (item) => states.get(item.id) || { status: "idle", stateSince: null, pendingCount: 0, latestRequest: null },
     latestRequest: async (item) => `Latest user request for ${item.id}`,
   });
 
   assert.deepEqual(planned.directory.groups.map((group) => group.projectLabel), ["Alpha", "Boundary", "Other tasks"]);
+  assert.deepEqual(planned.directory.groups.map((group) => group.status), ["working", "idle", "idle"]);
+  assert.equal(planned.directory.groups[0].activityAt, at(-30_000));
+  assert.equal(planned.directory.groups[1].activityAt, at(-directoryConstants.recentWindowMs));
   assert.deepEqual(planned.directory.groups[0].threads.map((item) => item.id), [
     "working-queued",
     "old-pending",
     "recent-pending",
+    "old-working",
     "recent-idle",
   ]);
   assert.equal(planned.directory.groups[0].threads[0].pendingCount, 2);
   assert.equal(planned.directory.groups[0].threads[0].requestPreview, "Newest queued request");
-  assert.equal(planned.directory.groups[0].threads[3].current, true);
+  assert.equal(planned.directory.groups[0].threads[4].current, true);
   assert.deepEqual(planned.directory.groups[1].threads.map((item) => item.id), ["cutoff"]);
   assert.deepEqual(planned.directory.groups[2].threads.map((item) => item.id), ["other-recent"]);
-  assert.equal(planned.directory.totalTasks, 6);
+  assert.equal(planned.directory.totalTasks, 7);
+  assert.equal(planned.directory.criteria, "working/pending + activity in last 48h");
   assert.deepEqual(planned.references, [
     "thread:working-queued",
     "thread:old-pending",
     "thread:recent-pending",
+    "thread:old-working",
     "thread:recent-idle",
     "thread:cutoff",
     "thread:other-recent",
   ]);
-  assert.deepEqual(planned.directory.groups.flatMap((group) => group.threads.map((item) => item.index)), [1, 2, 3, 4, 5, 6]);
+  assert.deepEqual(planned.directory.groups.flatMap((group) => group.threads.map((item) => item.index)), [1, 2, 3, 4, 5, 6, 7]);
   assert.equal(planned.references.some((reference) => reference.includes("old-idle") || reference.includes("outside")), false);
+});
+
+test("directory treats running and queued aliases as active while preserving pending-first ordering", async () => {
+  const threads = [
+    thread("old-running", "alpha", "Alpha", -7 * 24 * 60 * 60_000),
+    thread("old-queued", "alpha", "Alpha", -8 * 24 * 60 * 60_000),
+    thread("recent-idle", "alpha", "Alpha", -60_000),
+    thread("old-error", "alpha", "Alpha", -9 * 24 * 60 * 60_000),
+  ];
+  const planned = await buildThreadDirectory(threads, {
+    now: NOW,
+    stateFor: (item) => ({
+      status: item.id === "old-running" ? "running" : item.id === "old-queued" ? "queued" : item.id === "old-error" ? "error" : "idle",
+      stateSince: at(item.id === "old-running" ? -2 * 60_000 : -3 * 60_000),
+      pendingCount: 0,
+      latestRequest: item.id,
+    }),
+    latestRequest: async (item) => item.id,
+  });
+
+  assert.deepEqual(planned.directory.groups[0].threads.map((item) => item.id), [
+    "old-queued",
+    "old-running",
+    "recent-idle",
+  ]);
 });
 
 test("request previews are single-line, bounded, and always present", async () => {

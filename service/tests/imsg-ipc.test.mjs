@@ -31,6 +31,7 @@ import {
 } from "../src/imsg-ipc-protocol.mjs";
 import { ImsgHelperServer, inspectLocalImsgIdentity } from "../src/imsg-helper-server.mjs";
 import { ImsgIpcClient, createImsgIpcClientFromConfig } from "../src/imsg-ipc-client.mjs";
+import { REQUIRED_PINNED_IMSG_CAPABILITIES } from "../src/imsg-client.mjs";
 
 function temporary() {
   const root = mkdtempSync(path.join(os.tmpdir(), "imsg-ipc-test-"));
@@ -55,8 +56,11 @@ class FakeImsgClient {
         richText: true,
         replies: true,
         polls: true,
+        pollCaptionControl: true,
         pollVoting: true,
+        tapbacks: true,
         typing: true,
+        readReceipts: true,
         attachments: true,
         sendStatus: true,
       },
@@ -220,11 +224,83 @@ test("mutually authenticated proxy exposes only the pinned profile and advanced 
   const status = await client.sendStatus("RICH-1");
   assert.equal(status.send_state, "delivered");
   assert.deepEqual(fake.calls.find(([kind]) => kind === "status"), ["status", "RICH-1"]);
+  const read = await client.markRead({ chat_id: 42 });
+  assert.equal(read.classification, "accepted");
+  assert.deepEqual(fake.calls.find(([kind]) => kind === "read"), ["read", { chat_id: 42 }]);
+  const reaction = await client.tapback({ chat_id: 42, message_guid: "RICH-1", reaction: "like" });
+  assert.equal(reaction.classification, "accepted");
+  assert.deepEqual(fake.calls.find(([kind]) => kind === "tapback"), [
+    "tapback",
+    { chat_id: 42, message_guid: "RICH-1", reaction: "like" },
+  ]);
 
   const calls = fake.calls.length;
   const rejected = await client.sendRich({ chat_id: 99, text: "wrong target", text_formatting: [] });
   assert.equal(rejected.classification, "ambiguous");
   assert.equal(fake.calls.length, calls);
+});
+
+test("helper IPC preserves safe RPC diagnostics while stripping raw remote error fields", async (t) => {
+  const fake = new FakeImsgClient();
+  fake.sendPoll = async (params) => {
+    fake.calls.push(["sendPoll", params]);
+    return {
+      classification: "ambiguous",
+      accepted: false,
+      ambiguous: true,
+      unsupported: false,
+      retrySafe: false,
+      reason: "transport-or-send-failure",
+      failureSource: "remote-error",
+      remoteCode: -32603,
+      remoteCategory: "poll-reply-target-unresolved",
+      remoteMessage: "private-person@example.com must never cross IPC",
+      rawError: "Could not resolve reply target for poll: PRIVATE-GUID",
+    };
+  };
+  const { client, server } = await fixture(t, { fake });
+  await client.start();
+  const result = await client.sendPoll({
+    chat_id: 42,
+    question: "Choose",
+    options: ["One", "Two"],
+    reply_to: "PRIVATE-GUID",
+  });
+
+  assert.deepEqual(result, {
+    classification: "ambiguous",
+    accepted: false,
+    ambiguous: true,
+    unsupported: false,
+    retrySafe: false,
+    reason: "transport-or-send-failure",
+    failureSource: "remote-error",
+    remoteCode: -32603,
+    remoteCategory: "poll-reply-target-unresolved",
+    remoteMessage: "The poll reply target could not be resolved.",
+  });
+  assert.equal(JSON.stringify(result).includes("PRIVATE-GUID"), false);
+  assert.equal(JSON.stringify(result).includes("private-person"), false);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(server.helperStatus().health.healthy, true, "explicit remote errors must not retire a healthy RPC session");
+});
+
+test("helper startup rejects imsg builds missing any required pinned capability", async (t) => {
+  for (const capability of REQUIRED_PINNED_IMSG_CAPABILITIES) {
+    await t.test(capability, async (subtest) => {
+      const fake = new FakeImsgClient();
+      fake.status = async () => {
+        const status = await FakeImsgClient.prototype.status.call(fake);
+        delete status.capabilities[capability];
+        return status;
+      };
+
+      await assert.rejects(
+        fixture(subtest, { fake }),
+        (error) => error?.code === "IMSG_PINNED_MODE_UNAVAILABLE",
+      );
+    });
+  }
 });
 
 test("closing a diagnostics connection leaves the helper pinned RPC running", async (t) => {

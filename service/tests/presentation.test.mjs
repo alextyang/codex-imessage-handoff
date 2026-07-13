@@ -6,6 +6,7 @@ import {
   renderHelp,
   renderOutboundEvent,
   renderOutboundMessages,
+  renderThreadHeader,
   renderThreadDirectory,
   renderThreadMenu,
   threadIdentityEmoji,
@@ -103,20 +104,20 @@ test("recent directory follows the canonical project, selected, row, and note gr
   }, { now: "2026-07-12T08:00:00.000Z", ...activeOptions });
 
   assert.equal(rendered, [
-    "▾  📐 **iMessage handoff** · 2 tasks",
+    "▾  ○ 📐 **iMessage handoff** · 2 tasks",
     "",
     "**Selected**",
-    "1️⃣  🪁 **Polish message formatting**",
+    "1️⃣  ◷ 🪁 **Polish message formatting**",
     "   ◷ Working for 4m",
     "   “Show a full example set of every message type.”",
     "",
-    "2️⃣  🗺️ Fix duplicate fork history",
+    "2️⃣  ◷ 🗺️ Fix duplicate fork history",
     "   ◷ Working for 8m · 2 queued",
     "   “Prevent inherited history from replaying.”",
     "",
-    "▾ **Other tasks** · 1 task",
+    "▾ ○ **Other tasks** · 1 task",
     "",
-    "3️⃣  🗺️ Compare messaging providers",
+    "3️⃣  ○ 🗺️ Compare messaging providers",
     "   ○ 3h ago · 50 turns",
     "   “Which provider supports richer interactions?”",
     "",
@@ -124,8 +125,8 @@ test("recent directory follows the canonical project, selected, row, and note gr
     "“/projects” - See all projects",
     "“/search” - Show threads with specific text",
   ].join("\n"));
-  assert.doesNotMatch(rendered.split("▾ **Other tasks**")[0], /Other tasks/);
-  assert.match(rendered, /▾ \*\*Other tasks\*\* · 1 task/);
+  assert.doesNotMatch(rendered.split("▾ ○ **Other tasks**")[0], /Other tasks/);
+  assert.match(rendered, /▾ ○ \*\*Other tasks\*\* · 1 task/);
 });
 
 test("project menu is an exact minimal styled list", () => {
@@ -152,10 +153,10 @@ test("project menu is an exact minimal styled list", () => {
   assert.equal(rendered, [
     "**Projects**",
     "",
-    "1️⃣  📐 **iMessage handoff**",
+    "1️⃣  ◷ 📐 **iMessage handoff**",
     "   ◷ Working · 2 tasks",
     "",
-    "2️⃣  🧪 **Music crawler**",
+    "2️⃣  ○ 🧪 **Music crawler**",
     "   ○ 1h ago · 5 tasks",
     "",
     "Reply with a number to show that project.",
@@ -180,11 +181,38 @@ test("thread and project identity seeds normalize name plus start date", () => {
   assert.equal(projectIdentityEmoji({ ...project, startedAt: "2026-07-02T00:00:00Z" }), "🪁");
 });
 
-test("opening a thread sends only the opened acknowledgement and commands", () => {
-  assert.equal(
-    renderOutboundEvent({ kind: "service.switched", thread: ACTIVE }, activeOptions),
-    "Opened  🪁 **Polish message formatting**\n/reasoning (level/none) · /turn · /history · /cancel",
-  );
+test("thread header is a separate message with status, reasoning, link, and commands", () => {
+  const thread = {
+    ...ACTIVE,
+    status: "working",
+    stateSince: "2026-07-12T07:56:00.000Z",
+    pendingCount: 2,
+    reasoningEffort: "high",
+  };
+  const expected = [
+    "🪁 **Polish message formatting**",
+    "",
+    "◷ Working for 4m · 2 queued",
+    "Reasoning: high",
+    "",
+    "codex://threads/active-thread",
+    "",
+    "/listen · /link · /mute",
+    "/turn · /history · /reasoning · /cancel",
+  ].join("\n");
+  assert.equal(renderThreadHeader(thread, "2026-07-12T08:00:00.000Z"), expected);
+
+  const stableThread = { ...thread, status: "error", activityAt: null, stateSince: null, pendingCount: 0 };
+  const stableExpected = expected
+    .replace("◷ Working for 4m · 2 queued", "▲ Needs attention");
+  const event = { kind: "thread.header", thread: stableThread };
+  assert.equal(renderOutboundEvent(event, activeOptions), stableExpected);
+  assert.deepEqual(renderOutboundMessages(event, activeOptions), [stableExpected]);
+
+  const mutedListening = { ...thread, muted: true, listening: true };
+  assert.equal(renderThreadHeader(mutedListening, "2026-07-12T08:00:00.000Z"), expected
+    .replace("Reasoning: high", "Reasoning: high\nUpdates: muted\nListening: next turn")
+    .replace("/mute", "/unmute"));
 });
 
 test("thread detail is split into semantic messages without repeated framing", () => {
@@ -192,7 +220,6 @@ test("thread detail is split into semantic messages without repeated framing", (
     kind: "thread.detail",
     thread: ACTIVE,
     state: "working",
-    reason: "fork",
     requestPreview: { body: "Redo the message structure." },
     assistantMessages: [
       { body: "I’m mapping every outbound event.", phase: "commentary" },
@@ -200,12 +227,10 @@ test("thread detail is split into semantic messages without repeated framing", (
     ],
   };
   assert.deepEqual(renderOutboundMessages(event, activeOptions), [
-    "Opened  🪁 **Polish message formatting**\n/reasoning (level/none) · /turn · /history · /cancel",
     "👤 Redo the message structure.",
     "I’m mapping every outbound event.\n\nThe minimal formatter is ready.",
   ]);
   assert.equal(renderOutboundEvent(event, activeOptions), [
-    "Opened  🪁 **Polish message formatting**\n/reasoning (level/none) · /turn · /history · /cancel",
     "👤 Redo the message structure.",
     "I’m mapping every outbound event.\n\nThe minimal formatter is ready.",
   ].join("\n\n\n"));
@@ -417,7 +442,7 @@ test("canonical outputs never reintroduce universal headers, rules, context, or 
     renderOutboundEvent({ kind: "thread.output", thread: ACTIVE, body: "Done." }, activeOptions),
     renderOutboundEvent({ kind: "thread.live-message", messageId: "u", thread: ACTIVE, role: "user", body: "Go." }, activeOptions),
     renderOutboundEvent({ kind: "thread.progress", thread: ACTIVE, phase: "Running tests." }, activeOptions),
-    renderOutboundEvent({ kind: "service.switched", thread: ACTIVE }, activeOptions),
+    renderOutboundEvent({ kind: "thread.header", thread: { ...ACTIVE, status: "error" } }, activeOptions),
     renderOutboundEvent({ kind: "service.presence", state: "online" }, activeOptions),
     renderOutboundEvent({ kind: "service.notice", code: "connected", body: "Connected." }, activeOptions),
   ];

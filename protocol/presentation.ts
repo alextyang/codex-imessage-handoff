@@ -6,6 +6,15 @@ export interface ThreadLabel {
   projectKey?: string | null;
   projectLabel?: string | null;
   createdAt?: string | null;
+  status?: ThreadStatus | string | null;
+  activityAt?: string | null;
+  stateSince?: string | null;
+  reasoningEffort?: string | null;
+  pendingCount?: number;
+  turnCount?: number;
+  turnCountLowerBound?: boolean;
+  muted?: boolean;
+  listening?: boolean;
 }
 
 export interface MenuItem extends ThreadLabel {
@@ -71,6 +80,7 @@ export interface ThreadTurn {
 export type NoticeCode = "connected" | "queued" | "cancelled" | "needs-attention" | "updated";
 
 export type OutboundEvent =
+  | { kind: "thread.header"; thread: ThreadLabel; deliveryId?: string }
   | { kind: "thread.output"; thread: ThreadLabel; body: string }
   | { kind: "thread.completed"; completionId: string; thread: ThreadLabel; body: string; completedAt?: string | null }
   | {
@@ -97,7 +107,6 @@ export type OutboundEvent =
     assistantMessages?: VisibleMessage[];
     historyTruncated?: boolean;
     deliveryId?: string;
-    reason?: "fork" | "status" | null;
   }
   | { kind: "thread.request"; thread: ThreadLabel; body?: string; request?: string | { body?: string; at?: string | null }; at?: string | null }
   | { kind: "thread.turn"; thread: ThreadLabel; turn: ThreadTurn | null; reasoningEffort?: string | null }
@@ -113,7 +122,6 @@ export type OutboundEvent =
   }
   | { kind: "service.menu"; label?: "THREADS" | "PROJECTS" | "COMMANDS"; items?: MenuItem[]; body?: string; note?: string }
   | { kind: "service.directory"; directory: ThreadDirectory }
-  | { kind: "service.switched"; thread: ThreadLabel; reason?: "fork" | null }
   | { kind: "service.presence"; state: "online" | "offline" }
   | { kind: "service.notice"; code: NoticeCode; body: string; thread?: ThreadLabel };
 
@@ -220,7 +228,6 @@ function sameThread(left?: ThreadLabel | null, right?: ThreadLabel | null) {
 }
 
 function eventActiveThread(event: OutboundEvent, options: PresentationOptions) {
-  if (event.kind === "service.switched") return event.thread;
   if (options.context && Object.prototype.hasOwnProperty.call(options.context, "activeThread")) {
     return options.context.activeThread ?? null;
   }
@@ -260,7 +267,7 @@ function elapsed(value: string | null | undefined, now: string | Date | number =
   return ago === "now" || ago === "unknown" ? ago : ago.replace(/ ago$/, "");
 }
 
-function statusName(status: unknown) {
+export function statusName(status: unknown) {
   if (status === "working" || status === "running") return "working";
   if (status === "pending" || status === "queued") return "pending";
   if (status === "error" || status === "failed" || status === "aborted") return "error";
@@ -273,7 +280,14 @@ function turnCountText(item: { turnCount?: number; turnCountLowerBound?: boolean
   return `${count}${item.turnCountLowerBound ? "+" : ""} ${count === 1 ? "turn" : "turns"}`;
 }
 
-function directoryStatus(item: MenuItem, now: string | Date | number) {
+export function statusGlyph(status: unknown) {
+  const normalized = statusName(status);
+  if (normalized === "working" || normalized === "pending") return "◷";
+  if (normalized === "error") return "▲";
+  return "○";
+}
+
+export function directoryStatus(item: MenuItem, now: string | Date | number) {
   const status = statusName(item.status);
   const pending = Math.max(0, Number(item.pendingCount) || 0);
   const turns = turnCountText(item);
@@ -301,15 +315,15 @@ function requestPreview(value: unknown) {
 
 function projectHeading(group: ThreadDirectoryGroup) {
   const count = group.threadCount ?? group.threads.length + Math.max(0, group.hiddenCount ?? 0);
-  if (group.projectLabel.trim().toLowerCase() === "other tasks") return `▾ ${bold("Other tasks", "Other tasks")} · ${count} ${count === 1 ? "task" : "tasks"}`;
-  return `▾  ${projectIdentityEmoji(group)} ${bold(group.projectLabel, "Project")} · ${count} ${count === 1 ? "task" : "tasks"}`;
+  if (group.projectLabel.trim().toLowerCase() === "other tasks") return `▾ ${statusGlyph(group.status)} ${bold("Other tasks", "Other tasks")} · ${count} ${count === 1 ? "task" : "tasks"}`;
+  return `▾  ${statusGlyph(group.status)} ${projectIdentityEmoji(group)} ${bold(group.projectLabel, "Project")} · ${count} ${count === 1 ? "task" : "tasks"}`;
 }
 
 function renderThreadRow(item: MenuItem, offset: number, now: string | Date | number) {
   const index = item.index ?? offset + 1;
   const preview = requestPreview(item.requestPreview);
   return [
-    `${keycap(index)}  ${styledThreadTitle(item, Boolean(item.current))}`,
+    `${keycap(index)}  ${statusGlyph(item.status)} ${styledThreadTitle(item, Boolean(item.current))}`,
     `   ${directoryStatus(item, now)}`,
     preview ? `   “${preview}”` : null,
   ].filter(Boolean).join("\n");
@@ -337,7 +351,7 @@ export function renderThreadDirectory(directory: ThreadDirectory, options: { now
   for (const project of directory.collapsedProjects ?? []) {
     const statusItem: MenuItem = { title: project.projectLabel, status: project.status, activityAt: project.activityAt, stateSince: project.activityAt };
     const identity = project.projectLabel.trim().toLowerCase() === "other tasks" ? "" : `${projectIdentityEmoji(project)} `;
-    sections.push(`${keycap(project.index)}  ▸  ${identity}${bold(project.projectLabel, "Project")} · ${project.threadCount} ${project.threadCount === 1 ? "task" : "tasks"}\n   ${directoryStatus(statusItem, now)}`);
+    sections.push(`${keycap(project.index)}  ▸  ${statusGlyph(project.status)} ${identity}${bold(project.projectLabel, "Project")} · ${project.threadCount} ${project.threadCount === 1 ? "task" : "tasks"}\n   ${directoryStatus(statusItem, now)}`);
   }
   if (sections.length === 0) sections.push("No pending or recently active threads.");
   sections.push(safeBody(directory.note, DEFAULT_THREAD_DIRECTORY_NOTE));
@@ -357,7 +371,7 @@ export function renderThreadMenu(items: MenuItem[], options: { label?: "THREADS"
           : state === "error"
             ? `▲ Needs attention · ${count} ${count === 1 ? "task" : "tasks"}`
             : `○ ${relativeTime(item.activityAt || item.stateSince, now)} · ${count} ${count === 1 ? "task" : "tasks"}`;
-      return `${keycap(item.index ?? index + 1)}  ${projectIdentityEmoji({ title: item.title, createdAt: item.createdAt })} ${bold(item.title, "Project")}\n   ${status}`;
+      return `${keycap(item.index ?? index + 1)}  ${statusGlyph(item.status)} ${projectIdentityEmoji({ title: item.title, createdAt: item.createdAt })} ${bold(item.title, "Project")}\n   ${status}`;
     });
     return [
       "**Projects**",
@@ -396,23 +410,19 @@ function reasoningName(value: unknown) {
   return text;
 }
 
-function openedMessage(thread: ThreadLabel) {
-  return `Opened  ${styledThreadTitle(thread, true)}\n/reasoning (level/none) · /turn · /history · /cancel`;
-}
-
-function statusSummary(event: Extract<OutboundEvent, { kind: "thread.detail" }>) {
-  const item: MenuItem = {
-    ...event.thread,
-    status: event.state,
-    activityAt: event.activityAt,
-    stateSince: event.stateSince,
-    pendingCount: event.pendingCount,
-    turnCount: event.turnCount,
-    turnCountLowerBound: event.turnCountLowerBound,
-  };
-  const lines = [styledThreadTitle(event.thread, true), directoryStatus(item, new Date())];
-  if (event.reasoningEffort) lines.push(`Reasoning: ${reasoningName(event.reasoningEffort)}`);
-  return lines.join("\n");
+export function renderThreadHeader(thread: ThreadLabel, now: string | Date | number = new Date()) {
+  const status = directoryStatus(thread, now);
+  const reasoning = thread.reasoningEffort ? `Reasoning: ${reasoningName(thread.reasoningEffort)}` : null;
+  const updates = thread.muted ? "Updates: muted" : null;
+  const listening = thread.listening ? "Listening: next turn" : null;
+  const link = thread.id ? `codex://threads/${encodeURIComponent(thread.id)}` : null;
+  const updateCommand = thread.muted ? "/unmute" : "/mute";
+  return [
+    styledThreadTitle(thread, true),
+    [status, reasoning, updates, listening].filter(Boolean).join("\n"),
+    link,
+    `/listen · /link · ${updateCommand}\n/turn · /history · /reasoning · /cancel`,
+  ].filter(Boolean).join("\n\n");
 }
 
 function normalizeRequest(event: Extract<OutboundEvent, { kind: "thread.request" }>) {
@@ -444,12 +454,11 @@ function partPrefix(options: PresentationOptions) {
 }
 
 export function renderOutboundMessages(event: OutboundEvent, options: PresentationOptions = {}): string[] {
+  if (event.kind === "thread.header") return [renderThreadHeader(event.thread)];
   if (event.kind === "thread.progress") return [];
   if (event.kind === "thread.detail") {
     const activeThread = eventActiveThread(event, options);
     const messages: string[] = [];
-    if (event.reason === "fork") messages.push(openedMessage(event.thread));
-    if (event.reason === "status") messages.push(statusSummary(event));
     const preview = typeof event.requestPreview === "string" ? event.requestPreview : event.requestPreview?.body;
     if (preview && !/^No user request was found/i.test(preview)) {
       const truncated = typeof event.requestPreview === "object" && event.requestPreview?.truncated;
@@ -459,7 +468,7 @@ export function renderOutboundMessages(event: OutboundEvent, options: Presentati
     if (assistant.length > 0) messages.push(assistant.join("\n\n"));
     if (event.historyTruncated) messages.push("Older task context wasn’t loaded · /turn or /history 5");
     if (messages.length === 0) messages.push("No response yet.");
-    if (!sameThread(event.thread, activeThread) && event.reason !== "status") {
+    if (!sameThread(event.thread, activeThread)) {
       messages[0] = scopedBody(event.thread, messages[0], activeThread);
     }
     return messages;
@@ -470,6 +479,7 @@ export function renderOutboundMessages(event: OutboundEvent, options: Presentati
 export function renderOutboundEvent(event: OutboundEvent, options: PresentationOptions = {}): string {
   const activeThread = eventActiveThread(event, options);
   const part = partPrefix(options);
+  if (event.kind === "thread.header") return `${part}${renderThreadHeader(event.thread)}`;
   if (event.kind === "thread.output") return `${part}${scopedBody(event.thread, safeBody(event.body), activeThread)}`;
   if (event.kind === "thread.completed") return `${part}${scopedBody(event.thread, safeBody(event.body), activeThread)}`;
   if (event.kind === "thread.live-message") {
@@ -515,7 +525,6 @@ export function renderOutboundEvent(event: OutboundEvent, options: PresentationO
     return `${part}${scopedBody(event.thread, body, activeThread)}`;
   }
   if (event.kind === "service.directory") return `${part}${renderThreadDirectory(event.directory, { context: options.context })}`;
-  if (event.kind === "service.switched") return `${part}${openedMessage(event.thread)}`;
   if (event.kind === "service.presence") {
     return `${part}${event.state === "online" ? "● Codex is online." : "○ Codex is offline. New messages will wait until it reconnects."}`;
   }

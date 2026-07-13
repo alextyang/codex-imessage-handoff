@@ -1,4 +1,9 @@
 import { execFile as nodeExecFile, spawn as nodeSpawn } from "node:child_process";
+import {
+  imsgRpcFailureSource,
+  safeImsgFailureDetails,
+  safeRemoteRpcDiagnostic,
+} from "./imsg-rpc-diagnostics.mjs";
 
 const DEFAULT_RPC_TIMEOUT_MS = 8_000;
 const DEFAULT_SEND_TIMEOUT_MS = 20_000;
@@ -7,6 +12,19 @@ const DEFAULT_MAX_LINE_BYTES = 1024 * 1024;
 const DEFAULT_MAX_MESSAGE_BYTES = 256 * 1024;
 const DEFAULT_MAX_TEXT_BYTES = 128 * 1024;
 const STATUS_MAX_BYTES = 512 * 1024;
+
+export const REQUIRED_PINNED_IMSG_CAPABILITIES = Object.freeze([
+  "watch",
+  "richText",
+  "replies",
+  "polls",
+  "pollCaptionControl",
+  "pollVoting",
+  "tapbacks",
+  "typing",
+  "readReceipts",
+  "attachments",
+]);
 
 const SEND_METHODS = new Set([
   "send.rich",
@@ -33,7 +51,7 @@ function rpcFailure(code, message, options = {}) {
   return Object.assign(new Error(message), {
     code,
     attempted: options.attempted === true,
-    remoteCode: options.remoteCode,
+    ...safeImsgFailureDetails(options),
   });
 }
 
@@ -60,7 +78,7 @@ function unsupported(reason) {
   };
 }
 
-function ambiguous(reason) {
+function ambiguous(reason, details = {}) {
   return {
     classification: "ambiguous",
     accepted: false,
@@ -68,6 +86,7 @@ function ambiguous(reason) {
     unsupported: false,
     retrySafe: false,
     reason,
+    ...safeImsgFailureDetails(details),
   };
 }
 
@@ -165,7 +184,18 @@ function normalizePoll(params) {
   if (!question.trim() || options.length < 2 || options.length > 12) throw rpcFailure("IMSG_INVALID_INPUT", "A poll requires a question and 2–12 options.");
   const comment = requireBoundedString(params?.comment, "comment", { optional: true });
   const reply = requireBoundedString(params?.reply_to ?? params?.replyTo ?? params?.reply_to_guid, "reply_to", { optional: true, maxBytes: 4096 });
-  return { ...target, question, options, ...(comment ? { comment } : {}), ...(reply ? { reply_to: reply } : {}) };
+  const sendCaption = params?.send_caption ?? params?.sendCaption;
+  if (sendCaption !== undefined && typeof sendCaption !== "boolean") {
+    throw rpcFailure("IMSG_INVALID_INPUT", "send_caption must be a boolean.");
+  }
+  return {
+    ...target,
+    question,
+    options,
+    ...(comment ? { comment } : {}),
+    ...(reply ? { reply_to: reply } : {}),
+    ...(sendCaption !== undefined ? { send_caption: sendCaption } : {}),
+  };
 }
 
 function normalizeMutationTarget(params) {
@@ -238,6 +268,7 @@ function normalizedCapabilities(path, raw) {
       attachments: advanced && has("send.attachment"),
       urlPreviews: advanced && has("send.rich") && selectors.urlPreviewMessage === true && selectors.sendRichLinkAction === true,
       polls: advanced && has("poll.send") && selectors.pollPayloadMessage === true,
+      pollCaptionControl: advanced && has("poll.send") && raw?.poll_caption_control === true,
       pollVoting: advanced && has("poll.vote") && selectors.pollVoteMessage === true,
       tapbacks: advanced && has("tapback"),
       typing: advanced && has("typing") && raw?.typing_indicators === true,
@@ -503,7 +534,11 @@ export class ImsgClient {
     clearTimeout(pending.timer);
     this.pending.delete(message.id);
     if (hasError) {
-      pending.reject(rpcFailure("IMSG_RPC_REMOTE_ERROR", "imsg RPC rejected the request.", { attempted: true, remoteCode: Number(message.error.code) }));
+      pending.reject(rpcFailure("IMSG_RPC_REMOTE_ERROR", "imsg RPC rejected the request.", {
+        attempted: true,
+        failureSource: "remote-error",
+        ...safeRemoteRpcDiagnostic(message.error),
+      }));
     } else {
       pending.resolve(message.result);
     }
@@ -563,7 +598,10 @@ export class ImsgClient {
       return accepted(result);
     } catch (error) {
       if (error?.code === "IMSG_RPC_REMOTE_ERROR" && error?.remoteCode === -32601) return unsupported("rpc-method-unavailable");
-      return ambiguous(error?.code === "IMSG_RPC_TIMEOUT" ? "timeout" : "transport-or-send-failure");
+      return ambiguous(
+        error?.code === "IMSG_RPC_TIMEOUT" ? "timeout" : "transport-or-send-failure",
+        { ...error, failureSource: imsgRpcFailureSource(error) },
+      );
     }
   }
 
@@ -589,7 +627,8 @@ export class ImsgClient {
     } catch (error) {
       return unsupported(error.code || "invalid-input");
     }
-    return this._classifiedRpcSend("poll.send", normalized, { feature: "polls" });
+    const feature = normalized.send_caption === false ? "pollCaptionControl" : "polls";
+    return this._classifiedRpcSend("poll.send", normalized, { feature });
   }
 
   async votePoll(params, { remove = false } = {}) {

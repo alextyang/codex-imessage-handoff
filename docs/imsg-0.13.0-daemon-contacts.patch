@@ -1,4 +1,325 @@
+diff --git a/Sources/IMsgHelper/IMsgInjected.m b/Sources/IMsgHelper/IMsgInjected.m
+index 5728db9..738284a 100644
+--- a/Sources/IMsgHelper/IMsgInjected.m
++++ b/Sources/IMsgHelper/IMsgInjected.m
+@@ -2225,6 +2225,57 @@ static unsigned long long flagsForMessagePayload(NSAttributedString *subject,
+                                                  NSArray *fileTransferGuids,
+                                                  BOOL isAudioMessage);
+
++static id buildIMMessage(NSAttributedString *body,
++                         NSAttributedString *subject,
++                         NSString *effectId,
++                         NSString *threadIdentifier,
++                         id threadOriginator,
++                         NSString *associatedMessageGuid,
++                         long long associatedMessageType,
++                         NSRange associatedMessageRange,
++                         NSDictionary *summaryInfo,
++                         NSArray *fileTransferGuids,
++                         BOOL isAudioMessage,
++                         BOOL ddScan);
++
++static void setBalloonConstructionFailure(NSString **outFailureCode,
++                                          NSString *failureCode) {
++    if (outFailureCode) *outFailureCode = failureCode;
++}
++
++static BOOL stampBalloonMetadataOnMessage(id message,
++                                          NSString *balloonID,
++                                          NSData *payloadData,
++                                          NSDictionary *summaryInfo) {
++    if (!message) return NO;
++    NSMutableArray *targets = [NSMutableArray arrayWithObject:message];
++    SEL itemSel = NSSelectorFromString(@"_imMessageItem");
++    if ([message respondsToSelector:itemSel]) {
++        @try {
++            id item = [message performSelector:itemSel];
++            if (item) [targets insertObject:item atIndex:0];
++        } @catch (__unused NSException *e) {}
++    }
++    BOOL balloonStamped = NO;
++    BOOL payloadStamped = NO;
++    for (id target in targets) {
++        if ([target respondsToSelector:@selector(setBalloonBundleID:)]) {
++            [target performSelector:@selector(setBalloonBundleID:) withObject:balloonID];
++            balloonStamped = YES;
++        }
++        if ([target respondsToSelector:@selector(setPayloadData:)]) {
++            [target performSelector:@selector(setPayloadData:) withObject:payloadData];
++            payloadStamped = YES;
++        }
++        if (summaryInfo
++            && [target respondsToSelector:@selector(setMessageSummaryInfo:)]) {
++            [target performSelector:@selector(setMessageSummaryInfo:)
++                         withObject:summaryInfo];
++        }
++    }
++    return balloonStamped && payloadStamped;
++}
++
+ static id buildBalloonIMMessage(NSString *balloonID,
+                                 NSAttributedString *body,
+                                 NSData *payloadData,
+@@ -2234,23 +2285,45 @@ static id buildBalloonIMMessage(NSString *balloonID,
+                                 NSString *replyToGUID,
+                                 NSString *threadOriginatorGUID,
+                                 NSString *threadOriginatorPart,
+-                                id parentItem) {
++                                id parentItem,
++                                NSString **outFailureCode) {
++    if (outFailureCode) *outFailureCode = nil;
+     Class messageClass = NSClassFromString(@"IMMessage");
+-    if (!messageClass) return nil;
+-    if (!balloonID.length) return nil;
++    if (!messageClass) {
++        setBalloonConstructionFailure(outFailureCode, @"missing-class");
++        debugLog(@"buildBalloonIMMessage: missing IMMessage class");
++        return nil;
++    }
++    if (!balloonID.length) {
++        setBalloonConstructionFailure(outFailureCode, @"empty-balloon");
++        debugLog(@"buildBalloonIMMessage: empty balloon identifier");
++        return nil;
++    }
+
+-    if (replyToGUID.length) {
+-        Class itemClass = NSClassFromString(@"IMMessageItem");
+-        SEL itemInitSel = @selector(initWithSender:time:body:attributes:fileTransferGUIDs:flags:error:guid:threadIdentifier:);
+-        SEL wrapSel = @selector(messageFromIMMessageItem:sender:subject:);
+-        if (!itemClass
+-            || ![itemClass instancesRespondToSelector:itemInitSel]
+-            || ![messageClass respondsToSelector:wrapSel]) {
+-            return nil;
+-        }
++    Class itemClass = NSClassFromString(@"IMMessageItem");
++    SEL itemInitSel = @selector(initWithSender:time:body:attributes:fileTransferGUIDs:flags:error:guid:threadIdentifier:);
++    SEL wrapSel = @selector(messageFromIMMessageItem:sender:subject:);
++    BOOL replyItemPathAvailable = itemClass
++        && [itemClass instancesRespondToSelector:itemInitSel]
++        && [messageClass respondsToSelector:wrapSel]
++        && [itemClass instancesRespondToSelector:@selector(setBalloonBundleID:)]
++        && [itemClass instancesRespondToSelector:@selector(setPayloadData:)]
++        && [itemClass instancesRespondToSelector:@selector(setReplyToGUID:)]
++        && (!summaryInfo
++            || [itemClass instancesRespondToSelector:@selector(setMessageSummaryInfo:)])
++        && (!threadIdentifier.length
++            || [itemClass instancesRespondToSelector:@selector(setThreadIdentifier:)])
++        && (!parentItem
++            || [itemClass instancesRespondToSelector:@selector(setThreadOriginator:)]);
++
++    if (replyToGUID.length && replyItemPathAvailable) {
+
+         id item = [itemClass alloc];
+-        if (!item) return nil;
++        if (!item) {
++            setBalloonConstructionFailure(outFailureCode, @"legacy-item-alloc");
++            debugLog(@"buildBalloonIMMessage: reply item allocation failed");
++            return nil;
++        }
+
+         NSDate *now = [NSDate date];
+         NSArray *transferGuids = fileTransferGuids ?: @[];
+@@ -2276,30 +2349,17 @@ static id buildBalloonIMMessage(NSString *balloonID,
+         [iinv setArgument:&messageThreadIdentifier atIndex:10];
+         [iinv retainArguments];
+         item = invokeReturningObject(iinv);
+-        if (!item) return nil;
++        if (!item) {
++            setBalloonConstructionFailure(outFailureCode, @"legacy-item-init");
++            debugLog(@"buildBalloonIMMessage: reply item initializer returned nil");
++            return nil;
++        }
+
+         if ([item respondsToSelector:@selector(_regenerateBodyData)]) {
+             [item performSelector:@selector(_regenerateBodyData)];
+         }
+         ensureItemBodyData(item, body);
+
+-        if (![item respondsToSelector:@selector(setBalloonBundleID:)]
+-            || ![item respondsToSelector:@selector(setPayloadData:)]
+-            || ![item respondsToSelector:@selector(setReplyToGUID:)]) {
+-            return nil;
+-        }
+-        if (summaryInfo
+-            && ![item respondsToSelector:@selector(setMessageSummaryInfo:)]) {
+-            return nil;
+-        }
+-        if (messageThreadIdentifier
+-            && ![item respondsToSelector:@selector(setThreadIdentifier:)]) {
+-            return nil;
+-        }
+-        if (parentItem
+-            && ![item respondsToSelector:@selector(setThreadOriginator:)]) {
+-            return nil;
+-        }
+         [item performSelector:@selector(setBalloonBundleID:) withObject:balloonID];
+         [item performSelector:@selector(setPayloadData:) withObject:payloadData];
+         [item performSelector:@selector(setReplyToGUID:) withObject:replyToGUID];
+@@ -2341,11 +2401,30 @@ static id buildBalloonIMMessage(NSString *balloonID,
+         [winv setArgument:&nilSender atIndex:3];
+         [winv setArgument:&nilSubject atIndex:4];
+         [winv retainArguments];
+-        return invokeReturningObject(winv);
++        id wrapped = invokeReturningObject(winv);
++        if (!wrapped) {
++            setBalloonConstructionFailure(outFailureCode, @"legacy-wrap");
++            debugLog(@"buildBalloonIMMessage: legacy reply item wrapper returned nil");
++            return nil;
++        }
++        debugLog(@"buildBalloonIMMessage: legacy reply item wrapper succeeded");
++        return wrapped;
++    }
++
++    if (replyToGUID.length) {
++        // macOS 27 removed the legacy item wrapper. Match Messages' normal
++        // reply path instead: construct an ordinary atomic balloon, then set
++        // its thread identifier and let dispatch install inline-reply context.
++        // Passing a thread into the payload initializer itself can return nil.
++        debugLog(@"buildBalloonIMMessage: using atomic reply construction");
+     }
+
+     SEL sel = @selector(initWithSender:time:text:messageSubject:fileTransferGUIDs:flags:error:guid:subject:balloonBundleID:payloadData:expressiveSendStyleID:threadIdentifier:scheduleType:scheduleState:messageSummaryInfo:);
+-    if (![messageClass instancesRespondToSelector:sel]) return nil;
++    if (![messageClass instancesRespondToSelector:sel]) {
++        setBalloonConstructionFailure(outFailureCode, @"atomic-selector");
++        debugLog(@"buildBalloonIMMessage: atomic payload initializer unavailable");
++        return nil;
++    }
+
+     id msg = [[messageClass alloc] init];
+     NSMethodSignature *sig = [messageClass instanceMethodSignatureForSelector:sel];
+@@ -2360,6 +2439,8 @@ static id buildBalloonIMMessage(NSString *balloonID,
+     unsigned long long scheduleType = 0;
+     unsigned long long scheduleState = 0;
+     NSString *messageThreadIdentifier = threadIdentifier.length ? threadIdentifier : nil;
++    NSString *initializerThreadIdentifier = replyToGUID.length
++        ? nil : messageThreadIdentifier;
+
+     [inv setArgument:&nilObj atIndex:2];              // sender
+     [inv setArgument:&now atIndex:3];                 // time
+@@ -2373,13 +2454,63 @@ static id buildBalloonIMMessage(NSString *balloonID,
+     [inv setArgument:&balloonID atIndex:11];
+     [inv setArgument:&payloadData atIndex:12];
+     [inv setArgument:&nilObj atIndex:13];             // expressiveSendStyleID
+-    [inv setArgument:&messageThreadIdentifier atIndex:14];
++    [inv setArgument:&initializerThreadIdentifier atIndex:14];
+     [inv setArgument:&scheduleType atIndex:15];
+     [inv setArgument:&scheduleState atIndex:16];
+     [inv setArgument:&summaryInfo atIndex:17];
+     [inv retainArguments];
+     id result = invokeReturningObject(inv);
+-    if (!messageThreadIdentifier.length) {
++    if (!result) {
++        if (replyToGUID.length) {
++            id fallback = buildIMMessage(body,
++                                         nil,
++                                         nil,
++                                         messageThreadIdentifier,
++                                         parentItem,
++                                         nil,
++                                         0,
++                                         NSMakeRange(0, 0),
++                                         summaryInfo,
++                                         @[],
++                                         NO,
++                                         NO);
++            if (stampBalloonMetadataOnMessage(fallback,
++                                              balloonID,
++                                              payloadData,
++                                              summaryInfo)) {
++                debugLog(@"buildBalloonIMMessage: ordinary reply fallback succeeded");
++                return fallback;
++            }
++        }
++        setBalloonConstructionFailure(outFailureCode, @"atomic-init-nil");
++        debugLog(@"buildBalloonIMMessage: %@ payload initializer returned nil",
++                 replyToGUID.length ? @"reply" : @"top-level");
++        return nil;
++    }
++    if (replyToGUID.length && messageThreadIdentifier.length) {
++        BOOL threadIdentifierApplied = NO;
++        if ([result respondsToSelector:@selector(setThreadIdentifier:)]) {
++            [result performSelector:@selector(setThreadIdentifier:)
++                         withObject:messageThreadIdentifier];
++            threadIdentifierApplied = YES;
++        }
++        SEL itemSel = NSSelectorFromString(@"_imMessageItem");
++        if (!threadIdentifierApplied && [result respondsToSelector:itemSel]) {
++            @try {
++                id resultItem = [result performSelector:itemSel];
++                if ([resultItem respondsToSelector:@selector(setThreadIdentifier:)]) {
++                    [resultItem performSelector:@selector(setThreadIdentifier:)
++                                     withObject:messageThreadIdentifier];
++                    threadIdentifierApplied = YES;
++                }
++            } @catch (__unused NSException *e) {}
++        }
++        if (!threadIdentifierApplied) {
++            debugLog(@"buildBalloonIMMessage: reply thread setter unavailable");
++        } else {
++            debugLog(@"buildBalloonIMMessage: atomic reply construction succeeded");
++        }
++    } else if (!messageThreadIdentifier.length) {
+         clearReplyMetadataOnMessage(result);
+     }
+     return result;
+@@ -2392,7 +2523,8 @@ static id buildPollIMMessage(NSAttributedString *body,
+                              NSString *replyToGUID,
+                              NSString *threadOriginatorGUID,
+                              NSString *threadOriginatorPart,
+-                             id parentItem) {
++                             id parentItem,
++                             NSString **outFailureCode) {
+     return buildBalloonIMMessage(pollsBalloonBundleIdentifier(),
+                                  body,
+                                  payloadData,
+@@ -2402,7 +2534,8 @@ static id buildPollIMMessage(NSAttributedString *body,
+                                  replyToGUID,
+                                  threadOriginatorGUID,
+                                  threadOriginatorPart,
+-                                 parentItem);
++                                 parentItem,
++                                 outFailureCode);
+ }
+
+ static NSString *urlPreviewBalloonBundleIdentifier(void) {
+@@ -3602,7 +3735,8 @@ static BOOL validateRichLinkPreviewImage(NSDictionary *image,
+                                                 ? [parentMessage performSelector:@selector(guid)]
+                                                 : nil,
+                                               nil,
+-                                              parentItem);
++                                              parentItem,
++                                              NULL);
+         } else {
+             imMessage = buildIMMessage(body, subjectAttr,
+                                        effectId,
+@@ -3765,6 +3899,7 @@ static BOOL validateRichLinkPreviewImage(NSDictionary *image,
+     }
+
+     @try {
++        NSString *constructionFailure = nil;
+         id imMessage = buildPollIMMessage(body,
+                                           payloadData,
+                                           summary,
+@@ -3772,9 +3907,14 @@ static BOOL validateRichLinkPreviewImage(NSDictionary *image,
+                                           replyToGUID,
+                                           threadOriginatorGUID,
+                                           threadOriginatorPart,
+-                                          parentItem);
++                                          parentItem,
++                                          &constructionFailure);
+         if (!imMessage) {
+-            return errorResponse(requestId, @"Could not construct poll IMMessage");
++            NSString *failure = constructionFailure.length
++                ? constructionFailure : @"unknown";
++            return errorResponse(requestId,
++                [NSString stringWithFormat:
++                    @"Could not construct poll IMMessage [%@]", failure]);
+         }
+         if (parentMessage
+             && [imMessage respondsToSelector:@selector(setThreadOriginator:)]) {
 diff --git a/Sources/imsg/Commands/RpcCommand.swift b/Sources/imsg/Commands/RpcCommand.swift
+index bff73ee..f740436 100644
 --- a/Sources/imsg/Commands/RpcCommand.swift
 +++ b/Sources/imsg/Commands/RpcCommand.swift
 @@ -23,7 +23,7 @@ enum RpcCommand {
@@ -10,7 +331,36 @@ diff --git a/Sources/imsg/Commands/RpcCommand.swift b/Sources/imsg/Commands/RpcC
      let server = RPCServer(store: store, verbose: runtime.verbose, contactResolver: contacts)
      try await server.run()
    }
+diff --git a/Sources/imsg/Commands/StatusCommand.swift b/Sources/imsg/Commands/StatusCommand.swift
+index 4b923ab..2c72d14 100644
+--- a/Sources/imsg/Commands/StatusCommand.swift
++++ b/Sources/imsg/Commands/StatusCommand.swift
+@@ -62,6 +62,7 @@ enum StatusCommand {
+         version: IMsgVersion.current,
+         basicFeatures: true,
+         advancedFeatures: availability.available,
++        pollCaptionControl: true,
+         typingIndicators: availability.available,
+         readReceipts: availability.available,
+         sip: sipStatus,
+@@ -145,6 +146,7 @@ private struct StatusPayload: Encodable {
+   let version: String
+   let basicFeatures: Bool
+   let advancedFeatures: Bool
++  let pollCaptionControl: Bool
+   let typingIndicators: Bool
+   let readReceipts: Bool
+   let sip: String
+@@ -158,6 +160,7 @@ private struct StatusPayload: Encodable {
+     case version
+     case basicFeatures = "basic_features"
+     case advancedFeatures = "advanced_features"
++    case pollCaptionControl = "poll_caption_control"
+     case typingIndicators = "typing_indicators"
+     case readReceipts = "read_receipts"
+     case sip
 diff --git a/Sources/imsg/Commands/WatchCommand.swift b/Sources/imsg/Commands/WatchCommand.swift
+index 0246bfe..2f867f9 100644
 --- a/Sources/imsg/Commands/WatchCommand.swift
 +++ b/Sources/imsg/Commands/WatchCommand.swift
 @@ -55,7 +55,7 @@ enum WatchCommand {
@@ -22,3 +372,127 @@ diff --git a/Sources/imsg/Commands/WatchCommand.swift b/Sources/imsg/Commands/Wa
      },
      streamProvider:
        @escaping (
+diff --git a/Sources/imsg/RPCServer+BridgeMessageHandlers.swift b/Sources/imsg/RPCServer+BridgeMessageHandlers.swift
+index 63dd82f..159d930 100644
+--- a/Sources/imsg/RPCServer+BridgeMessageHandlers.swift
++++ b/Sources/imsg/RPCServer+BridgeMessageHandlers.swift
+@@ -244,15 +244,13 @@ extension RPCServer {
+
+     // Messages never renders the poll title on the balloon, so send the question
+     // (or an explicit `comment` override) as a PLAIN caption message right after
+-    // the poll — matching how the native "comment or Send" field renders. Not a
+-    // threaded reply: native poll comments carry no thread metadata, so a reply
+-    // would decorate the balloon with a connector line. Outbound (from_me) rows
+-    // are cached and never re-processed, so no poll<->comment link is needed.
+-    // Callers pass only `question`; the caption appears for free and the agent
+-    // needs no knowledge of this. Best-effort: the poll already succeeded, so a
+-    // comment failure must not fail the RPC.
++    // the poll by default. RPC callers that provide their own context can set
++    // `send_caption` (or `sendCaption`) to false and keep the poll as one native
++    // Messages item. Best-effort: the poll already succeeded, so a caption
++    // failure must not fail the RPC.
++    let sendCaption = boolParam(params["send_caption"] ?? params["sendCaption"]) ?? true
+     let comment = stringParam(params["comment"]).flatMap { $0.isEmpty ? nil : $0 } ?? question
+-    if !comment.isEmpty {
++    if sendCaption && !comment.isEmpty {
+       do {
+         _ = try await invokeBridge(
+           action: .sendMessage,
+diff --git a/Tests/imsgTests/BridgeCommandRegistrationTests.swift b/Tests/imsgTests/BridgeCommandRegistrationTests.swift
+index 53b5013..f08c44f 100644
+--- a/Tests/imsgTests/BridgeCommandRegistrationTests.swift
++++ b/Tests/imsgTests/BridgeCommandRegistrationTests.swift
+@@ -253,6 +253,7 @@ func injectedHelperWiresNativePollSend() throws {
+   let source = stripObjectiveCComments(try String(contentsOf: helper, encoding: .utf8))
+   let sendPollBody = try #require(functionBody(named: "handleSendPoll", in: source))
+   let buildPollBody = try #require(functionBody(named: "buildPollIMMessage", in: source))
++  let buildBalloonBody = try #require(functionBody(named: "buildBalloonIMMessage", in: source))
+
+   #expect(source.contains("send-poll"))
+   #expect(source.contains("com.apple.messages.Polls"))
+@@ -268,7 +269,35 @@ func injectedHelperWiresNativePollSend() throws {
+   #expect(sendPollBody.contains("buildPollIMMessage"))
+   #expect(buildPollBody.contains("buildBalloonIMMessage(pollsBalloonBundleIdentifier()"))
+   #expect(buildPollBody.contains("@[]"))
++  #expect(buildBalloonBody.contains("replyItemPathAvailable"))
++  #expect(buildBalloonBody.contains("replyToGUID.length && replyItemPathAvailable"))
++  #expect(buildBalloonBody.contains("using atomic reply construction"))
++  #expect(buildBalloonBody.contains("initializerThreadIdentifier"))
++  #expect(buildBalloonBody.contains("replyToGUID.length"))
++  #expect(
++    buildBalloonBody.contains(
++      "setArgument:&initializerThreadIdentifier atIndex:14"
++    ))
++  #expect(!buildBalloonBody.contains("setArgument:&messageThreadIdentifier atIndex:14"))
++  #expect(buildBalloonBody.contains("setThreadIdentifier:"))
++  #expect(buildBalloonBody.contains("atomic reply construction succeeded"))
++  #expect(buildBalloonBody.contains("setBalloonConstructionFailure"))
++  #expect(buildBalloonBody.contains(#"@"atomic-init-nil""#))
++  #expect(buildBalloonBody.contains("ordinary reply fallback succeeded"))
++  #expect(buildBalloonBody.contains("stampBalloonMetadataOnMessage"))
++  #expect(buildBalloonBody.contains("if (!threadIdentifierApplied)"))
++  #expect(!buildBalloonBody.contains(
++    "reply thread setter unavailable\");\n            return nil"
++  ))
++  #expect(!buildBalloonBody.contains("accountController:itemCreator:"))
++  #expect(buildBalloonBody.contains("if (replyToGUID.length)"))
++  #expect(
++    buildBalloonBody.contains(
++      "initWithSender:time:text:messageSubject:fileTransferGUIDs:flags:error:guid:subject:"
++    ))
+   #expect(sendPollBody.contains("pollPayloadMessageInitializerAvailable()"))
++  #expect(sendPollBody.contains("constructionFailure"))
++  #expect(sendPollBody.contains("Could not construct poll IMMessage [%@]"))
+   #expect(!sendPollBody.contains(#"selectedMessageGuid.length ? @"" : question"#))
+   #expect(sendPollBody.contains("buildPollCreationPayloadData(question,"))
+   #expect(sendPollBody.contains(#"@{ @"enc": @YES, @"ust": @YES }"#))
+diff --git a/Tests/imsgTests/LaunchStatusCommandTests.swift b/Tests/imsgTests/LaunchStatusCommandTests.swift
+index d8dab2f..be5c46c 100644
+--- a/Tests/imsgTests/LaunchStatusCommandTests.swift
++++ b/Tests/imsgTests/LaunchStatusCommandTests.swift
+@@ -42,6 +42,7 @@ func statusCommandProducesJsonOutput() async throws {
+   #expect(output.contains(#""version":"\#(IMsgVersion.current)""#))
+   #expect(output.contains("basic_features"))
+   #expect(output.contains("advanced_features"))
++  #expect(output.contains(#""poll_caption_control":true"#))
+ }
+
+ @Test
+diff --git a/Tests/imsgTests/RPCBridgeMessageHandlersTests.swift b/Tests/imsgTests/RPCBridgeMessageHandlersTests.swift
+index 06eb1b4..9719a85 100644
+--- a/Tests/imsgTests/RPCBridgeMessageHandlersTests.swift
++++ b/Tests/imsgTests/RPCBridgeMessageHandlersTests.swift
+@@ -217,6 +217,33 @@ func rpcPollSendUsesCommentOverrideWithoutPollGuid() async throws {
+   #expect(calls.last?.params["message"] as? String == "Vote by 5pm")
+ }
+
++@Test
++func rpcPollSendCanSuppressPlainCaption() async throws {
++  let store = try CommandTestDatabase.makeStoreForRPC()
++  let output = TestRPCOutput()
++  var calls: [(action: BridgeAction, params: [String: Any])] = []
++  let server = RPCServer(
++    store: store,
++    verbose: false,
++    output: output,
++    invokeBridge: { action, params in
++      calls.append((action, params))
++      return ["messageGuid": "poll-guid"]
++    }
++  )
++
++  await server.handleLineForTesting(
++    #"{"jsonrpc":"2.0","id":"poll","method":"poll.send","params":{"#
++      + #""chat_id":1,"question":"Dinner?","options":["Pizza","Sushi"],"#
++      + #""send_caption":false}}"#
++  )
++
++  #expect(calls.count == 1)
++  #expect(calls.first?.action == .sendPoll)
++  let result = output.responses.first?["result"] as? [String: Any]
++  #expect(result?["guid"] as? String == "poll-guid")
++}
++
+ @Test
+ func rpcNormalizesTapbackReactionAliases() throws {
+   #expect(try normalizeBridgeReactionType("heart") == "love")

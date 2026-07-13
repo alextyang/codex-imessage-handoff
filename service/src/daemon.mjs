@@ -8,10 +8,14 @@ import { assertThreadReadyForIMessageRun, getThreadDetail, getLatestRequest, get
 import { buildThreadDirectory } from "./thread-directory.mjs";
 import { getReasoningOverride, setReasoningOverride, listReasoningOptions } from "./thread-settings.mjs";
 import { ImsgTransport } from "./imsg-transport.mjs";
+import { safeImsgFailureDetails } from "./imsg-rpc-diagnostics.mjs";
 import { AppServerCodexRunner } from "./app-server-runner.mjs";
 import { RunManager } from "./run-manager.mjs";
 import { FailureQueue } from "./failure-queue.mjs";
+import { isTerminalLocalActionFailure, LocalActionDispatch } from "./local-action-dispatch.mjs";
 import { loadClaimedJobs, markClaimedJobState, removeClaimedJob, saveClaimedJob } from "./claimed-store.mjs";
+import { admitClaimedJob } from "./claimed-job-admission.mjs";
+import { unconfirmedRecoveryDisposition } from "./recovered-run-policy.mjs";
 import { CompletionMonitor } from "./completion-monitor.mjs";
 import { MultiLiveMirror } from "./multi-live-mirror.mjs";
 import { CodexFocusDetector } from "./codex-focus.mjs";
@@ -21,6 +25,12 @@ import { SharedBackendTurnLease } from "./shared-backend-lease.mjs";
 import { inspectDesktopSharedConnection } from "./desktop-connection.mjs";
 import { ServiceReadiness } from "./service-readiness.mjs";
 import { PresenceTracker } from "./presence-tracker.mjs";
+import { shouldSuppressSubmittedUserMirror, submittedUserMirrorMode } from "./submitted-user-mirror-policy.mjs";
+import {
+  manualSelectionCancellationNotice,
+  manualSelectionLease,
+  presentManualSelection,
+} from "./manual-selection-flow.mjs";
 
 const paths = servicePaths();
 const serviceReadiness = new ServiceReadiness(paths.serviceReadinessState);
@@ -117,9 +127,10 @@ function allowStartupWork() {
 }
 
 async function deliverLocalCompletion(completion) {
+  const thread = catalogById.get(String(completion.threadId || ""));
+  if (thread) await imsgTransport.setThreadTyping(thread.id, false).catch(() => {});
   const activity = await notificationStatus();
   if (activity?.active !== true) return { status: activity?.status || "INACTIVE" };
-  const thread = catalogById.get(String(completion.threadId || ""));
   if (thread && imsgTransport.router.shouldPauseIncoming(thread.id)) return { status: "AWAITING_PROMPT" };
   const listening = thread ? imsgTransport.router.nativeThread(thread.id)?.listen === true : false;
   if (thread && !listening && imsgTransport.router.isThreadMuted(thread.id)) {
@@ -165,6 +176,10 @@ async function deliverLiveMessage(message) {
   if (!thread) return { status: "STALE_SELECTION" };
   if (imsgTransport.router.shouldPauseIncoming(thread.id)) return { status: "AWAITING_PROMPT" };
   if (message.role === "user") {
+    // A Desktop-started turn appears in the rollout before the slower catalog
+    // state refresh. Track it immediately so the current default task exposes
+    // native typing within the live-mirror polling window.
+    await imsgTransport.setThreadTyping(thread.id, true).catch(() => {});
     if (imsgTransport.router.isThreadMuted(thread.id)) return { status: "INACTIVE" };
     if (await codexFocus.shouldSuppressUserMirror()) return { status: "INACTIVE" };
   } else if (!imsgTransport.router.nativeThread(thread.id)?.listen) {
@@ -249,7 +264,10 @@ async function sendOutbound(event, options = {}) {
     : event;
   const result = await imsgTransport.outbound(outboundEvent, options);
   if (result?.terminal === false) {
-    throw Object.assign(new Error("The local iMessage send remains pending."), { code: result.status || "IMSG_DELIVERY_PENDING" });
+    throw Object.assign(new Error("The local iMessage send remains pending."), {
+      code: result.status || "IMSG_DELIVERY_PENDING",
+      ...safeImsgFailureDetails(result),
+    });
   }
   return result;
 }
@@ -261,7 +279,10 @@ async function notificationStatus() {
 async function publishImages(thread, files, options = {}) {
   const result = await imsgTransport.publishImages(thread, files, options);
   if (result?.terminal === false) {
-    throw Object.assign(new Error("The local iMessage attachment send remains pending."), { code: result.status || "IMSG_DELIVERY_PENDING" });
+    throw Object.assign(new Error("The local iMessage attachment send remains pending."), {
+      code: result.status || "IMSG_DELIVERY_PENDING",
+      ...safeImsgFailureDetails(result),
+    });
   }
   return result;
 }
@@ -271,12 +292,20 @@ async function updateThreadStatus(thread, status) {
 }
 
 function threadLabel(thread) {
+  const state = effectiveState(thread);
   return {
     id: thread.id,
     title: thread.title,
     createdAt: thread.createdAt,
     projectKey: thread.projectKey,
     projectLabel: thread.projectLabel,
+    status: state.status,
+    stateSince: state.stateSince,
+    activityAt: thread.lastTurnAt || thread.activityAt || thread.updatedAt,
+    pendingCount: state.pendingCount,
+    reasoningEffort: effectiveReasoning(thread),
+    muted: imsgTransport.router.isThreadMuted(thread.id),
+    listening: imsgTransport.router.nativeThread(thread.id)?.listen === true,
   };
 }
 
@@ -332,6 +361,9 @@ async function synchronizeNow() {
   const threads = await listThreads(500);
   catalogById = new Map(threads.map((thread) => [thread.id, thread]));
   multiLiveMirror.activateCatalog(threads, { resume: true, clearMissing: true });
+  await imsgTransport.syncWorkingThreads(
+    threads.filter((thread) => effectiveState(thread).status === "working").map((thread) => thread.id),
+  );
   scheduleCompletionScan();
   scheduleLiveMirrorScan();
   return threads;
@@ -442,6 +474,7 @@ async function executeReply(event, context) {
     }) || null;
     if (matchingTurn?.state === "running") {
       event.recoveredTurnId = String(matchingTurn.id || "");
+      event.recoveryMissingSince = null;
       if (!event.recoveredTurnId) {
         throw Object.assign(new Error("The recovered Codex turn has no canonical turn id."), { code: "RECOVERED_TURN_INVALID" });
       }
@@ -462,9 +495,11 @@ async function executeReply(event, context) {
         imagesDelivered: 0,
       };
       event.reconcileRunning = false;
+      event.recoveryMissingSince = null;
       saveClaimedJob(event, "delivering");
     } else if (matchingTurn) {
       event.reconcileRunning = false;
+      event.recoveryMissingSince = null;
       saveClaimedJob(event, "failed");
       failedRuns.record(thread.id, {
         body: prompt,
@@ -480,10 +515,33 @@ async function executeReply(event, context) {
       );
       return;
     } else {
-      // The job was persisted before the shared backend accepted a matching
-      // rollout turn. It is safe to submit normally.
+      const recovery = unconfirmedRecoveryDisposition(event.recoveryMissingSince);
+      event.recoveryMissingSince = recovery.missingSince;
+      if (recovery.status === "observe") {
+        saveClaimedJob(event, "running");
+        context.defer(recovery.retryAfterMs);
+        return;
+      }
+      // A daemon restart cannot prove whether an unobserved turn was accepted.
+      // Fail closed into the explicit retry queue instead of submitting the
+      // same prompt a second time.
       event.reconcileRunning = false;
-      saveClaimedJob(event, "queued");
+      saveClaimedJob(event, "failed");
+      failedRuns.record(thread.id, {
+        body: prompt,
+        images: event.claimed?.images || [],
+        replyId: event.replyId,
+        claimed: event.claimed,
+        queuedAt: event.queuedAt,
+      });
+      await publishFailure(
+        thread,
+        Object.assign(new Error("The restarted service could not confirm whether Codex accepted this turn."), {
+          code: "RECOVERED_TURN_UNCONFIRMED",
+        }),
+        `run:${event.replyId}:failure`,
+      );
+      return;
     }
   }
 
@@ -536,6 +594,7 @@ async function executeReply(event, context) {
 
   try {
     await updateThreadStatus(thread, "working");
+    await imsgTransport.setThreadTyping(thread.id, true);
     scheduleSynchronize();
     if (cancelRequested) {
       removeClaimedJob(event.replyId);
@@ -569,7 +628,7 @@ async function executeReply(event, context) {
       throw Object.assign(new Error("Codex Desktop is currently using its private app server; shared iMessage work is paused until the next shared Desktop session."), { code: "CODEX_UNAVAILABLE" });
     }
     markClaimedJobState(event.replyId, "running");
-    if (!event.mirrorSuppressionToken) {
+    if (shouldSuppressSubmittedUserMirror(claim) && !event.mirrorSuppressionToken) {
       event.mirrorSuppressionToken = multiLiveMirror.suppressUser(thread.id, String(reply.body || ""));
       if (event.mirrorSuppressionToken) saveClaimedJob(event, "running");
     }
@@ -646,6 +705,7 @@ async function executeReply(event, context) {
       try { await updateThreadStatus(thread, "error"); } catch {}
     }
   } finally {
+    await imsgTransport.setThreadTyping(thread.id, false).catch(() => {});
     if (sharedLeaseHeld) sharedBackendTurnLease.release();
     if (progressTimer) clearInterval(progressTimer);
     if (managedCompletion) completions.unmanage(thread.id);
@@ -703,33 +763,28 @@ async function ingestReply(event) {
   if (!replyId || !threadId || runs.has(replyId) || claimingReplyIds.has(replyId)) return;
   event.receivedAtMs ||= Date.now();
   event.queuedAt ||= event.createdAt || new Date().toISOString();
-  let delay = 1000;
-  while (!stopped && !runs.has(replyId)) {
-    claimingReplyIds.set(replyId, threadId);
-    try {
-      if (!event.claimed) {
-        throw Object.assign(new Error("The local iMessage request is missing its durable payload."), { code: "MISSING_LOCAL_PAYLOAD" });
-      }
-      saveClaimedJob(event, "queued");
-      if ((cancelledThrough.get(threadId) || 0) >= event.receivedAtMs) {
-        await discardReply(event);
-        return;
-      }
-      if (!catalogById.has(threadId)) {
-        await sendOutbound({ kind: "service.notice", code: "needs-attention", body: "That task is no longer available, so the message was not run.\n\n/threads" });
-        await discardReply(event);
-        return;
-      }
-      enqueueReply(event);
-      return;
-    } catch (error) {
-      if (error?.status === 409) return;
-      log(`Could not save pending reply ${replyId}; will retry.`);
-    } finally {
-      claimingReplyIds.delete(replyId);
-    }
-    await new Promise((resolve) => setTimeout(resolve, delay));
-    delay = Math.min(30000, delay * 2);
+  if (!event.claimed) {
+    throw Object.assign(new Error("The local iMessage request is missing its durable payload."), { code: "MISSING_LOCAL_PAYLOAD" });
+  }
+  claimingReplyIds.set(replyId, threadId);
+  try {
+    return await admitClaimedJob({
+      persist: () => saveClaimedJob(event, "queued"),
+      cancelled: () => (cancelledThrough.get(threadId) || 0) >= event.receivedAtMs,
+      discard: () => discardReply(event),
+      threadExists: () => catalogById.has(threadId),
+      missingThread: () => sendOutbound({
+        kind: "service.notice",
+        code: "needs-attention",
+        body: "That task is no longer available, so the message was not run.\n\n/threads",
+      }),
+      enqueue: () => enqueueReply(event),
+    });
+  } catch (error) {
+    if (error?.status === 409) return "duplicate";
+    throw error;
+  } finally {
+    claimingReplyIds.delete(replyId);
   }
 }
 
@@ -809,7 +864,6 @@ async function buildThreadDetailEvent(thread, options = {}) {
   return {
     kind: "thread.detail",
     ...(options.deliveryId ? { deliveryId: options.deliveryId } : {}),
-    ...(options.reason ? { reason: options.reason } : {}),
     thread: threadLabel(thread),
     state: state.status,
     activityAt: detail.activityAt || thread.activityAt,
@@ -828,8 +882,23 @@ async function buildThreadDetailEvent(thread, options = {}) {
   };
 }
 
-async function publishThreadDetail(thread, options = {}) {
-  await sendOutbound(await buildThreadDetailEvent(thread, options));
+function headerThreadFromDetail(detail) {
+  return {
+    ...detail.thread,
+    status: detail.state,
+    activityAt: detail.activityAt,
+    stateSince: detail.stateSince,
+    pendingCount: detail.pendingCount,
+    turnCount: detail.turnCount,
+    turnCountLowerBound: detail.turnCountLowerBound,
+    reasoningEffort: detail.reasoningEffort,
+  };
+}
+
+async function publishThreadHeader(thread, detail = null) {
+  const resolved = detail || await buildThreadDetailEvent(thread);
+  await sendOutbound({ kind: "thread.header", thread: headerThreadFromDetail(resolved) });
+  return resolved;
 }
 
 function outboundTurn(turn) {
@@ -847,6 +916,18 @@ function outboundTurn(turn) {
     finalResponse: turn.finalResponse || null,
     completedAt: turn.completedAt || null,
   };
+}
+
+async function currentThreadTurn(thread) {
+  const state = effectiveState(thread);
+  const turn = await getTurn(thread);
+  const serviceTurnVisible = state.request !== null
+    && state.status === "working"
+    && turn?.state === "running"
+    && turn.request === state.request;
+  return state.request !== null && !serviceTurnVisible
+    ? { state: state.status, request: state.request, requestAt: state.requestAt, assistantMessages: [], finalResponse: null, completedAt: null }
+    : outboundTurn(turn);
 }
 
 async function publishThreadDirectory(activeThreadId) {
@@ -878,18 +959,30 @@ async function handleControl(event) {
   if (command === "cancel") {
     const threadId = event.threadId ? String(event.threadId) : "";
     if (threadId) imsgTransport.router.consumeThreadListen(threadId);
-    if (imsgTransport.router.clearAwaitingPrompt(threadId || null)) {
+    // Top-level /cancel consumes the awaiting-prompt lease atomically during
+    // routing, while a native Reply /cancel is cleared here. Preserve either
+    // path so selection-only cancellation never reports that no work existed.
+    const selectionCleared = imsgTransport.router.clearAwaitingPrompt(threadId || null)
+      || event.fromAwaitingPrompt === true;
+    if (selectionCleared) {
       scheduleLiveMirrorScan();
       scheduleCompletionScan();
     }
     cancelledThrough.set(threadId, Date.now());
     const claiming = ingestPendingCounts.get(threadId) || [...claimingReplyIds.values()].filter((id) => id === threadId).length;
     const cancelled = await runs.cancel(threadId);
-    if (!cancelled.active && cancelled.pending === 0 && claiming === 0) {
-      await sendOutbound({ kind: "service.notice", code: "needs-attention", thread: thread ? threadLabel(thread) : undefined, body: "There is no iMessage-started work to cancel." });
-    } else if (!cancelled.active) {
-      const count = cancelled.pending + claiming;
-      await sendOutbound({ kind: "service.notice", code: "cancelled", thread: thread ? threadLabel(thread) : undefined, body: `Removed ${count} pending message${count === 1 ? "" : "s"}.` });
+    const notice = manualSelectionCancellationNotice({
+      selectionCleared,
+      active: cancelled.active,
+      pending: cancelled.pending,
+      claiming,
+    });
+    if (notice) {
+      await sendOutbound({
+        kind: "service.notice",
+        ...notice,
+        thread: thread ? threadLabel(thread) : undefined,
+      });
     }
     return;
   }
@@ -932,7 +1025,9 @@ async function handleControl(event) {
     return;
   }
   if (command === "open" || command === "thread" || command === "status") {
-    await publishThreadDetail(thread, command === "open" ? {} : { reason: "status" });
+    const detail = await buildThreadDetailEvent(thread);
+    await publishThreadHeader(thread, detail);
+    await sendOutbound(detail);
     return;
   }
   if (command === "request" || command === "message") {
@@ -947,16 +1042,12 @@ async function handleControl(event) {
     return;
   }
   if (command === "turn") {
-    const state = effectiveState(thread);
-    const turn = await getTurn(thread);
-    const serviceTurnVisible = state.request !== null
-      && state.status === "working"
-      && turn?.state === "running"
-      && turn.request === state.request;
-    const current = state.request !== null && !serviceTurnVisible
-      ? { state: state.status, request: state.request, requestAt: state.requestAt, assistantMessages: [], finalResponse: null, completedAt: null }
-      : outboundTurn(turn);
-    await sendOutbound({ kind: "thread.turn", thread: threadLabel(thread), turn: current, reasoningEffort: effectiveReasoning(thread) });
+    await sendOutbound({
+      kind: "thread.turn",
+      thread: threadLabel(thread),
+      turn: await currentThreadTurn(thread),
+      reasoningEffort: effectiveReasoning(thread),
+    });
     return;
   }
   if (command === "history") {
@@ -1153,25 +1244,36 @@ async function publishThreadMenu(threads, note) {
   return ordered;
 }
 
-async function publishCommandThreadPicker(command) {
+async function publishCommandThreadPicker(command, action = {}) {
   const threads = await synchronize();
-  const planned = await buildThreadDirectory(threads, {
-    activeThreadId: imsgTransport.router.lastUserThreadId,
-    stateFor: effectiveState,
-    historyFor: (thread) => readThreadHistory(thread),
-  });
-  const items = (planned.directory.groups || [])
-    .flatMap((group) => group.threads || [])
-    .map((item) => ({ ...item, projectLabel: item.projectLabel || item.projectName || "Codex" }));
+  let items;
+  if (command === "mute" || command === "unmute") {
+    const shouldBeMuted = command === "unmute";
+    const relevant = sortedThreads(threads).filter((thread) => imsgTransport.router.isThreadMuted(thread.id) === shouldBeMuted);
+    items = await Promise.all(relevant.map((thread, index) => threadMenuItem(thread, index + 1)));
+  } else {
+    const planned = await buildThreadDirectory(threads, {
+      activeThreadId: imsgTransport.router.lastUserThreadId,
+      stateFor: effectiveState,
+      historyFor: (thread) => readThreadHistory(thread),
+    });
+    items = (planned.directory.groups || [])
+      .flatMap((group) => group.threads || [])
+      .map((item) => ({ ...item, projectLabel: item.projectLabel || item.projectName || "Codex" }));
+  }
   if (!items.length) {
-    await sendOutbound({ kind: "service.notice", code: "needs-attention", body: "No recent tasks are available." });
+    const body = command === "unmute"
+      ? "No tasks are muted."
+      : command === "mute"
+        ? "All available tasks are already muted."
+        : "No recent tasks are available.";
+    await sendOutbound({ kind: "service.notice", code: "needs-attention", body });
     return;
   }
-  if (items.length === 1) {
-    await handleControl({ command, threadId: items[0].id, createdAt: new Date().toISOString() });
-    return;
-  }
-  const result = await imsgTransport.sendThreadPicker(command, items);
+  const result = await imsgTransport.sendThreadPicker(command, items, {
+    argument: action.argument,
+    operationScope: action.messageKey ? `local-action:${action.messageKey}:picker:${command}` : `picker:${command}`,
+  });
   if (result?.terminal === false) {
     throw Object.assign(new Error("The native task picker remains pending."), { code: result.status || "IMSG_PICKER_PENDING" });
   }
@@ -1187,10 +1289,16 @@ async function publishProject(projectKey) {
   await publishThreadMenu(threads, "Reply with a number to open that thread. Add “1 (message)” to directly message the thread.\n“/projects” - See all projects");
 }
 
-async function publishSearch(queryValue) {
+async function publishSearch(queryValue, options = {}) {
   await synchronize();
   const query = String(queryValue || "").trim().toLowerCase();
-  const candidates = sortedThreads([...catalogById.values()]);
+  const queryLabel = String(queryValue || "").trim().replace(/\s+/g, " ").slice(0, 96);
+  const pickerCommand = String(options.command || "search").trim().toLowerCase();
+  const candidates = sortedThreads([...catalogById.values()]).filter((thread) => {
+    if (pickerCommand === "mute") return !imsgTransport.router.isThreadMuted(thread.id);
+    if (pickerCommand === "unmute") return imsgTransport.router.isThreadMuted(thread.id);
+    return true;
+  });
   const matches = [];
   for (const thread of candidates) {
     if (matches.length >= 25) break;
@@ -1200,10 +1308,34 @@ async function publishSearch(queryValue) {
       : "";
     if (!query || labelText.includes(query) || requestText.includes(query)) matches.push(thread);
   }
+  if (pickerCommand !== "search") {
+    if (!matches.length) {
+      await sendOutbound({
+        kind: "service.notice",
+        code: "needs-attention",
+        body: queryLabel ? `No tasks matched “${queryLabel}”.` : "No matching tasks are available.",
+      });
+      return;
+    }
+    const items = await Promise.all(matches.map((thread, index) => threadMenuItem(thread, index + 1)));
+    const result = await imsgTransport.sendThreadPicker(pickerCommand, items, {
+      argument: options.commandArgument,
+      question: `/${pickerCommand} · ${queryLabel}`,
+      operationScope: options.messageKey
+        ? `local-action:${options.messageKey}:search:${pickerCommand}`
+        : `search:${pickerCommand}:${query}`,
+    });
+    if (result?.terminal === false) {
+      throw Object.assign(new Error("The native task search picker remains pending."), {
+        code: result.status || "IMSG_PICKER_PENDING",
+      });
+    }
+    return;
+  }
   await publishThreadMenu(
     matches,
     query
-      ? `Showing matches for “${queryValue}”.\n“/threads” - See recent threads`
+      ? `Showing matches for “${queryLabel}”.\n“/threads” - See recent threads`
       : "Add a query after /search, or reply with a number to open a task.",
   );
 }
@@ -1233,6 +1365,7 @@ async function queueLocalPrompt(action, threadId, bodyValue = action.body, attac
     claimed: {
       reply: { id: `imsg:${action.messageKey}`, body, media: [] },
       images,
+      userMirrorMode: submittedUserMirrorMode(action),
     },
   });
   scheduleLiveMirrorScan();
@@ -1253,7 +1386,7 @@ async function handleLocalAction(action) {
     return;
   }
   if (action.kind === "search") {
-    await publishSearch(action.argument);
+    await publishSearch(action.argument, action);
     return;
   }
   if (action.kind === "project") {
@@ -1265,17 +1398,32 @@ async function handleLocalAction(action) {
     await publishThreadDirectory(imsgTransport.router.lastUserThreadId);
     return;
   }
+  if (action.kind === "stale-reply-context" || action.kind === "ambiguous-reply-context") {
+    await sendOutbound({
+      kind: "service.notice",
+      code: "needs-attention",
+      body: action.kind === "stale-reply-context"
+        ? "That reply thread is no longer mapped to a Codex task. Choose the task again with /threads."
+        : "That reply thread maps to more than one Codex task, so nothing was run. Choose the task again with /threads.",
+    });
+    return;
+  }
   if (action.kind === "no-thread") {
     await sendOutbound({ kind: "service.notice", code: "needs-attention", body: "No thread is selected.\nText /threads to choose one." });
     return;
   }
   if (action.kind === "unknown-command") {
-    await sendOutbound({ kind: "service.notice", code: "needs-attention", body: "That command is not available." });
-    await sendOutbound({ kind: "service.menu", label: "COMMANDS" });
+    const thread = action.threadId ? catalogById.get(String(action.threadId)) : null;
+    await sendOutbound({
+      kind: "service.notice",
+      code: "needs-attention",
+      ...(thread ? { thread: threadLabel(thread) } : {}),
+      body: "That command is not available.\n\n/help · /thread · /turn · /history · /reasoning",
+    });
     return;
   }
   if (action.kind === "thread-picker") {
-    await publishCommandThreadPicker(action.command);
+    await publishCommandThreadPicker(action.command, action);
     return;
   }
   if (action.kind === "switch") {
@@ -1291,12 +1439,26 @@ async function handleLocalAction(action) {
       // Router ingestion established this atomically before the menu action was
       // queued. If a later user message already consumed it, a retried menu
       // action must not reopen the pause or send a stale prompt.
-      if (!imsgTransport.router.isAwaitingPromptFor(thread.id)) return;
-      await sendOutbound({
-        kind: "service.notice",
-        code: "updated",
-        thread: threadLabel(thread),
-        body: "Send the message you want to run in this task. Reply /cancel to leave this selection.",
+      const lease = manualSelectionLease(action, imsgTransport.router.awaitingPrompt);
+      if (!lease) return;
+      await presentManualSelection({
+        lease,
+        currentLease: () => imsgTransport.router.awaitingPrompt,
+        buildDetail: () => buildThreadDetailEvent(thread),
+        sendHeader: (detail) => publishThreadHeader(thread, detail),
+        buildTurn: () => currentThreadTurn(thread),
+        sendTurn: (detail, turn) => sendOutbound({
+          kind: "thread.turn",
+          thread: detail.thread,
+          turn,
+          reasoningEffort: detail.reasoningEffort,
+        }),
+        sendPrompt: () => sendOutbound({
+          kind: "service.notice",
+          code: "updated",
+          thread: threadLabel(thread),
+          body: "Send the message you want to run in this task. Reply /cancel to leave this selection.",
+        }),
       });
     }
     return;
@@ -1315,13 +1477,14 @@ async function handleLocalAction(action) {
 const localActionsInFlight = new Set();
 const localActionRetryTimers = new Map();
 const localActionRetryAttempts = new Map();
-let localActionChain = Promise.resolve();
+const MAX_LOCAL_ACTION_FAILURES = 5;
 
 function scheduleLocalActionRetry(action) {
   const key = String(action?.messageKey || "");
-  if (!key || stopped || localActionRetryTimers.has(key)) return;
+  if (!key || stopped || localActionRetryTimers.has(key)) return false;
   const attempts = (localActionRetryAttempts.get(key) || 0) + 1;
   localActionRetryAttempts.set(key, attempts);
+  if (attempts >= MAX_LOCAL_ACTION_FAILURES) return false;
   const delay = Math.min(5 * 60 * 1000, 5_000 * (2 ** Math.min(6, attempts - 1)));
   const timer = setTimeout(() => {
     localActionRetryTimers.delete(key);
@@ -1329,6 +1492,31 @@ function scheduleLocalActionRetry(action) {
   }, delay);
   timer.unref?.();
   localActionRetryTimers.set(key, timer);
+  return true;
+}
+
+function settleFailedLocalAction(action, code, detail = "") {
+  const key = String(action?.messageKey || "");
+  if (!key) return;
+  const preservePending = code === "CLAIMED_STORE_UNAVAILABLE";
+  if (!preservePending) imsgTransport.acknowledge(key);
+  localActionRetryAttempts.delete(key);
+  const timer = localActionRetryTimers.get(key);
+  if (timer) clearTimeout(timer);
+  localActionRetryTimers.delete(key);
+  log(preservePending
+    ? `Local iMessage prompt remains in the durable inbox after bounded persistence failures (${detail ? `${code}; ${detail}` : code}); later messages will continue normally.`
+    : `Local iMessage action was quarantined after ${detail ? `${code}; ${detail}` : code}; later messages will continue normally.`);
+}
+
+function safeLocalFailureDiagnostic(error) {
+  const detail = safeImsgFailureDetails(error);
+  return [
+    detail.failureSource ? `source=${detail.failureSource}` : "",
+    detail.remoteCode !== undefined ? `remote=${detail.remoteCode}` : "",
+    detail.remoteCategory ? `category=${detail.remoteCategory}` : "",
+    detail.remoteMessage || "",
+  ].filter(Boolean).join("; ");
 }
 
 async function processLocalAction(action) {
@@ -1346,17 +1534,28 @@ async function processLocalAction(action) {
     if (retryTimer) clearTimeout(retryTimer);
     localActionRetryTimers.delete(key);
   } catch (error) {
-    log(`Local iMessage action could not be completed (${error?.code || "UNKNOWN"}); it remains pending.`);
-    scheduleLocalActionRetry(action);
+    const code = error?.code || "UNKNOWN";
+    const detail = safeLocalFailureDiagnostic(error);
+    const diagnostic = detail ? `${code}; ${detail}` : code;
+    if (stopped) {
+      log(`Local iMessage action stopped during shutdown (${diagnostic}); it remains durable.`);
+    } else if (isTerminalLocalActionFailure(code) || !scheduleLocalActionRetry(action)) {
+      settleFailedLocalAction(action, code, detail);
+    } else {
+      log(`Local iMessage action could not be completed (${diagnostic}); it will retry with a bounded backoff.`);
+    }
   } finally {
     localActionsInFlight.delete(key);
   }
 }
 
+const localActionDispatch = new LocalActionDispatch(processLocalAction);
+
 function queueLocalAction(action) {
-  if (action?.kind === "control" && action.command === "cancel") return processLocalAction(action);
-  localActionChain = localActionChain.catch(() => {}).then(() => processLocalAction(action));
-  return localActionChain;
+  imsgTransport.observeInbound(action).catch(() => {});
+  return localActionDispatch.enqueue(action, {
+    immediate: action?.kind === "control" && action.command === "cancel",
+  });
 }
 
 async function main() {
@@ -1384,6 +1583,9 @@ async function main() {
     onAction: (action) => queueLocalAction(action),
     onError: () => log("Local iMessage watch reported an error; imsg will retry recoverable subscriptions."),
   });
+  await imsgTransport.syncWorkingThreads(
+    threads.filter((thread) => effectiveState(thread).status === "working").map((thread) => thread.id),
+  );
   for (const action of imsgTransport.pendingActions()) await queueLocalAction(action);
   await completions.reconcile(threads, { deliver: deliverLocalCompletion, deliverPending: false });
   allowStartupWork();
@@ -1402,7 +1604,7 @@ async function stop() {
   stopped = true;
   if (presenceOfflineTimer) clearTimeout(presenceOfflineTimer);
   presenceOfflineTimer = null;
-  runs.cancelAll();
+  runs.shutdown();
   await imsgTransport.stop().catch(() => {});
   clearServiceReadiness();
   process.exit(0);
