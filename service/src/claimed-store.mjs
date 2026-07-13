@@ -15,10 +15,19 @@ function readStore() {
   } catch (error) {
     throw Object.assign(new Error("Claimed-run state could not be read safely.", { cause: error }), { code: "INVALID_RUN_STATE" });
   }
-  if (!value || value.version !== 2 || !value.jobs || typeof value.jobs !== "object" || Array.isArray(value.jobs)) {
+  if (
+    !value
+    || ![1, 2].includes(value.version)
+    || !value.jobs
+    || typeof value.jobs !== "object"
+    || Array.isArray(value.jobs)
+  ) {
     throw Object.assign(new Error("Claimed-run state has an unsupported format."), { code: "INVALID_RUN_STATE" });
   }
-  return value;
+  // Version 1 used the same job representation. Normalize it in memory so
+  // read-only commands remain side-effect free; the next intentional state
+  // update writes the current format atomically through writeStore().
+  return value.version === 1 ? { version: 2, jobs: value.jobs } : value;
 }
 
 function writeStore(store) {

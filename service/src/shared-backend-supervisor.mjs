@@ -563,7 +563,10 @@ async function spawnBackend() {
     }
     if (!adoptedChildPid) adoptedChildPid = discoverExternalAppServer();
     log("Adopting an already healthy local app server without starting a duplicate.");
-    saveState({ phase: "healthy-external", healthy: true, childPid: adoptedChildPid, adoptedChildPid });
+    // Do not publish the transient adoption state as healthy. recordHealthy()
+    // applies the activation policy and writes the first externally observable
+    // healthy state immediately below.
+    saveState({ phase: "adopting-external", healthy: false, childPid: adoptedChildPid, adoptedChildPid });
     for (let index = 0; index < HEALTHY_ACTIVATION_STREAK; index += 1) await recordHealthy();
     return;
   } catch {}
