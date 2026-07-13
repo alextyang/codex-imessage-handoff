@@ -249,7 +249,10 @@ test("LaunchAgent is persistent and contains path-only private configuration", (
   });
   assert.match(plist, /<key>RunAtLoad<\/key><true\/>/);
   assert.match(plist, /<key>KeepAlive<\/key><dict><key>SuccessfulExit<\/key><false\/><\/dict>/);
-  assert.match(plist, /<key>ThrottleInterval<\/key><integer>60<\/integer>/);
+  assert.match(plist, /<key>ThrottleInterval<\/key><integer>10<\/integer>/);
+  assert.match(plist, /<key>SoftResourceLimits<\/key><dict><key>NumberOfFiles<\/key><integer>128<\/integer><\/dict>/);
+  assert.match(plist, /<key>HardResourceLimits<\/key><dict><key>NumberOfFiles<\/key><integer>256<\/integer><\/dict>/);
+  assert.doesNotMatch(plist, /NumberOfProcesses/);
   assert.match(plist, /<key>ProgramArguments<\/key><array><string>\/private\/node<\/string><string>\/private\/helper\.mjs<\/string><\/array>/);
   assert.match(plist, /IMSG_HELPER_CONFIG/);
   assert.doesNotMatch(plist, /expectedSender|chatGuid|CODEX_HOME|codex exec|app-server/);
