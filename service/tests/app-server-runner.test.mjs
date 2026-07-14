@@ -122,6 +122,46 @@ process.stdin.on("data", (chunk) => {
   return executable;
 }
 
+class ProcessRemoteStream extends EventEmitter {
+  constructor(child) {
+    super();
+    this.child = child;
+    this.readyState = 0;
+    this.buffer = "";
+    child.stdout.on("data", (chunk) => {
+      this.buffer += String(chunk);
+      for (;;) {
+        const newline = this.buffer.indexOf("\n");
+        if (newline < 0) break;
+        const line = this.buffer.slice(0, newline);
+        this.buffer = this.buffer.slice(newline + 1);
+        if (line) this.emit("message", line);
+      }
+    });
+    child.once("error", (error) => this.emit("error", error));
+    child.once("close", () => {
+      this.readyState = 3;
+      this.emit("close");
+    });
+    queueMicrotask(() => {
+      if (this.readyState !== 0) return;
+      this.readyState = 1;
+      this.emit("open");
+    });
+  }
+
+  send(value) {
+    if (this.readyState !== 1) throw new Error("Remote stream is closed.");
+    this.child.stdin.write(`${value}\n`);
+  }
+
+  close() {
+    if (this.readyState >= 2) return;
+    this.readyState = 2;
+    this.child.stdin.end();
+  }
+}
+
 function testRunner(directory, mode = "complete", options = {}) {
   const capture = path.join(directory, `${mode}.jsonl`);
   const image = path.join(directory, "generated.png");
@@ -129,27 +169,28 @@ function testRunner(directory, mode = "complete", options = {}) {
   writeFileSync(image, "png");
   const executable = fakeProxy(directory, mode);
   const invocations = [];
-  const spawnImpl = (command, args, spawnOptions) => {
-    invocations.push({ command, args, codexHome: spawnOptions.env.CODEX_HOME });
-    return spawn(command, args, {
-      ...spawnOptions,
+  const webSocketFactory = () => {
+    invocations.push({ command: executable, args: [], codexHome: path.join(directory, "codex-home") });
+    const child = spawn(executable, [], {
+      stdio: ["pipe", "pipe", "pipe"],
       env: {
-        ...spawnOptions.env,
+        ...process.env,
+        CODEX_HOME: path.join(directory, "codex-home"),
         IMESSAGE_TEST_CAPTURE: capture,
         IMESSAGE_TEST_IMAGE: image,
       },
     });
+    return new ProcessRemoteStream(child);
   };
   const client = new AppServerRpcClient({
-    codexPath: executable,
     codexHome: path.join(directory, "codex-home"),
-    spawnImpl,
+    webSocketFactory,
     requestTimeoutMs: options.requestTimeoutMs || 2_000,
     turnTimeoutMs: options.turnTimeoutMs || 2_000,
     interruptGraceMs: options.interruptGraceMs || 200,
   });
   const runner = new AppServerCodexRunner({ client });
-  return { runner, client, capture, image, invocations, executable, spawnImpl };
+  return { runner, client, capture, image, invocations, executable, webSocketFactory };
 }
 
 function messages(capture) {
@@ -165,7 +206,110 @@ async function waitFor(predicate, timeoutMs = 2_000) {
   throw new Error("Timed out waiting for the fake proxy.");
 }
 
-test("shared app-server creates a persistent thread with an idempotency source", async (t) => {
+class InteractiveRemoteStream extends EventEmitter {
+  constructor({ codexHome, serverRequest, completeOnResponse = true } = {}) {
+    super();
+    this.codexHome = codexHome;
+    this.serverRequest = serverRequest;
+    this.completeOnResponse = completeOnResponse;
+    this.readyState = 0;
+    this.sent = [];
+    this.serverRequestResponse = null;
+    queueMicrotask(() => {
+      if (this.readyState !== 0) return;
+      this.readyState = 1;
+      this.emit("open");
+    });
+  }
+
+  send(value) {
+    if (this.readyState !== 1) throw new Error("Remote stream is closed.");
+    const message = JSON.parse(value);
+    this.sent.push(message);
+    if (message.method === "initialize") {
+      this.#receive({ id: message.id, result: { codexHome: this.codexHome } });
+      return;
+    }
+    if (message.method === "thread/resume") {
+      this.#receive({ id: message.id, result: { thread: { id: "thread-1" } } });
+      return;
+    }
+    if (message.method === "turn/start") {
+      this.#receive({ id: message.id, result: { turn: { id: "turn-1", status: "inProgress", items: [] } } });
+      this.#receive({ method: "turn/started", params: { threadId: "thread-1", turn: { id: "turn-1" } } });
+      if (this.serverRequest) this.#receive(this.serverRequest);
+      return;
+    }
+    if (this.serverRequest && message.id === this.serverRequest.id && !message.method) {
+      this.serverRequestResponse = message;
+      if (this.completeOnResponse) this.complete("Interactive request completed.");
+      return;
+    }
+  }
+
+  complete(body = "Interactive request completed.") {
+    this.#receive({ method: "item/completed", params: {
+      threadId: "thread-1",
+      turnId: "turn-1",
+      item: { id: "answer-1", type: "agentMessage", text: body, phase: "final_answer" },
+    } });
+    this.#receive({ method: "turn/completed", params: {
+      threadId: "thread-1",
+      turn: { id: "turn-1", status: "completed", items: [] },
+    } });
+  }
+
+  disconnect() {
+    this.readyState = 3;
+    this.emit("close");
+  }
+
+  close() {
+    if (this.readyState === 3) return;
+    this.disconnect();
+  }
+
+  #receive(message) {
+    queueMicrotask(() => {
+      if (this.readyState === 1) this.emit("message", JSON.stringify(message));
+    });
+  }
+}
+
+function interactiveRunner(serverRequest, options = {}) {
+  const codexHome = options.codexHome || "/tmp/interactive-remote-codex-home";
+  let socket = null;
+  const client = new AppServerRpcClient({
+    codexHome,
+    requestTimeoutMs: options.requestTimeoutMs || 1_000,
+    turnTimeoutMs: options.turnTimeoutMs || 1_000,
+    interruptGraceMs: options.interruptGraceMs || 50,
+    serverRequestTimeoutMs: options.serverRequestTimeoutMs || 100,
+    webSocketFactory: () => {
+      socket = new InteractiveRemoteStream({
+        codexHome,
+        serverRequest,
+        completeOnResponse: options.completeOnResponse !== false,
+      });
+      return socket;
+    },
+  });
+  return {
+    client,
+    runner: new AppServerCodexRunner({ client }),
+    socket: () => socket,
+  };
+}
+
+function interactiveRequest(method, params = {}, id = "interactive-1") {
+  return {
+    id,
+    method,
+    params: { threadId: "thread-1", turnId: "turn-1", ...params },
+  };
+}
+
+test("Remote Control creates a persistent thread with an idempotency source", async (t) => {
   const directory = mkdtempSync(path.join(os.tmpdir(), "imessage-app-server-create-"));
   const { runner, capture } = testRunner(directory);
   t.after(() => runner.client.close());
@@ -208,7 +352,7 @@ test("thread creation rejects an invalid app-server response and a missing cwd",
   assert.equal(messages(capture).filter((message) => message.method === "thread/start").length, 1);
 });
 
-test("shared app-server runner preserves input and streams safe output", async (t) => {
+test("Remote Control runner preserves input and streams safe output", async (t) => {
   const directory = mkdtempSync(path.join(os.tmpdir(), "imessage-app-server-runner-"));
   const { runner, capture, image, invocations } = testRunner(directory);
   t.after(() => runner.client.close());
@@ -239,11 +383,7 @@ test("shared app-server runner preserves input and streams safe output", async (
   assert.deepEqual(start.params.input[1], { type: "localImage", path: localInput });
   assert.equal(start.params.clientUserMessageId, "client-message-stable");
   assert.equal(start.params.effort, "high");
-  assert.deepEqual(invocations, [{
-    command: invocations[0].command,
-    args: ["app-server", "proxy", "--sock", path.join(directory, "codex-home", "app-server-control", "app-server-control.sock")],
-    codexHome: path.join(directory, "codex-home"),
-  }]);
+  assert.deepEqual(invocations, [{ command: invocations[0].command, args: [], codexHome: path.join(directory, "codex-home") }]);
   assert.equal(sent.some((message) => message.method === "initialized"), true);
   assert.deepEqual(phases, ["Starting work.", "Creating an image.", "Finishing the response."]);
   assert.deepEqual(reasoning, ["Safe summary."]);
@@ -254,7 +394,7 @@ test("shared app-server runner preserves input and streams safe output", async (
   assert.equal(runner.isRunning(), false);
 });
 
-test("shared app-server reconciles a turn by the echoed client user-message id", async (t) => {
+test("Remote Control reconciles a turn by the echoed client user-message id", async (t) => {
   const directory = mkdtempSync(path.join(os.tmpdir(), "imessage-app-server-reconcile-"));
   const { runner, capture } = testRunner(directory, "reconcile");
   t.after(() => runner.client.close());
@@ -323,7 +463,752 @@ test("runner safely declines app-server approval requests", async (t) => {
   assert.equal(result.body, "Approval safely declined.");
 });
 
-test("runner interrupts the shared turn without terminating the proxy", async (t) => {
+test("a truncated command approval stays denied even when its handler accepts", async (t) => {
+  const request = interactiveRequest("item/commandExecution/requestApproval", {
+    itemId: "command-1",
+    approvalId: "approval-callback-1",
+    startedAtMs: 1783987200123,
+    environmentId: "local",
+    reason: "Network access is required.",
+    command: `curl https://example.com/${"x".repeat(100_000)}`,
+    cwd: "/tmp/project",
+    commandActions: [{ type: "unknown", command: "curl" }],
+    networkApprovalContext: { host: "example.com", protocol: "https" },
+    proposedExecpolicyAmendment: ["curl", "https://example.com"],
+    unexpectedSecret: "must not cross the protocol boundary",
+  });
+  const fixture = interactiveRunner(request);
+  t.after(() => fixture.client.close());
+  let received = null;
+  let handlerContext = null;
+  const result = await fixture.runner.run({
+    thread: { id: "thread-1", cwd: "/tmp" },
+    prompt: "Approve safely.",
+    onServerRequest: async (descriptor, context) => {
+      received = descriptor;
+      handlerContext = context;
+      return { decision: "accept" };
+    },
+  });
+
+  assert.equal(result.body, "Interactive request completed.");
+  assert.deepEqual(fixture.socket().serverRequestResponse, {
+    id: "interactive-1",
+    result: { decision: "decline" },
+  });
+  assert.equal(received.kind, "approval");
+  assert.equal(received.approval, "command");
+  assert.equal(received.protocol, "v2");
+  assert.equal(received.threadId, "thread-1");
+  assert.equal(received.turnId, "turn-1");
+  assert.equal(received.itemId, "command-1");
+  assert.equal(received.approvalId, "approval-callback-1");
+  assert.equal(received.truncated, true);
+  assert.ok(Buffer.byteLength(received.command, "utf8") <= 16 * 1024);
+  assert.ok(Buffer.byteLength(JSON.stringify(received), "utf8") <= 64 * 1024);
+  assert.equal(Object.hasOwn(received, "unexpectedSecret"), false);
+  assert.equal(Object.isFrozen(received), true);
+  assert.equal(Object.isFrozen(received.commandActions), true);
+  assert.equal(handlerContext.signal.aborted, false);
+  assert.equal(handlerContext.timeoutMs, 100);
+});
+
+test("undisclosed command approvals stay denied even when their handler accepts", async (t) => {
+  const cases = [
+    {
+      name: "missing command",
+      params: {
+        itemId: "missing-command",
+        reason: "Run an undisclosed action.",
+        cwd: "/tmp/project",
+      },
+      decision: "accept",
+    },
+    {
+      name: "unusable command actions",
+      params: {
+        itemId: "unusable-command-actions",
+        reason: "Run an undisclosed action.",
+        cwd: "/tmp/project",
+        command: "   ",
+        commandActions: [{ type: "unknown" }],
+      },
+      decision: "acceptForSession",
+    },
+  ];
+
+  for (const entry of cases) {
+    await t.test(entry.name, async (subtest) => {
+      const fixture = interactiveRunner(interactiveRequest(
+        "item/commandExecution/requestApproval",
+        entry.params,
+      ));
+      subtest.after(() => fixture.client.close());
+      let received = null;
+      await fixture.runner.run({
+        thread: { id: "thread-1", cwd: "/tmp" },
+        prompt: "Reject the undisclosed command.",
+        onServerRequest: async (descriptor) => {
+          received = descriptor;
+          return { decision: entry.decision };
+        },
+      });
+
+      assert.equal(received.approval, "command");
+      assert.deepEqual(fixture.socket().serverRequestResponse, {
+        id: "interactive-1",
+        result: { decision: "decline" },
+      });
+    });
+  }
+});
+
+test("usable commandActions can supply the command disclosure", async (t) => {
+  const fixture = interactiveRunner(interactiveRequest(
+    "item/commandExecution/requestApproval",
+    {
+      itemId: "command-actions-only",
+      reason: "Inspect the working tree.",
+      cwd: "/tmp/project",
+      commandActions: [{ type: "unknown", command: "git status --short" }],
+    },
+  ));
+  t.after(() => fixture.client.close());
+  let received = null;
+  await fixture.runner.run({
+    thread: { id: "thread-1", cwd: "/tmp" },
+    prompt: "Review the command action.",
+    onServerRequest: async (descriptor) => {
+      received = descriptor;
+      return { decision: "accept" };
+    },
+  });
+
+  assert.equal(received.command, null);
+  assert.equal(received.commandActions[0].command, "git status --short");
+  assert.deepEqual(fixture.socket().serverRequestResponse, {
+    id: "interactive-1",
+    result: { decision: "accept" },
+  });
+});
+
+test("a bounded long command and commandActions retain their suffixes and can be accepted", async (t) => {
+  const marker = (fill, size, suffix) => `${fill.repeat(size - suffix.length)}${suffix}`;
+  const request = interactiveRequest("item/commandExecution/requestApproval", {
+    itemId: "bounded-long-command",
+    reason: marker("r", 4 * 1024, "REASON-END"),
+    cwd: marker("c", 4 * 1024, "CWD-END"),
+    command: marker("x", 10 * 1024, "COMMAND-END"),
+    commandActions: [{
+      type: "unknown",
+      command: marker("a", 10 * 1024, "ACTION-END"),
+    }],
+  });
+  const fixture = interactiveRunner(request);
+  t.after(() => fixture.client.close());
+  let received = null;
+  await fixture.runner.run({
+    thread: { id: "thread-1", cwd: "/tmp" },
+    prompt: "Review the complete bounded command.",
+    onServerRequest: async (descriptor) => {
+      received = descriptor;
+      return { decision: "accept" };
+    },
+  });
+
+  assert.notEqual(received.truncated, true);
+  assert.match(received.reason, /REASON-END$/);
+  assert.match(received.cwd, /CWD-END$/);
+  assert.match(received.command, /COMMAND-END$/);
+  assert.match(received.commandActions[0].command, /ACTION-END$/);
+  assert.deepEqual(fixture.socket().serverRequestResponse, {
+    id: "interactive-1",
+    result: { decision: "accept" },
+  });
+});
+
+test("a v2 file approval without concrete changes cannot grant session authority", async (t) => {
+  const request = interactiveRequest("item/fileChange/requestApproval", {
+    itemId: "file-change-1",
+    startedAtMs: 1783987200123,
+    reason: "Write outside the current root.",
+    grantRoot: "/outside/project",
+  });
+  const fixture = interactiveRunner(request);
+  t.after(() => fixture.client.close());
+  let received = null;
+  await fixture.runner.run({
+    thread: { id: "thread-1", cwd: "/tmp" },
+    prompt: "Review the incomplete file request.",
+    onServerRequest: async (descriptor) => {
+      received = descriptor;
+      return { decision: "acceptForSession" };
+    },
+  });
+
+  assert.equal(received.approval, "fileChange");
+  assert.equal(received.protocol, "v2");
+  assert.equal(received.grantRoot, "/outside/project");
+  assert.equal(Object.hasOwn(received, "changes"), false);
+  assert.deepEqual(fixture.socket().serverRequestResponse, {
+    id: "interactive-1",
+    result: { decision: "decline" },
+  });
+});
+
+test("a truncated legacy file list stays denied even when its handler accepts", async (t) => {
+  const fileChanges = Object.fromEntries(Array.from({ length: 33 }, (_, index) => [
+    `/tmp/project/file-${index}.txt`,
+    { type: "update", unified_diff: `@@ -1 +1 @@ file ${index}`, move_path: null },
+  ]));
+  const fixture = interactiveRunner({
+    id: "legacy-files-truncated",
+    method: "applyPatchApproval",
+    params: {
+      conversationId: "thread-1",
+      callId: "legacy-patch-truncated",
+      fileChanges,
+      reason: "Apply every requested file update.",
+      grantRoot: "/tmp/project",
+    },
+  });
+  t.after(() => fixture.client.close());
+  let received = null;
+  await fixture.runner.run({
+    thread: { id: "thread-1", cwd: "/tmp" },
+    prompt: "Review the truncated file request.",
+    onServerRequest: async (descriptor) => {
+      received = descriptor;
+      return { decision: "accept" };
+    },
+  });
+
+  assert.equal(received.approval, "fileChange");
+  assert.equal(received.protocol, "legacy");
+  assert.equal(received.truncated, true);
+  assert.equal(received.changes.length, 32);
+  assert.equal(received.grantRoot, "/tmp/project");
+  assert.deepEqual(fixture.socket().serverRequestResponse, {
+    id: "legacy-files-truncated",
+    result: { decision: "denied" },
+  });
+});
+
+test("all 32 bounded legacy file changes retain their disclosure and can be accepted", async (t) => {
+  const fileChanges = Object.fromEntries(Array.from({ length: 32 }, (_, index) => [
+    `/tmp/project/file-${String(index + 1).padStart(2, "0")}.txt`,
+    { type: "update", unified_diff: `change-${index + 1}`, move_path: null },
+  ]));
+  const fixture = interactiveRunner({
+    id: "legacy-files-bounded",
+    method: "applyPatchApproval",
+    params: {
+      conversationId: "thread-1",
+      callId: "legacy-patch-bounded",
+      fileChanges,
+      reason: "Apply all disclosed updates.",
+      grantRoot: "/tmp/project",
+    },
+  });
+  t.after(() => fixture.client.close());
+  let received = null;
+  await fixture.runner.run({
+    thread: { id: "thread-1", cwd: "/tmp" },
+    prompt: "Review every disclosed file.",
+    onServerRequest: async (descriptor) => {
+      received = descriptor;
+      return { decision: "accept" };
+    },
+  });
+
+  assert.notEqual(received.truncated, true);
+  assert.equal(received.changes.length, 32);
+  assert.equal(received.changes[16].path, "/tmp/project/file-17.txt");
+  assert.equal(received.changes[31].path, "/tmp/project/file-32.txt");
+  assert.deepEqual(fixture.socket().serverRequestResponse, {
+    id: "legacy-files-bounded",
+    result: { decision: "approved" },
+  });
+});
+
+test("bounded file metadata retains every field suffix and can be accepted", async (t) => {
+  const marker = (fill, size, suffix) => `${fill.repeat(size - suffix.length)}${suffix}`;
+  const pathName = marker("p", 4 * 1024, "PATH-END");
+  const fixture = interactiveRunner({
+    id: "legacy-file-boundaries",
+    method: "applyPatchApproval",
+    params: {
+      conversationId: "thread-1",
+      callId: "legacy-patch-boundaries",
+      fileChanges: {
+        [pathName]: {
+          type: marker("t", 64, "TYPE-END"),
+          unified_diff: marker("v", 2 * 1024, "PREVIEW-END"),
+          move_path: marker("m", 4 * 1024, "MOVE-END"),
+        },
+      },
+      reason: marker("r", 4 * 1024, "REASON-END"),
+      grantRoot: marker("g", 4 * 1024, "GRANT-END"),
+    },
+  });
+  t.after(() => fixture.client.close());
+  let received = null;
+  await fixture.runner.run({
+    thread: { id: "thread-1", cwd: "/tmp" },
+    prompt: "Review every bounded field.",
+    onServerRequest: async (descriptor) => {
+      received = descriptor;
+      return { decision: "accept" };
+    },
+  });
+
+  assert.notEqual(received.truncated, true);
+  assert.match(received.reason, /REASON-END$/);
+  assert.match(received.grantRoot, /GRANT-END$/);
+  assert.match(received.changes[0].path, /PATH-END$/);
+  assert.match(received.changes[0].type, /TYPE-END$/);
+  assert.match(received.changes[0].preview, /PREVIEW-END$/);
+  assert.match(received.changes[0].movePath, /MOVE-END$/);
+  assert.deepEqual(fixture.socket().serverRequestResponse, {
+    id: "legacy-file-boundaries",
+    result: { decision: "approved" },
+  });
+});
+
+test("legacy approval decisions map to exact legacy app-server responses", async (t) => {
+  const cases = [
+    {
+      method: "execCommandApproval",
+      params: {
+        conversationId: "thread-1",
+        callId: "legacy-command-1",
+        approvalId: null,
+        command: ["git", "status"],
+        cwd: "/tmp",
+        reason: null,
+        parsedCmd: [{ type: "unknown", cmd: "git status" }],
+      },
+      decision: "acceptForSession",
+      expected: "approved_for_session",
+      approval: "command",
+    },
+    {
+      method: "applyPatchApproval",
+      params: {
+        conversationId: "thread-1",
+        callId: "legacy-patch-1",
+        fileChanges: { "/tmp/file.txt": { type: "update", unified_diff: "@@ -1 +1 @@", move_path: null } },
+        reason: "Write the requested change.",
+        grantRoot: "/tmp",
+      },
+      decision: "cancel",
+      expected: "abort",
+      approval: "fileChange",
+    },
+  ];
+
+  for (const entry of cases) {
+    await t.test(entry.method, async (subtest) => {
+      const fixture = interactiveRunner({ id: "legacy-1", method: entry.method, params: entry.params });
+      subtest.after(() => fixture.client.close());
+      let descriptor = null;
+      await fixture.runner.run({
+        thread: { id: "thread-1", cwd: "/tmp" },
+        prompt: "Handle legacy approval.",
+        onServerRequest: async (value) => {
+          descriptor = value;
+          return { decision: entry.decision };
+        },
+      });
+      assert.equal(descriptor.protocol, "legacy");
+      assert.equal(descriptor.approval, entry.approval);
+      assert.deepEqual(fixture.socket().serverRequestResponse, {
+        id: "legacy-1",
+        result: { decision: entry.expected },
+      });
+    });
+  }
+});
+
+test("requestUserInput descriptor and answers use the exact app-server schema", async (t) => {
+  const request = interactiveRequest("item/tool/requestUserInput", {
+    itemId: "question-item-1",
+    autoResolutionMs: 75,
+    questions: [
+      {
+        id: "environment",
+        header: "Target",
+        question: "Where should this run?",
+        isOther: true,
+        isSecret: false,
+        options: [
+          { label: "Staging", description: "Use the staging environment." },
+          { label: "Production", description: "Use the production environment." },
+        ],
+      },
+      {
+        id: "token",
+        header: "Token",
+        question: "Enter the one-time token.",
+        isOther: false,
+        isSecret: true,
+        options: null,
+      },
+    ],
+  });
+  const fixture = interactiveRunner(request);
+  t.after(() => fixture.client.close());
+  let received = null;
+  let timeoutMs = null;
+  await fixture.runner.run({
+    thread: { id: "thread-1", cwd: "/tmp" },
+    prompt: "Ask me.",
+    onServerRequest: async (descriptor, context) => {
+      received = descriptor;
+      timeoutMs = context.timeoutMs;
+      return { answers: { environment: ["Staging"], token: { answers: ["123456"] } } };
+    },
+  });
+  assert.equal(received.kind, "userInput");
+  assert.equal(received.itemId, "question-item-1");
+  assert.equal(received.questions[1].isSecret, true);
+  assert.equal(timeoutMs, 75);
+  assert.deepEqual(fixture.socket().serverRequestResponse, {
+    id: "interactive-1",
+    result: {
+      answers: {
+        environment: { answers: ["Staging"] },
+        token: { answers: ["123456"] },
+      },
+    },
+  });
+});
+
+test("elicitation and dynamic-tool decisions map to exact app-server schemas", async (t) => {
+  await t.test("elicitation", async (subtest) => {
+    const request = interactiveRequest("mcpServer/elicitation/request", {
+      mode: "form",
+      serverName: "calendar",
+      message: "Choose a date.",
+      requestedSchema: { type: "object", properties: { date: { type: "string", format: "date" } } },
+      _meta: { source: "test" },
+    });
+    const fixture = interactiveRunner(request);
+    subtest.after(() => fixture.client.close());
+    let descriptor = null;
+    await fixture.runner.run({
+      thread: { id: "thread-1", cwd: "/tmp" },
+      prompt: "Collect form input.",
+      onServerRequest: async (value) => {
+        descriptor = value;
+        return { action: "accept", content: { date: "2026-07-14" }, meta: { client: "imessage" } };
+      },
+    });
+    assert.equal(descriptor.kind, "elicitation");
+    assert.equal(descriptor.serverName, "calendar");
+    assert.deepEqual(fixture.socket().serverRequestResponse, {
+      id: "interactive-1",
+      result: {
+        action: "accept",
+        content: { date: "2026-07-14" },
+        _meta: { client: "imessage" },
+      },
+    });
+  });
+
+  await t.test("dynamic tool", async (subtest) => {
+    const request = interactiveRequest("item/tool/call", {
+      callId: "dynamic-call-1",
+      namespace: "mobile",
+      tool: "confirm",
+      arguments: { action: "deploy", count: 2 },
+    });
+    const fixture = interactiveRunner(request);
+    subtest.after(() => fixture.client.close());
+    let descriptor = null;
+    await fixture.runner.run({
+      thread: { id: "thread-1", cwd: "/tmp" },
+      prompt: "Use a dynamic tool.",
+      onServerRequest: async (value) => {
+        descriptor = value;
+        return {
+          success: true,
+          contentItems: [
+            { type: "text", text: "Confirmed." },
+            { type: "image", imageUrl: "https://example.com/receipt.png" },
+          ],
+        };
+      },
+    });
+    assert.equal(descriptor.kind, "dynamicTool");
+    assert.deepEqual(descriptor.arguments, { action: "deploy", count: 2 });
+    assert.deepEqual(fixture.socket().serverRequestResponse, {
+      id: "interactive-1",
+      result: {
+        contentItems: [
+          { type: "inputText", text: "Confirmed." },
+          { type: "inputImage", imageUrl: "https://example.com/receipt.png" },
+        ],
+        success: true,
+      },
+    });
+  });
+});
+
+test("interactive requests fail closed for missing, invalid, throwing, timed-out, or mismatched handlers", async (t) => {
+  const baseRequest = () => interactiveRequest("item/commandExecution/requestApproval", {
+    itemId: "command-1",
+    startedAtMs: Date.now(),
+    command: "touch /tmp/should-not-run",
+    cwd: "/tmp",
+  });
+  const cases = [
+    { name: "missing handler", handler: undefined },
+    { name: "invalid decision", handler: async () => ({ decision: "approve-everything" }) },
+    { name: "throwing handler", handler: async () => { throw new Error("broker unavailable"); } },
+  ];
+  for (const entry of cases) {
+    await t.test(entry.name, async (subtest) => {
+      const fixture = interactiveRunner(baseRequest());
+      subtest.after(() => fixture.client.close());
+      await fixture.runner.run({
+        thread: { id: "thread-1", cwd: "/tmp" },
+        prompt: "Fail closed.",
+        ...(entry.handler ? { onServerRequest: entry.handler } : {}),
+      });
+      assert.deepEqual(fixture.socket().serverRequestResponse, {
+        id: "interactive-1",
+        result: { decision: "decline" },
+      });
+    });
+  }
+
+  await t.test("timeout aborts the broker wait", async (subtest) => {
+    const fixture = interactiveRunner(baseRequest(), { serverRequestTimeoutMs: 20 });
+    subtest.after(() => fixture.client.close());
+    let signal = null;
+    const startedAt = Date.now();
+    await fixture.runner.run({
+      thread: { id: "thread-1", cwd: "/tmp" },
+      prompt: "Bound the wait.",
+      onServerRequest: async (_descriptor, context) => {
+        signal = context.signal;
+        return new Promise(() => {});
+      },
+    });
+    assert.ok(Date.now() - startedAt < 500);
+    assert.equal(signal.aborted, true);
+    assert.deepEqual(fixture.socket().serverRequestResponse, {
+      id: "interactive-1",
+      result: { decision: "decline" },
+    });
+  });
+
+  await t.test("foreign turn context never reaches the handler", async (subtest) => {
+    const request = baseRequest();
+    request.params.threadId = "foreign-thread";
+    const fixture = interactiveRunner(request);
+    subtest.after(() => fixture.client.close());
+    let called = false;
+    await fixture.runner.run({
+      thread: { id: "thread-1", cwd: "/tmp" },
+      prompt: "Reject foreign context.",
+      onServerRequest: async () => {
+        called = true;
+        return { decision: "accept" };
+      },
+    });
+    assert.equal(called, false);
+    assert.deepEqual(fixture.socket().serverRequestResponse.result, { decision: "decline" });
+  });
+});
+
+test("every supported interactive method has an exact fail-closed response without a handler", async (t) => {
+  const cases = [
+    {
+      method: "item/fileChange/requestApproval",
+      params: { itemId: "file-1", startedAtMs: Date.now(), reason: null, grantRoot: null },
+      expected: { decision: "decline" },
+    },
+    {
+      method: "execCommandApproval",
+      params: {
+        conversationId: "thread-1",
+        callId: "legacy-command-1",
+        approvalId: null,
+        command: ["pwd"],
+        cwd: "/tmp",
+        reason: null,
+        parsedCmd: [],
+      },
+      expected: { decision: "denied" },
+    },
+    {
+      method: "applyPatchApproval",
+      params: {
+        conversationId: "thread-1",
+        callId: "legacy-patch-1",
+        fileChanges: {},
+        reason: null,
+        grantRoot: null,
+      },
+      expected: { decision: "denied" },
+    },
+    {
+      method: "item/tool/requestUserInput",
+      params: {
+        itemId: "question-1",
+        questions: [{
+          id: "answer",
+          header: "Answer",
+          question: "Continue?",
+          isOther: false,
+          isSecret: false,
+          options: null,
+        }],
+        autoResolutionMs: null,
+      },
+      expected: { answers: {} },
+    },
+    {
+      method: "mcpServer/elicitation/request",
+      params: {
+        mode: "form",
+        serverName: "test",
+        message: "Enter a value.",
+        requestedSchema: { type: "object", properties: {} },
+        _meta: null,
+      },
+      expected: { action: "decline", content: null, _meta: null },
+    },
+    {
+      method: "item/tool/call",
+      params: { callId: "dynamic-1", namespace: null, tool: "confirm", arguments: {} },
+      expected: { contentItems: [], success: false },
+    },
+  ];
+  for (const entry of cases) {
+    await t.test(entry.method, async (subtest) => {
+      const fixture = interactiveRunner(interactiveRequest(entry.method, entry.params));
+      subtest.after(() => fixture.client.close());
+      await fixture.runner.run({
+        thread: { id: "thread-1", cwd: "/tmp" },
+        prompt: "Default safely.",
+      });
+      assert.deepEqual(fixture.socket().serverRequestResponse, {
+        id: "interactive-1",
+        result: entry.expected,
+      });
+    });
+  }
+});
+
+test("method-specific broker output validation declines malformed answers", async (t) => {
+  const cases = [
+    {
+      method: "item/tool/requestUserInput",
+      params: {
+        itemId: "question-1",
+        questions: [{
+          id: "known",
+          header: "Known",
+          question: "Answer this.",
+          isOther: false,
+          isSecret: false,
+          options: null,
+        }],
+        autoResolutionMs: null,
+      },
+      decision: { answers: { unknown: ["not allowed"] } },
+      expected: { answers: {} },
+    },
+    {
+      method: "mcpServer/elicitation/request",
+      params: {
+        mode: "form",
+        serverName: "test",
+        message: "Enter a value.",
+        requestedSchema: { type: "object", properties: {} },
+        _meta: null,
+      },
+      decision: (() => {
+        const content = {};
+        content.self = content;
+        return { action: "accept", content };
+      })(),
+      expected: { action: "decline", content: null, _meta: null },
+    },
+    {
+      method: "item/tool/call",
+      params: { callId: "dynamic-1", namespace: null, tool: "confirm", arguments: {} },
+      decision: { success: true, contentItems: [{ type: "executable", command: "rm -rf /" }] },
+      expected: { contentItems: [], success: false },
+    },
+  ];
+  for (const entry of cases) {
+    await t.test(entry.method, async (subtest) => {
+      const fixture = interactiveRunner(interactiveRequest(entry.method, entry.params));
+      subtest.after(() => fixture.client.close());
+      await fixture.runner.run({
+        thread: { id: "thread-1", cwd: "/tmp" },
+        prompt: "Validate this result.",
+        onServerRequest: async () => entry.decision,
+      });
+      assert.deepEqual(fixture.socket().serverRequestResponse.result, entry.expected);
+    });
+  }
+});
+
+test("unknown server requests fail closed and never invoke the turn handler", async (t) => {
+  const fixture = interactiveRunner(interactiveRequest("device/adminAccess/grant", { scope: "all" }));
+  t.after(() => fixture.client.close());
+  let called = false;
+  await fixture.runner.run({
+    thread: { id: "thread-1", cwd: "/tmp" },
+    prompt: "Reject unknown methods.",
+    onServerRequest: async () => {
+      called = true;
+      return { decision: "accept" };
+    },
+  });
+  assert.equal(called, false);
+  assert.deepEqual(fixture.socket().serverRequestResponse, {
+    id: "interactive-1",
+    error: { code: -32001, message: "This request requires interaction in the Codex app." },
+  });
+});
+
+test("disconnect aborts an outstanding mobile decision and ignores a late approval", async (t) => {
+  const request = interactiveRequest("item/fileChange/requestApproval", {
+    itemId: "file-change-1",
+    startedAtMs: Date.now(),
+    reason: "Write outside the current root.",
+    grantRoot: "/tmp/project",
+  });
+  const fixture = interactiveRunner(request, { completeOnResponse: false, serverRequestTimeoutMs: 500 });
+  t.after(() => fixture.client.close());
+  let resolveDecision;
+  let signal = null;
+  const run = fixture.runner.run({
+    thread: { id: "thread-1", cwd: "/tmp" },
+    prompt: "Wait for approval.",
+    onServerRequest: async (_descriptor, context) => {
+      signal = context.signal;
+      return new Promise((resolve) => { resolveDecision = resolve; });
+    },
+  });
+  await waitFor(() => typeof resolveDecision === "function");
+  fixture.socket().disconnect();
+  await assert.rejects(run, (error) => error?.code === "CODEX_DISCONNECTED");
+  assert.equal(signal.aborted, true);
+  resolveDecision({ decision: "accept" });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(fixture.socket().sent.some((message) => (
+    message.id === "interactive-1" && !message.method
+  )), false);
+});
+
+test("runner interrupts a remote turn without closing its shared stream", async (t) => {
   const directory = mkdtempSync(path.join(os.tmpdir(), "imessage-app-server-cancel-"));
   const { runner, capture } = testRunner(directory, "cancel");
   t.after(() => runner.client.close());
@@ -335,7 +1220,7 @@ test("runner interrupts the shared turn without terminating the proxy", async (t
   const interrupt = messages(capture).find((message) => message.method === "turn/interrupt");
   assert.equal(interrupt.params.threadId, "thread-1");
   assert.equal(interrupt.params.turnId, "turn-1");
-  assert.equal(runner.client.child.exitCode, null);
+  assert.equal(runner.client.socket.readyState, 1);
 });
 
 test("runner interrupts a recovered turn by its persisted canonical turn id", async (t) => {
@@ -348,31 +1233,98 @@ test("runner interrupts a recovered turn by its persisted canonical turn id", as
   assert.deepEqual(interrupt.params, { threadId: "thread-1", turnId: "turn-recovered-42" });
 });
 
-test("runner-owned proxy connections close after a completed turn", async () => {
+test("runner-owned remote streams close after a completed turn", async () => {
   const directory = mkdtempSync(path.join(os.tmpdir(), "imessage-app-server-owned-"));
   const fixture = testRunner(directory);
   const owned = new AppServerCodexRunner({
-    codexPath: fixture.executable,
     codexHome: path.join(directory, "codex-home"),
-    spawnImpl: fixture.spawnImpl,
+    webSocketFactory: fixture.webSocketFactory,
     requestTimeoutMs: 2_000,
     turnTimeoutMs: 2_000,
   });
   const result = await owned.run({ thread: { id: "thread-1", cwd: directory }, prompt: "Hello" });
   assert.equal(result.status, "completed");
-  assert.equal(owned.client.child, null);
+  assert.equal(owned.client.socket, null);
   fixture.client.close();
 });
 
-test("runner bounds initialization waits and reports managed daemon unavailability", async (t) => {
+test("runner bounds Remote Control initialization waits", async (t) => {
   const directory = mkdtempSync(path.join(os.tmpdir(), "imessage-app-server-timeout-"));
   const { runner } = testRunner(directory, "timeout", { requestTimeoutMs: 40 });
   t.after(() => runner.client.close());
   await assert.rejects(
     runner.run({ thread: { id: "thread-1", cwd: directory }, prompt: "Hello" }),
-    (error) => error.code === "CODEX_UNAVAILABLE",
+    (error) => error.code === "CODEX_TIMEOUT",
   );
   assert.equal(runner.isRunning(), false);
+});
+
+test("terminal initialization notifications reject promptly and classify missing pairing", async (t) => {
+  const cases = [
+    {
+      name: "generic terminal error",
+      error: { code: -32000, message: "Remote app-server initialization failed." },
+      expectedCode: "CODEX_FAILED",
+    },
+    {
+      name: "client is not paired",
+      error: "not paired for this client",
+      expectedCode: "CODEX_REMOTE_PAIRING_REQUIRED",
+    },
+  ];
+
+  for (const entry of cases) {
+    await t.test(entry.name, async () => {
+      let closed = false;
+      class TerminalErrorSocket extends EventEmitter {
+        readyState = 0;
+        send(value) {
+          const message = JSON.parse(value);
+          if (message.method !== "initialize") return;
+          queueMicrotask(() => this.emit("message", JSON.stringify({
+            method: "error",
+            params: { error: entry.error, willRetry: false },
+          })));
+        }
+        close() {
+          closed = true;
+          this.readyState = 3;
+        }
+      }
+      const client = new AppServerRpcClient({
+        codexHome: "/tmp/terminal-error-codex-home",
+        requestTimeoutMs: 10_000,
+        webSocketFactory: () => {
+          const socket = new TerminalErrorSocket();
+          queueMicrotask(() => {
+            socket.readyState = 1;
+            socket.emit("open");
+          });
+          return socket;
+        },
+      });
+      let deadline;
+      try {
+        const outcome = await Promise.race([
+          client.connect().then(
+            () => ({ resolved: true }),
+            (error) => ({ error }),
+          ),
+          new Promise((resolve) => {
+            deadline = setTimeout(() => resolve({ timedOut: true }), 250);
+          }),
+        ]);
+        assert.equal(outcome.timedOut, undefined, "initialize waited for its request timeout");
+        assert.equal(outcome.resolved, undefined);
+        assert.equal(outcome.error?.code, entry.expectedCode);
+        assert.equal(client.ready, false);
+        assert.equal(closed, true);
+      } finally {
+        clearTimeout(deadline);
+        client.close();
+      }
+    });
+  }
 });
 
 test("turn timeout interrupts backend work and rejects after bounded grace", async (t) => {
@@ -481,9 +1433,9 @@ test("late events from an old socket cannot disconnect its replacement", async (
   client.close();
 });
 
-test("production transport uses websocket-over-Unix instead of raw proxy stdio", async () => {
+test("protocol client requires an injected Remote Control stream and receives no local endpoint", async () => {
   const sent = [];
-  let connectionFactory = null;
+  let factoryArguments = null;
   class FakeSocket extends EventEmitter {
     readyState = 0;
     send(value) {
@@ -501,11 +1453,8 @@ test("production transport uses websocket-over-Unix instead of raw proxy stdio",
   }
   const client = new AppServerRpcClient({
     codexHome: "/tmp/.codex",
-    socketPath: "/tmp/.codex/app-server-control/app-server-control.sock",
-    webSocketFactory: (url, options) => {
-      assert.equal(url, "ws://localhost/rpc");
-      assert.equal(options.perMessageDeflate, false);
-      connectionFactory = options.createConnection;
+    webSocketFactory: (...args) => {
+      factoryArguments = args;
       const socket = new FakeSocket();
       queueMicrotask(() => {
         socket.readyState = 1;
@@ -515,8 +1464,15 @@ test("production transport uses websocket-over-Unix instead of raw proxy stdio",
     },
   });
   await client.connect();
-  assert.equal(typeof connectionFactory, "function");
+  assert.deepEqual(factoryArguments, []);
   assert.equal(sent[0].method, "initialize");
   assert.equal(sent[1].method, "initialized");
   client.close();
+});
+
+test("protocol client cannot construct a local Codex transport", () => {
+  assert.throws(
+    () => new AppServerRpcClient({ codexHome: "/tmp/.codex" }),
+    (error) => error?.code === "CODEX_REMOTE_TRANSPORT_REQUIRED",
+  );
 });

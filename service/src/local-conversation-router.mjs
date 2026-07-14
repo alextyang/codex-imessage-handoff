@@ -117,7 +117,7 @@ function normalizePollAction(value) {
   const kind = cleanString(value.kind, 40);
   if (!kind || !POLL_ACTION_KINDS.has(kind)) return null;
   const action = { kind };
-  for (const key of ["command", "argument", "threadId", "projectKey", "prompt", "flowId"]) {
+  for (const key of ["command", "argument", "commandArgument", "threadId", "projectKey", "prompt", "flowId"]) {
     const item = cleanString(value[key], key === "prompt" ? 32_000 : 512);
     if (item) action[key] = item;
   }

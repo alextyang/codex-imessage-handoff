@@ -18,9 +18,15 @@ import {
 } from "./thread-settings.mjs";
 import { ImsgTransport } from "./imsg-transport.mjs";
 import { safeImsgFailureDetails } from "./imsg-rpc-diagnostics.mjs";
-import { AppServerCodexRunner } from "./app-server-runner.mjs";
+import { RemoteControlCodexRuntime } from "./remote-control-runner.mjs";
+import {
+  RemoteControlAvailability,
+  remoteControlPresenceState,
+} from "./remote-control-availability.mjs";
 import { normalizeAppServerTimestamp } from "./app-server-timestamp.mjs";
 import { RunManager } from "./run-manager.mjs";
+import { RolloutActivityMonitor } from "./rollout-activity-monitor.mjs";
+import { ServerRequestBroker } from "./server-request-broker.mjs";
 import { FailureQueue } from "./failure-queue.mjs";
 import { isTerminalLocalActionFailure, LocalActionDispatch } from "./local-action-dispatch.mjs";
 import { loadClaimedJobs, markClaimedJobState, removeClaimedJob, saveClaimedJob } from "./claimed-store.mjs";
@@ -30,8 +36,6 @@ import { CompletionMonitor } from "./completion-monitor.mjs";
 import { MultiLiveMirror } from "./multi-live-mirror.mjs";
 import { LiveMirrorRetryBackoff } from "./live-mirror-backoff.mjs";
 import { servicePaths } from "./paths.mjs";
-import { SharedBackendTurnLease } from "./shared-backend-lease.mjs";
-import { inspectDesktopSharedConnection } from "./desktop-connection.mjs";
 import { ServiceReadiness } from "./service-readiness.mjs";
 import { PresenceTracker } from "./presence-tracker.mjs";
 import { shouldSuppressSubmittedUserMirror, submittedUserMirrorMode } from "./submitted-user-mirror-policy.mjs";
@@ -57,6 +61,8 @@ serviceReadiness.markStarting();
 const config = readConfig();
 const imsgTransport = new ImsgTransport({ profile: config.imsg, stateFile: paths.imsgState, logger: log });
 serviceReadiness.setHealthCheck(() => imsgTransport.healthStatus());
+const remoteControlAvailability = new RemoteControlAvailability();
+serviceReadiness.setCapabilityCheck(() => ({ remoteControl: remoteControlAvailability.snapshot() }));
 const presenceTracker = new PresenceTracker(paths.presenceState);
 const PRESENCE_OFFLINE_DEBOUNCE_MS = 30_000;
 let presenceOfflineTimer = null;
@@ -66,49 +72,90 @@ function observePresence(state) {
     deliver: (event) => sendOutbound(event),
   }).catch(() => log("A Codex presence transition remains pending."));
 }
-imsgTransport.setHealthCallback((health) => {
-  if (health?.healthy === true) {
+function observeRemoteControlAvailability(value) {
+  serviceReadiness.refreshCapabilities();
+  const state = remoteControlPresenceState(value);
+  if (state === "online") {
     if (presenceOfflineTimer) clearTimeout(presenceOfflineTimer);
     presenceOfflineTimer = null;
     observePresence("online");
     return;
   }
+  if (state !== "offline") {
+    if (presenceOfflineTimer) clearTimeout(presenceOfflineTimer);
+    presenceOfflineTimer = null;
+    return;
+  }
   if (presenceOfflineTimer) return;
   presenceOfflineTimer = setTimeout(() => {
     presenceOfflineTimer = null;
-    if (imsgTransport.healthStatus().healthy !== true) observePresence("offline");
+    if (remoteControlPresenceState(remoteControlAvailability.snapshot()) === "offline") observePresence("offline");
   }, PRESENCE_OFFLINE_DEBOUNCE_MS);
   presenceOfflineTimer.unref?.();
-});
+}
+function markRemoteControlAvailable() {
+  observeRemoteControlAvailability(remoteControlAvailability.observeAvailable());
+}
+function markRemoteControlFailure(error) {
+  observeRemoteControlAvailability(remoteControlAvailability.observeFailure(error));
+}
 const completions = new CompletionMonitor(paths.completionState);
 const multiLiveMirror = new MultiLiveMirror({ stateDirectory: paths.multiLiveMirrorState });
 const liveMirrorBackoff = new LiveMirrorRetryBackoff();
 const failedRuns = new FailureQueue();
 const newThreadFlows = new NewThreadFlowStore();
 const localActionContext = new AsyncLocalStorage();
-const codexBackend = String(process.env.IMESSAGE_HANDOFF_CODEX_BACKEND || "app-server").trim().toLowerCase();
-const sharedBackendTurnLease = new SharedBackendTurnLease(paths.sharedBackendTurnLease);
-const retryableSharedBackendErrors = new Set([
+const codexRuntime = new RemoteControlCodexRuntime();
+const retryableCodexErrors = new Set([
   "CODEX_DISCONNECTED",
   "CODEX_PROTOCOL_ERROR",
+  "CODEX_REMOTE_PROTOCOL_ERROR",
   "CODEX_TIMEOUT",
   "CODEX_UNAVAILABLE",
+  "CODEX_REMOTE_UNAVAILABLE",
+  "CODEX_HOST_OFFLINE",
+  "CODEX_HOST_UNAVAILABLE",
+  "CODEX_REMOTE_ENROLLMENT_REQUIRED",
+  "CODEX_REMOTE_PAIRING_REQUIRED",
+  "CODEX_REMOTE_FORBIDDEN",
+  "CODEX_AUTH_REQUIRED",
+  "CODEX_AUTH_STALE",
 ]);
 
 function clearServiceReadiness() {
   try { serviceReadiness.markStopped(); } catch {}
 }
 
-if (codexBackend !== "app-server" && codexBackend !== "shared") {
-  throw new Error("The local iMessage service requires the supervised shared Codex app-server.");
-}
-
 function createCodexRunner() {
-  return new AppServerCodexRunner();
+  return codexRuntime.createRunner();
 }
 
 function shouldDeferCodexRun(error) {
-  return error?.code === "BUSY" || retryableSharedBackendErrors.has(error?.code);
+  return error?.code === "BUSY" || retryableCodexErrors.has(error?.code);
+}
+
+const manualCodexRecoveryErrors = new Set([
+  "CODEX_REMOTE_ENROLLMENT_REQUIRED",
+  "CODEX_REMOTE_PAIRING_REQUIRED",
+  "CODEX_REMOTE_FORBIDDEN",
+  "CODEX_HOST_UNAVAILABLE",
+  "CODEX_AUTH_REQUIRED",
+  "CODEX_AUTH_STALE",
+]);
+
+function codexRetryPolicy(error) {
+  if (error?.code === "BUSY") {
+    return { key: "codex-busy", initialMs: 15_000, maxMs: 60_000, factor: 2 };
+  }
+  if (manualCodexRecoveryErrors.has(error?.code)) {
+    return { key: "codex-setup", initialMs: 2 * 60_000, maxMs: 30 * 60_000, factor: 2 };
+  }
+  return { key: "codex-availability", initialMs: 15_000, maxMs: 5 * 60_000, factor: 2 };
+}
+
+function deferCodexRetry(context, error) {
+  const policy = codexRetryPolicy(error);
+  return context.deferWithBackoff(policy.key, policy);
 }
 
 const pendingNotices = new Set();
@@ -126,6 +173,8 @@ let catalogById = new Map();
 let completionMonitoringStarted = false;
 let completionScanInFlight = null;
 let liveMirrorScanInFlight = null;
+let completionScanRequested = false;
+let liveMirrorScanRequested = false;
 let releaseStartupWork;
 let startupWorkReleased = false;
 const startupWorkReady = new Promise((resolve) => { releaseStartupWork = resolve; });
@@ -171,10 +220,18 @@ async function scanKnownCompletions() {
 }
 
 function scheduleCompletionScan() {
-  if (!completionMonitoringStarted || completionScanInFlight) return;
+  if (!completionMonitoringStarted) return;
+  if (completionScanInFlight) {
+    completionScanRequested = true;
+    return;
+  }
+  completionScanRequested = false;
   completionScanInFlight = scanKnownCompletions()
     .catch(() => log("Completion synchronization failed; will retry."))
-    .finally(() => { completionScanInFlight = null; });
+    .finally(() => {
+      completionScanInFlight = null;
+      if (completionScanRequested) queueMicrotask(scheduleCompletionScan);
+    });
 }
 
 async function deliverLiveMessage(message) {
@@ -212,14 +269,30 @@ async function scanLiveMirror() {
 }
 
 function scheduleLiveMirrorScan() {
-  if (stopped || liveMirrorScanInFlight || !liveMirrorBackoff.ready()) return;
+  if (stopped || !liveMirrorBackoff.ready()) return;
+  if (liveMirrorScanInFlight) {
+    liveMirrorScanRequested = true;
+    return;
+  }
+  liveMirrorScanRequested = false;
   liveMirrorScanInFlight = scanLiveMirror()
     .catch(() => {
       liveMirrorBackoff.recordFailure();
       log("Live task synchronization failed; will retry.");
     })
-    .finally(() => { liveMirrorScanInFlight = null; });
+    .finally(() => {
+      liveMirrorScanInFlight = null;
+      if (liveMirrorScanRequested) queueMicrotask(scheduleLiveMirrorScan);
+    });
 }
+
+const rolloutActivity = new RolloutActivityMonitor({
+  root: paths.sessions,
+  onActivity: () => {
+    scheduleLiveMirrorScan();
+    scheduleCompletionScan();
+  },
+});
 
 async function drainSelectedLiveMirror(thread) {
   if (!thread) return { pending: false };
@@ -319,6 +392,65 @@ function threadLabel(thread) {
     listening: imsgTransport.router.nativeThread(thread.id)?.listen === true,
   };
 }
+
+const serverRequests = new ServerRequestBroker({
+  logger: log,
+  sendText: async ({ threadId, deliveryId, body }) => {
+    const thread = catalogById.get(String(threadId || ""));
+    if (!thread) {
+      throw Object.assign(new Error("The task for this Codex interaction is no longer available."), {
+        code: "CODEX_INTERACTION_THREAD_MISSING",
+      });
+    }
+    return sendOutbound({
+      kind: "service.notice",
+      deliveryId,
+      code: "needs-attention",
+      thread: threadLabel(thread),
+      body,
+    });
+  },
+  sendChoices: async ({ threadId, deliveryId, question, choices, allowOther, otherToken }) => {
+    const thread = catalogById.get(String(threadId || ""));
+    if (!thread) {
+      throw Object.assign(new Error("The task for this Codex interaction is no longer available."), {
+        code: "CODEX_INTERACTION_THREAD_MISSING",
+      });
+    }
+    const result = await imsgTransport.sendActionPicker(
+      question,
+      choices.map((choice) => ({
+        label: choice.label,
+        action: {
+          kind: "control",
+          command: "respond",
+          threadId: thread.id,
+          argument: choice.token,
+        },
+      })),
+      {
+        threadId: thread.id,
+        operationScope: deliveryId,
+        allowAddedChoiceSearch: allowOther === true,
+        ...(allowOther && otherToken ? {
+          addedChoiceAction: {
+            kind: "control",
+            command: "respond",
+            threadId: thread.id,
+            commandArgument: otherToken,
+          },
+        } : {}),
+      },
+    );
+    if (result?.terminal === false || result?.sent !== true) {
+      throw Object.assign(new Error("The Codex interaction choices could not be delivered in the task reply thread."), {
+        code: result?.status || "IMSG_INTERACTION_PENDING",
+        ...safeImsgFailureDetails(result),
+      });
+    }
+    return result;
+  },
+});
 
 function outboundReasoningOptions(options) {
   return options.map((option) => option.value === "default"
@@ -487,15 +619,20 @@ async function executeReply(event, context) {
     let matchingTurn = event.clientUserMessageId
       ? candidates.find((turn) => turn.clientUserMessageId === event.clientUserMessageId) || null
       : null;
+    let recoveryLookupError = null;
     if (!matchingTurn && event.clientUserMessageId) {
-      const recoveryReader = createCodexRunner();
       try {
+        const recoveryReader = createCodexRunner();
         matchingTurn = await recoveryReader.findTurnByClientUserMessageId(
           thread.id,
           event.clientUserMessageId,
         );
+        context.resetDeferBackoff();
+        markRemoteControlAvailable();
       } catch (error) {
-        // The rollout may still materialize while the shared RPC connection is
+        recoveryLookupError = error;
+        markRemoteControlFailure(error);
+        // The rollout may still materialize while the Remote Control RPC connection is
         // recovering. Continue the bounded observation window without ever
         // resubmitting the ambiguous prompt automatically.
         log(`Exact recovery lookup for ${thread.id} is not available (${error?.code || "UNKNOWN"}).`);
@@ -511,21 +648,26 @@ async function executeReply(event, context) {
       }) || null;
     }
     if (matchingTurn?.state === "running") {
+      context.resetDeferBackoff();
       event.recoveredTurnId = String(matchingTurn.id || "");
       event.recoveryMissingSince = null;
       if (!event.recoveredTurnId) {
         throw Object.assign(new Error("The recovered Codex turn has no canonical turn id."), { code: "RECOVERED_TURN_INVALID" });
       }
-      const recoveryRunner = createCodexRunner();
       context.setCancel(() => {
-        recoveryRunner.cancelRecoveredTurn(thread.id, event.recoveredTurnId)
-          .catch(() => log(`Recovered turn ${event.recoveredTurnId} could not be interrupted.`));
+        try {
+          createCodexRunner().cancelRecoveredTurn(thread.id, event.recoveredTurnId)
+            .catch(() => log(`Recovered turn ${event.recoveredTurnId} could not be interrupted.`));
+        } catch {
+          log(`Recovered turn ${event.recoveredTurnId} could not be interrupted.`);
+        }
       });
       context.defer(2000);
       saveClaimedJob(event, "running");
       return;
     }
     if (matchingTurn?.finalResponse) {
+      context.resetDeferBackoff();
       event.delivery = {
         body: matchingTurn.finalResponse,
         generatedImages: [],
@@ -536,6 +678,7 @@ async function executeReply(event, context) {
       event.recoveryMissingSince = null;
       saveClaimedJob(event, "delivering");
     } else if (matchingTurn) {
+      context.resetDeferBackoff();
       event.reconcileRunning = false;
       event.recoveryMissingSince = null;
       saveClaimedJob(event, "failed");
@@ -558,14 +701,20 @@ async function executeReply(event, context) {
       const recovery = unconfirmedRecoveryDisposition(event.recoveryMissingSince);
       event.recoveryMissingSince = recovery.missingSince;
       if (recovery.status === "observe") {
+        if (recoveryLookupError && shouldDeferCodexRun(recoveryLookupError)) {
+          const retry = deferCodexRetry(context, recoveryLookupError);
+          log(`Exact recovery lookup for ${thread.id} will retry in ${retry.delayMs}ms (attempt ${retry.attempt}).`);
+        } else {
+          context.defer(recovery.retryAfterMs);
+        }
         saveClaimedJob(event, "running");
-        context.defer(recovery.retryAfterMs);
         return;
       }
       // A daemon restart cannot prove whether an unobserved turn was accepted.
       // Fail closed into the explicit retry queue instead of submitting the
       // same prompt a second time.
       event.reconcileRunning = false;
+      context.resetDeferBackoff();
       saveClaimedJob(event, "failed");
       failedRuns.record(thread.id, {
         body: prompt,
@@ -619,11 +768,11 @@ async function executeReply(event, context) {
 
   const reply = claim.reply || {};
   const images = (claim.images || []).filter((file) => existsSync(file));
-  const runner = createCodexRunner();
+  let runner = null;
   let cancelRequested = false;
   context.setCancel(() => {
     cancelRequested = true;
-    runner.cancel(thread.id);
+    runner?.cancel(thread.id);
   });
   let progressTimer = null;
   let pendingPhase = null;
@@ -632,9 +781,9 @@ async function executeReply(event, context) {
   let deferred = false;
   let managedCompletion = false;
   let runStartedAt = null;
-  let sharedLeaseHeld = false;
 
   try {
+    runner = createCodexRunner();
     await updateThreadStatus(thread, "working");
     await imsgTransport.setThreadTyping(thread.id, true);
     scheduleSynchronize();
@@ -662,15 +811,11 @@ async function executeReply(event, context) {
     // Re-read the rollout at the last safe point before claiming this turn as
     // service-owned. This prevents a local Codex turn that began after the
     // catalog scan from receiving the same-thread iMessage prompt in parallel.
-    // There is still a tiny check-to-spawn race; Codex's session lock is the
+    // There is still a tiny check-to-submit race; Codex's session lock is the
     // final guard and is handled by the same BUSY deferral path below.
     assertThreadReadyForIMessageRun(thread);
-    const desktop = inspectDesktopSharedConnection();
-    if (desktop.desktopRunning && desktop.privateAppServerChild) {
-      throw Object.assign(new Error("Codex Desktop is currently using its private app server; shared iMessage work is paused until the next shared Desktop session."), { code: "CODEX_UNAVAILABLE" });
-    }
-    // Persist the stable app-server user-message id before turn/start can be
-    // written to the socket. This is the recovery key after any process loss.
+    // Persist the stable app-server user-message id before turn/start can cross
+    // the Remote Control stream. This is the recovery key after any process loss.
     saveClaimedJob(event, "running");
     if (shouldSuppressSubmittedUserMirror(claim) && !event.mirrorSuppressionToken) {
       event.mirrorSuppressionToken = multiLiveMirror.suppressUser(thread.id, String(reply.body || ""));
@@ -679,8 +824,6 @@ async function executeReply(event, context) {
     runStartedAt = new Date().toISOString();
     completions.manage(thread.id, runStartedAt);
     managedCompletion = true;
-    sharedBackendTurnLease.acquire(thread.id);
-    sharedLeaseHeld = true;
     const result = await runner.run({
       thread,
       prompt: String(reply.body || ""),
@@ -688,7 +831,12 @@ async function executeReply(event, context) {
       clientUserMessageId: event.clientUserMessageId,
       reasoningEffort: event.reasoningEffort || effectiveReasoning(thread),
       onPhase: (phase) => { pendingPhase = phase; },
+      onServerRequest: (descriptor, requestContext) => serverRequests.request(descriptor, requestContext),
     });
+    // A completed Remote Control RPC is proof that the capability is back.
+    // Reset every prior availability/setup attempt before persisting delivery.
+    context.resetDeferBackoff();
+    markRemoteControlAvailable();
     if (result.status === "cancelled") {
       await settleLiveSuppression(event, thread, { forceClear: true });
       removeClaimedJob(event.replyId);
@@ -722,16 +870,28 @@ async function executeReply(event, context) {
       event.reconcileRunning = true;
       event.recoveredTurnId = typeof error.turnId === "string" ? error.turnId : null;
       event.recoveryMissingSince = null;
+      markRemoteControlFailure(error);
       saveClaimedJob(event, "running");
       context.defer(1000);
       log(`Codex turn outcome for ${thread.id} is ambiguous; reconciling ${event.clientUserMessageId}.`);
     } else if (shouldDeferCodexRun(error)) {
       deferred = true;
-      context.defer(15000);
+      const pairingRequired = error?.code === "CODEX_REMOTE_PAIRING_REQUIRED";
+      const setupRequired = manualCodexRecoveryErrors.has(error?.code);
+      const hostOffline = error?.code === "CODEX_HOST_OFFLINE";
+      if (error?.code === "BUSY") {
+        // BUSY is an application-level response and therefore proves Remote
+        // Control itself is online. Only the task-specific retry remains.
+        context.resetDeferBackoff();
+        markRemoteControlAvailable();
+      } else {
+        markRemoteControlFailure(error);
+      }
+      const retry = deferCodexRetry(context, error);
       await settleLiveSuppression(event, thread, { forceClear: true });
       const backendUnavailable = error?.code !== "BUSY";
       if (backendUnavailable) {
-        log(`Shared Codex connection for ${thread.id} is unavailable (${error.code}); run remains pending.`);
+        log(`Codex Remote Control for ${thread.id} is unavailable (${error.code}); run remains pending for ${retry.delayMs}ms (attempt ${retry.attempt}).`);
       }
       const noticeKey = backendUnavailable ? "backendNoticeSent" : "busyNoticeSent";
       const shouldNotify = !event[noticeKey];
@@ -746,14 +906,22 @@ async function executeReply(event, context) {
           deliveryId: `run:${event.replyId}:${backendUnavailable ? "backend-queued" : "busy-queued"}`,
           code: "queued",
           thread: threadLabel(thread),
-          body: backendUnavailable
-            ? "Codex is reconnecting. Your message remains pending and will start when the shared service is available.\n\n/cancel · /thread"
+          body: pairingRequired
+            ? "Remote access needs to be paired with Codex before this message can run. Open Settings → Connections → Control this Mac, then pair the iMessage client. Your message remains pending.\n\n/cancel · /thread"
+            : setupRequired
+            ? "Remote access needs attention on the Mac before this message can run. Your message remains pending.\n\n/cancel · /thread"
+            : hostOffline
+            ? "The Codex host is offline. Your message is pending and will start when it reconnects.\n\n/cancel · /thread"
+            : backendUnavailable
+            ? "Remote Control is reconnecting. Your message remains pending.\n\n/cancel · /thread"
             : "This task is already working locally. Your message is pending and will start when it is free.\n\n/cancel · /thread",
         });
       }
     } else {
       const code = typeof error?.code === "string" && /^[A-Z0-9_]{1,40}$/.test(error.code) ? error.code : "UNKNOWN";
       log(`Codex run for ${thread.id} failed (${code}).`);
+      context.resetDeferBackoff();
+      if (code.startsWith("CODEX_")) markRemoteControlFailure(error);
       await settleLiveSuppression(event, thread, { forceClear: true });
       failedRuns.record(thread.id, {
         body: String(reply.body || ""),
@@ -771,7 +939,6 @@ async function executeReply(event, context) {
     }
   } finally {
     await imsgTransport.setThreadTyping(thread.id, false).catch(() => {});
-    if (sharedLeaseHeld) sharedBackendTurnLease.release();
     if (progressTimer) clearInterval(progressTimer);
     if (managedCompletion) completions.unmanage(thread.id);
     if (!deferred) delete event.claimed;
@@ -1866,6 +2033,24 @@ async function queueLocalPrompt(action, threadId, bodyValue = action.body, attac
 }
 
 async function handleLocalAction(action) {
+  const serverRequestOutcome = await serverRequests.handleAction(action);
+  if (serverRequestOutcome.handled) {
+    if (serverRequestOutcome.stale) {
+      const thread = action.threadId ? catalogById.get(String(action.threadId)) : null;
+      await sendOutbound({
+        kind: "service.notice",
+        code: "needs-attention",
+        ...(thread ? { thread: threadLabel(thread) } : {}),
+        body: "That Codex request has expired or was already answered.",
+      });
+      return { reaction: "❌" };
+    }
+    return { reaction: serverRequestOutcome.deliveryFailed
+      ? "❌"
+      : serverRequestOutcome.accepted
+        ? "✅"
+        : "❓" };
+  }
   if (["new", "new-project", "new-project-search", "new-reasoning", "new-reasoning-refresh", "new-prompt", "new-cancel"].includes(action.kind)) {
     return handleNewThreadAction(action);
   }
@@ -2126,8 +2311,7 @@ async function main() {
   completionMonitoringStarted = true;
   scheduleCompletionScan();
   scheduleLiveMirrorScan();
-  setInterval(scheduleLiveMirrorScan, 2000).unref();
-  setInterval(scheduleCompletionScan, 10 * 1000).unref();
+  rolloutActivity.start();
   setInterval(() => synchronize().catch(() => log("Background synchronization failed; will retry.")), 30 * 1000).unref();
   serviceReadiness.markReady();
 }
@@ -2138,6 +2322,9 @@ async function stop() {
   if (presenceOfflineTimer) clearTimeout(presenceOfflineTimer);
   presenceOfflineTimer = null;
   runs.shutdown();
+  rolloutActivity.stop();
+  serverRequests.stop();
+  codexRuntime.close();
   await imsgTransport.stop().catch(() => {});
   clearServiceReadiness();
   process.exit(0);

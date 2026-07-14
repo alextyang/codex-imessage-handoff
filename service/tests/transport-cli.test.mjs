@@ -74,6 +74,41 @@ test("remote, direct-cli, and transport-switch commands no longer exist", () => 
   assert.equal(readFileSync(path.join(home, "config.json"), "utf8"), before);
 });
 
+test("the retired Desktop backend-switch command no longer exists", () => {
+  const { run } = fixture();
+  const result = run(["desktop-sync", "status"]);
+  assert.equal(result.status, 1);
+  assert.doesNotMatch(result.stderr, /shared app-server|desktop-sync prepare/);
+  assert.match(result.stderr, /transport harden-helper\|status\|check\|finish-helper/);
+});
+
+test("service and Remote Control setup verify the nonextractable-key helper first", () => {
+  const source = readFileSync(cli, "utf8");
+  assert.match(source, /async function requireRemoteControlAuthorization\(\{ requirePaired = false \} = \{\}\) \{\s+ensureRemoteControlKeyHelper\(\);\s+const status = await new RemoteControlController\(\)\.status\(\{ network: requirePaired \}\);/s);
+  assert.match(source, /if \(action === "finish-helper"\) \{\s+await requireRemoteControlAuthorization\(\{ requirePaired: true \}\);\s+const finished/s);
+  assert.match(source, /async function handleRemoteControl\(action, actionArgument = ""\) \{\s+ensureRemoteControlKeyHelper\(\);\s+const controller = new RemoteControlController\(\);/s);
+  assert.match(source, /if \(action === "install" \|\| action === "start"\) \{\s+readConfig\(\);\s+await requireRemoteControlAuthorization\(\);\s+const installed = installService\(\);/s);
+  assert.match(source, /if \(action === "restart"\) \{\s+readConfig\(\);\s+await requireRemoteControlAuthorization\(\);\s+const installed = installService\(\{ forceRestart: true \}\);/s);
+  assert.match(source, /Codex Remote Control is not authorized .*remote-control authorize/s);
+  assert.match(source, /Codex Remote Control is not paired .*remote-control pair <code>/s);
+});
+
+test("authorization and pairing keep the ready service alive until transactional activation", () => {
+  const source = readFileSync(cli, "utf8");
+  assert.match(source, /function hasVerifiedHelperConfig\(\) \{\s+if \(!existsSync\(servicePaths\(\)\.config\)\) return false;\s+readConfig\(\);\s+return true;\s+\}/s);
+  const authorize = source.slice(source.indexOf('if (action === "authorize")'), source.indexOf('if (action === "pair")'));
+  assert.doesNotMatch(authorize, /stopService\(\)/);
+  assert.match(authorize, /authorizeRemoteControlAndActivate\(\{\s+controller,\s+hasVerifiedHelperConfig,\s+installService,\s+rotateServiceProcess,\s+\}\)/s);
+  const pair = source.slice(source.indexOf('if (action === "pair")'), source.indexOf('if (action === "deauthorize")'));
+  assert.match(pair, /normalizeManualPairingCode\(actionArgument\)/);
+  assert.doesNotMatch(pair, /stopService\(\)/);
+  assert.match(pair, /controller\.pairEnvironment\(pairingCode\)/);
+  assert.match(pair, /hasVerifiedHelperConfig\(\)\s+\? installService\(\{ forceRestart: true \}\)/s);
+  const deauthorize = source.slice(source.indexOf('if (action === "deauthorize")'), source.indexOf('throw new Error("Usage: imessage-handoff remote-control'));
+  assert.match(deauthorize, /const stopped = stopService\(\)/);
+  assert.doesNotMatch(deauthorize, /installService\(/);
+});
+
 test("service commands fail closed when the authenticated helper is not configured", () => {
   const { run } = fixture({ configured: false });
   const result = run(["service", "run", "--relay=https://relay.example"]);

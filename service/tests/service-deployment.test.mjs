@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { chmodSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -15,7 +15,14 @@ function fixture(t) {
   mkdirSync(protocol, { recursive: true });
   mkdirSync(wsRoot, { recursive: true });
   writeFileSync(path.join(projectRoot, "package.json"), JSON.stringify({ name: "test-service", type: "module" }));
-  for (const name of ["daemon.mjs", "shared-backend-supervisor.mjs", "app-server-runner.mjs", "imsg-transport.mjs"]) {
+  for (const name of [
+    "daemon.mjs",
+    "app-server-runner.mjs",
+    "remote-control-runner.mjs",
+    "remote-control-controller.mjs",
+    "remote-control-transport.mjs",
+    "imsg-transport.mjs",
+  ]) {
     writeFileSync(path.join(source, name), "export const ready = true;\n");
   }
   writeFileSync(path.join(protocol, "presentation.ts"), "export const ready: boolean = true;\n");
@@ -64,6 +71,8 @@ test("staging creates a content-addressed immutable bundle with its own Node run
   assert.equal(statSync(deployed.nodePath).size, statSync(run.nodeRuntime).size);
   assert.equal(lstatSync(deployed.nodePath).mode & 0o222, 0);
   assert.equal(lstatSync(deployed.daemonPath).mode & 0o222, 0);
+  assert.equal(deployed.supervisorPath, undefined);
+  assert.equal(existsSync(path.join(deployed.root, "service", "src", "shared-backend-supervisor.mjs")), false);
   assert.equal(JSON.parse(readFileSync(path.join(deployed.root, "package.json"), "utf8")).type, "module");
   assert.equal(stageServiceDeployment(run.deployments, options).changed, false);
   assert.equal(verifyServiceDeployment(deployed.root, deployed.fingerprint).fingerprint, deployed.fingerprint);

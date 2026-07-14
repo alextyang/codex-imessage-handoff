@@ -14,6 +14,11 @@ test("the distributable contains no hosted relay or hook-skill runtime", () => {
     "service/src/relay-client.mjs",
     "service/src/codex-runner.mjs",
     "service/src/local-message-guard.mjs",
+    "service/src/desktop-connection.mjs",
+    "service/src/desktop-sync.mjs",
+    "service/src/shared-backend-lease.mjs",
+    "service/src/shared-backend-policy.mjs",
+    "service/src/shared-backend-supervisor.mjs",
   ]) {
     assert.equal(existsSync(path.join(repo, relative)), false, `${relative} must not ship`);
   }
@@ -22,6 +27,7 @@ test("the distributable contains no hosted relay or hook-skill runtime", () => {
 test("runtime entry points expose only the authenticated local helper", () => {
   const daemon = readFileSync(path.join(repo, "service/src/daemon.mjs"), "utf8");
   const cli = readFileSync(path.join(repo, "bin/imessage-handoff.mjs"), "utf8");
+  const manager = readFileSync(path.join(repo, "service/src/service-manager.mjs"), "utf8");
   const workspace = readFileSync(path.join(repo, "pnpm-workspace.yaml"), "utf8");
   const forbidden = [
     "RelayClient",
@@ -36,5 +42,27 @@ test("runtime entry points expose only the authenticated local helper", () => {
   }
   assert.equal(workspace.includes('"relay"'), false);
   assert.match(daemon, /new ImsgTransport\(\{ profile: config\.imsg/);
-  assert.match(daemon, /requires the supervised shared Codex app-server/);
+  assert.doesNotMatch(cli, /desktop-sync|sharedBackendSupervisor|inspectDesktopSharedConnection/);
+  assert.doesNotMatch(manager, /installSharedBackendSupervisor|requestSharedBackendActivation|inspectDesktopSharedConnection/);
+  assert.match(manager, /<string>\/usr\/bin\/env<\/string><string>-u<\/string><string>\$\{retiredLocalDaemonEnvironment\}<\/string>/);
+  assert.doesNotMatch(manager, /<key>\$\{retiredLocalDaemonEnvironment\}<\/key>/);
+});
+
+test("the main service can only reach Codex through an injected Remote Control stream", () => {
+  const daemon = readFileSync(path.join(repo, "service/src/daemon.mjs"), "utf8");
+  const manager = readFileSync(path.join(repo, "service/src/service-manager.mjs"), "utf8");
+  const deployment = readFileSync(path.join(repo, "service/src/service-deployment.mjs"), "utf8");
+  const paths = readFileSync(path.join(repo, "service/src/paths.mjs"), "utf8");
+  const protocolClient = readFileSync(path.join(repo, "service/src/app-server-runner.mjs"), "utf8");
+
+  assert.match(daemon, /RemoteControlCodexRuntime/);
+  assert.doesNotMatch(daemon, /AppServerCodexRunner|SharedBackendTurnLease|inspectDesktopSharedConnection/);
+  assert.doesNotMatch(manager, /CODEX_BIN|resolveCodexBinary|installSharedBackendSupervisor|requestSharedBackendActivation/);
+  assert.match(manager, /cleanupRetiredSharedBackendArtifacts/);
+  assert.doesNotMatch(paths, /sharedBackend|desktopSync|shared-backend|desktop-sync/);
+  assert.match(deployment, /await import\('\.\/service\/src\/remote-control-runner\.mjs'\)/);
+  assert.doesNotMatch(deployment, /await import\('\.\/service\/src\/app-server-runner\.mjs'\)/);
+  assert.doesNotMatch(protocolClient, /node:child_process|node:net|from "ws"|spawnImpl|codexPath|socketPath|CODEX_APP_SERVER_SOCKET|app-server-control|\.kill\s*\(/);
+  assert.match(protocolClient, /CODEX_REMOTE_TRANSPORT_REQUIRED/);
+  assert.match(protocolClient, /this\.webSocketFactory\(\)/);
 });

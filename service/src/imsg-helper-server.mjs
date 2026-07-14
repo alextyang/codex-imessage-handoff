@@ -135,19 +135,7 @@ export function messagesAccountFingerprint(values) {
   return imsgAccountFingerprint(values);
 }
 
-export function inspectLocalImsgIdentity({ binary, run = execFileSync } = {}) {
-  if (!path.isAbsolute(clean(binary))) throw codedError("IMSG_ACCOUNT_UNAVAILABLE", "The pinned imsg binary is invalid.");
-  let output;
-  try {
-    output = run(binary, ["account", "--json"], {
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "pipe"],
-      timeout: 15_000,
-      maxBuffer: 512 * 1024,
-    });
-  } catch {
-    throw codedError("IMSG_ACCOUNT_UNAVAILABLE", "The live Messages account could not be inspected.");
-  }
+export function parseLocalImsgIdentityOutput(output) {
   if (Buffer.byteLength(String(output || ""), "utf8") > 512 * 1024) {
     throw codedError("IMSG_ACCOUNT_UNAVAILABLE", "The live Messages account inspection was too large.");
   }
@@ -163,6 +151,22 @@ export function inspectLocalImsgIdentity({ binary, run = execFileSync } = {}) {
   const accountFingerprint = messagesAccountFingerprint(identities);
   if (!accountFingerprint) throw codedError("IMSG_ACCOUNT_UNAVAILABLE", "The live Messages account identity was unavailable.");
   return { accountFingerprint, identities };
+}
+
+export function inspectLocalImsgIdentity({ binary, run = execFileSync } = {}) {
+  if (!path.isAbsolute(clean(binary))) throw codedError("IMSG_ACCOUNT_UNAVAILABLE", "The pinned imsg binary is invalid.");
+  let output;
+  try {
+    output = run(binary, ["account", "--json"], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+      timeout: 15_000,
+      maxBuffer: 512 * 1024,
+    });
+  } catch {
+    throw codedError("IMSG_ACCOUNT_UNAVAILABLE", "The live Messages account could not be inspected.");
+  }
+  return parseLocalImsgIdentityOutput(output);
 }
 
 function inside(root, candidate) {

@@ -1,16 +1,29 @@
 export class RunManager {
-  constructor({ maxConcurrent = 3, run, discard = async () => {}, onChange = () => {}, onError = () => {} } = {}) {
+  constructor({
+    maxConcurrent = 3,
+    run,
+    discard = async () => {},
+    onChange = () => {},
+    onError = () => {},
+    now = Date.now,
+    setTimeoutImpl = setTimeout,
+    clearTimeoutImpl = clearTimeout,
+  } = {}) {
     if (typeof run !== "function") throw new TypeError("run is required");
     this.maxConcurrent = Math.max(1, Math.min(8, Number(maxConcurrent) || 3));
     this.run = run;
     this.discard = discard;
     this.onChange = onChange;
     this.onError = onError;
+    this.now = now;
+    this.setTimeoutImpl = setTimeoutImpl;
+    this.clearTimeoutImpl = clearTimeoutImpl;
     this.queues = new Map();
     this.active = new Map();
     this.blockedUntil = new Map();
     this.knownReplyIds = new Set();
     this.deferTimers = new Set();
+    this.deferTimersByThread = new Map();
     this.closed = false;
     this.sequence = 0;
   }
@@ -78,8 +91,10 @@ export class RunManager {
     }
     if (queued.length) {
       this.queues.delete(id);
+      this.#clearBlock(id);
       await Promise.allSettled(queued.map(async (entry) => {
         try {
+          delete entry.deferredRetries;
           await this.discard(entry);
         } finally {
           this.knownReplyIds.delete(entry.replyId);
@@ -100,8 +115,9 @@ export class RunManager {
   shutdown({ interrupt = false } = {}) {
     if (this.closed) return { active: this.active.size, pending: [...this.queues.values()].reduce((sum, queue) => sum + queue.length, 0) };
     this.closed = true;
-    for (const timer of this.deferTimers) clearTimeout(timer);
+    for (const timer of this.deferTimers) this.clearTimeoutImpl(timer);
     this.deferTimers.clear();
+    this.deferTimersByThread.clear();
     this.blockedUntil.clear();
     if (interrupt) this.cancelAll();
     return {
@@ -113,7 +129,7 @@ export class RunManager {
   #next() {
     return [...this.queues.entries()]
       .filter(([threadId, queue]) => queue.length && !this.active.has(threadId))
-      .filter(([threadId]) => (this.blockedUntil.get(threadId) || 0) <= Date.now())
+      .filter(([threadId]) => (this.blockedUntil.get(threadId) || 0) <= this.now())
       .map(([threadId, queue]) => ({ threadId, entry: queue[0] }))
       .sort((a, b) => a.entry.sequence - b.entry.sequence)[0] || null;
   }
@@ -143,6 +159,43 @@ export class RunManager {
           if (slot.cancelRequested) cancel();
         },
         defer: (milliseconds = 15000) => { slot.deferMs = Math.max(1000, Number(milliseconds) || 15000); },
+        deferWithBackoff: (key, options = {}) => {
+          const retryKey = String(key || "").trim();
+          if (!retryKey || retryKey.length > 80) throw new TypeError("A bounded deferred-retry key is required.");
+          const initialMs = Math.max(1000, Number(options.initialMs) || 15000);
+          const maxMs = Math.max(initialMs, Number(options.maxMs) || initialMs);
+          const factor = Math.max(1, Math.min(8, Number(options.factor) || 2));
+          const prior = entry.deferredRetries?.[retryKey];
+          const priorAttempt = Number.isSafeInteger(prior?.attempt) && prior.attempt > 0
+            ? Math.min(prior.attempt, 1_000)
+            : 0;
+          const attempt = priorAttempt + 1;
+          const delayMs = Math.min(maxMs, initialMs * (factor ** Math.min(attempt - 1, 64)));
+          const retries = entry.deferredRetries && typeof entry.deferredRetries === "object"
+            && !Array.isArray(entry.deferredRetries)
+            ? entry.deferredRetries
+            : {};
+          entry.deferredRetries = {
+            ...retries,
+            [retryKey]: {
+              attempt,
+              delayMs,
+              deferredAt: new Date(this.now()).toISOString(),
+            },
+          };
+          slot.deferMs = delayMs;
+          return { attempt, delayMs };
+        },
+        resetDeferBackoff: (key = null) => {
+          if (key == null) {
+            delete entry.deferredRetries;
+            return;
+          }
+          const retryKey = String(key || "").trim();
+          if (!retryKey || !entry.deferredRetries || typeof entry.deferredRetries !== "object") return;
+          delete entry.deferredRetries[retryKey];
+          if (Object.keys(entry.deferredRetries).length === 0) delete entry.deferredRetries;
+        },
       };
       Promise.resolve()
         .then(() => this.run(entry, context))
@@ -156,7 +209,8 @@ export class RunManager {
             return;
           }
           if (slot.cancelRequested) {
-            this.blockedUntil.delete(next.threadId);
+            this.#clearBlock(next.threadId);
+            delete entry.deferredRetries;
             this.knownReplyIds.delete(entry.replyId);
             Promise.resolve(this.discard(entry)).catch((error) => {
               try { this.onError(error, entry); } catch {}
@@ -165,15 +219,21 @@ export class RunManager {
             const deferred = this.queues.get(next.threadId) || [];
             deferred.unshift(entry);
             this.queues.set(next.threadId, deferred);
-            this.blockedUntil.set(next.threadId, Date.now() + slot.deferMs);
-            const timer = setTimeout(() => {
+            this.#clearBlock(next.threadId);
+            this.blockedUntil.set(next.threadId, this.now() + slot.deferMs);
+            const timer = this.setTimeoutImpl(() => {
               this.deferTimers.delete(timer);
+              if (this.deferTimersByThread.get(next.threadId) === timer) {
+                this.deferTimersByThread.delete(next.threadId);
+              }
               this.blockedUntil.delete(next.threadId);
               this.#drain();
             }, slot.deferMs);
             this.deferTimers.add(timer);
+            this.deferTimersByThread.set(next.threadId, timer);
             timer.unref?.();
           } else {
+            delete entry.deferredRetries;
             this.knownReplyIds.delete(entry.replyId);
           }
           this.#changed();
@@ -184,5 +244,15 @@ export class RunManager {
 
   #changed() {
     try { this.onChange(this.states()); } catch {}
+  }
+
+  #clearBlock(threadId) {
+    const timer = this.deferTimersByThread.get(threadId);
+    if (timer) {
+      this.clearTimeoutImpl(timer);
+      this.deferTimers.delete(timer);
+      this.deferTimersByThread.delete(threadId);
+    }
+    this.blockedUntil.delete(threadId);
   }
 }

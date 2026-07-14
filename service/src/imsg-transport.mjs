@@ -1101,6 +1101,12 @@ export class ImsgTransport {
     if (!this.richCapabilities().polls) {
       return { sent: false, status: "UNSUPPORTED", terminal: false, parts: 0, guids: [], attempted: false };
     }
+    const threadId = clean(options.threadId);
+    const replyToGuid = clean(options.replyToGuid)
+      || (threadId ? clean(this.router.nativeThread(threadId)?.rootGuid) : "");
+    if (threadId && (!replyToGuid || !this.richCapabilities().replies)) {
+      return { sent: false, status: "NO_REPLY_CONTEXT", terminal: false, parts: 0, guids: [], attempted: false };
+    }
     const plan = pollPlan(question, choices);
     const { chunks, questions } = plan;
     if (!chunks.length) {
@@ -1119,6 +1125,7 @@ export class ImsgTransport {
         question: pollQuestion,
         options: chunk.map((choice) => choice.label),
         send_caption: false,
+        ...(replyToGuid ? { reply_to: replyToGuid } : {}),
       }, { operationId: outboundOperationId(this.profile.chatGuid, `${operationScope}:part:${index}`) });
       const normalized = resultStatus(sent);
       if (!normalized.sent) {
@@ -1133,6 +1140,7 @@ export class ImsgTransport {
         return { sent: false, status: "POLL_OPTIONS_MISSING", terminal: false, parts: guids.length, guids, attempted: true };
       }
       guids.push(normalized.guid);
+      if (threadId) this.router.routeOutboundGuid(normalized.guid, threadId);
       this.router.registerPoll(normalized.guid, mapping, {
         allowAddedChoiceSearch: options.allowAddedChoiceSearch !== false,
         addChoiceCommand: clean(options.addChoiceCommand),
@@ -1187,6 +1195,8 @@ export class ImsgTransport {
       addedChoiceAction: options.addedChoiceAction,
       refreshAction: options.refreshAction,
       operationScope: clean(options.operationScope),
+      threadId: clean(options.threadId),
+      replyToGuid: clean(options.replyToGuid),
     }));
   }
 

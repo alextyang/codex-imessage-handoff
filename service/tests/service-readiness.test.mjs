@@ -130,3 +130,44 @@ test("readiness degrades while the authenticated watch is down and recovers with
   assert.equal(status.readiness.status, "ready");
   assert.equal(status.readiness.health.activeWatch, true);
 });
+
+test("Remote Control degradation is exposed separately and never blocks local Messages readiness", () => {
+  const state = harness({ healthCheck: true });
+  let remoteControl = {
+    status: "degraded",
+    available: false,
+    hostStatus: "offline",
+    code: "CODEX_HOST_OFFLINE",
+  };
+  state.lease.markStarting();
+  state.lease.setCapabilityCheck(() => ({ remoteControl }));
+  state.lease.markReady();
+
+  let status = inspectServiceLaunchdReadiness(launchd(4242), state.file, { now: state.now() });
+  assert.equal(status.running, true, "an offline Codex host must not stop the Messages receiver");
+  assert.equal(status.readiness.status, "ready");
+  assert.equal(status.readiness.healthHealthy, true);
+  assert.deepEqual(status.readiness.capabilities.remoteControl, remoteControl);
+
+  remoteControl = {
+    status: "available",
+    available: true,
+    hostStatus: "online",
+    code: null,
+  };
+  assert.equal(state.lease.refreshCapabilities(), true);
+  status = inspectServiceLaunchdReadiness(launchd(4242), state.file, { now: state.now() });
+  assert.equal(status.running, true);
+  assert.equal(status.readiness.capabilities.remoteControl.status, "available");
+});
+
+test("a failing optional capability check cannot make the core service unhealthy", () => {
+  const state = harness({ healthCheck: true });
+  state.lease.markStarting();
+  state.lease.setCapabilityCheck(() => { throw new Error("diagnostic failed"); });
+  state.lease.markReady();
+
+  const status = inspectServiceLaunchdReadiness(launchd(4242), state.file, { now: state.now() });
+  assert.equal(status.running, true);
+  assert.equal(status.readiness.capabilities.error, "CAPABILITY_CHECK_FAILED");
+});

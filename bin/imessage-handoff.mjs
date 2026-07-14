@@ -1,12 +1,18 @@
 #!/usr/bin/env node
 import { execFileSync, spawn } from "node:child_process";
+import { existsSync } from "node:fs";
 import { configureImsg, readConfig, transportStatus } from "../service/src/config.mjs";
-import { disableSharedBackendActivation, installService, installSharedBackendSupervisor, requestSharedBackendActivation, serviceStatus, sharedBackendSupervisorStatus, stopService, uninstallService, uninstallSharedBackendSupervisor } from "../service/src/service-manager.mjs";
-import { loadClaimedJobs } from "../service/src/claimed-store.mjs";
-import { inspectDesktopSharedConnection } from "../service/src/desktop-connection.mjs";
+import { installService, rotateServiceProcess, serviceStatus, stopService, uninstallService } from "../service/src/service-manager.mjs";
 import { createImsgIpcClientFromConfig } from "../service/src/imsg-ipc-client.mjs";
 import { finishSplitUserHelper } from "../service/src/split-user-controller.mjs";
 import { requestHelperAccountHardening } from "../service/scripts/harden-split-user-helper.mjs";
+import {
+  RemoteControlController,
+  normalizeManualPairingCode,
+} from "../service/src/remote-control-controller.mjs";
+import { ensureRemoteControlKeyHelper } from "../service/src/remote-control-key-helper.mjs";
+import { authorizeRemoteControlAndActivate } from "../service/src/remote-control-setup.mjs";
+import { servicePaths } from "../service/src/paths.mjs";
 
 function arg(name) {
   const prefix = `--${name}=`;
@@ -16,6 +22,32 @@ function arg(name) {
 
 function print(value) {
   process.stdout.write(`${JSON.stringify(value, null, 2)}\n`);
+}
+
+async function requireRemoteControlAuthorization({ requirePaired = false } = {}) {
+  ensureRemoteControlKeyHelper();
+  const status = await new RemoteControlController().status({ network: requirePaired });
+  if (status.enrolled !== true) {
+    const code = typeof status.code === "string" ? status.code : "CODEX_REMOTE_ENROLLMENT_REQUIRED";
+    throw Object.assign(
+      new Error(`Codex Remote Control is not authorized (${code}). Run \`imessage-handoff remote-control authorize\` first.`),
+      { code },
+    );
+  }
+  if (requirePaired && status.paired !== true) {
+    const code = typeof status.code === "string" ? status.code : "CODEX_REMOTE_PAIRING_REQUIRED";
+    throw Object.assign(
+      new Error(`Codex Remote Control is not paired (${code}). Get a code from Codex Desktop and run \`imessage-handoff remote-control pair <code>\`.`),
+      { code },
+    );
+  }
+  return status;
+}
+
+function hasVerifiedHelperConfig() {
+  if (!existsSync(servicePaths().config)) return false;
+  readConfig();
+  return true;
 }
 
 function dedicatedHelperUser() {
@@ -119,18 +151,14 @@ async function handleTransport(action) {
     return;
   }
   if (action === "finish-helper") {
-    const desktop = inspectDesktopSharedConnection();
-    const supervisor = sharedBackendSupervisorStatus();
-    if (!desktop.shared || !supervisor.running || !supervisor.healthy || !supervisor.activationReady) {
-      throw new Error("Codex Desktop must be connected to the healthy supervised shared app-server before enabling the split-user Messages helper.");
-    }
+    await requireRemoteControlAuthorization({ requirePaired: true });
     const finished = await finishSplitUserHelper({ dedicatedUser: dedicatedHelperUser() });
     const config = configureImsg({
       mode: "helper",
       clientConfig: finished.clientConfigPath,
       ...finished.profile,
     });
-    const installed = installService({ codexBackend: "app-server" });
+    installService();
     const runtime = serviceStatus();
     print({
       ok: true,
@@ -140,7 +168,6 @@ async function handleTransport(action) {
       helperAuthenticated: true,
       advanced: finished.capabilities?.advanced === true,
       watchVerified: finished.watchVerified,
-      sharedCodexBackend: installed.codexBackend === "app-server",
       serviceReady: runtime.running,
       ...transportStatus(config),
     });
@@ -149,118 +176,65 @@ async function handleTransport(action) {
   throw new Error("Usage: imessage-handoff transport harden-helper|status|check|finish-helper [--helper-user=codex]");
 }
 
-function requireIdleMessagingService() {
-  const active = loadClaimedJobs().filter((job) => job.state === "running" || job.state === "delivering");
-  if (active.length) throw new Error("The iMessage service still has active work. Wait for it to finish before switching the Codex Desktop backend.");
-}
-
-async function handleDesktopSync(action) {
+async function handleRemoteControl(action, actionArgument = "") {
+  ensureRemoteControlKeyHelper();
+  const controller = new RemoteControlController();
   if (action === "status") {
-    const supervisor = sharedBackendSupervisorStatus();
+    print({ ok: true, remoteControl: await controller.status({ network: true }) });
+    return;
+  }
+  if (action === "authorize") {
+    const { result, status, paired, configured, installed } = await authorizeRemoteControlAndActivate({
+      controller,
+      hasVerifiedHelperConfig,
+      installService,
+      rotateServiceProcess,
+    });
     print({
       ok: true,
-      prepared: supervisor.healthy,
-      daemonRunning: supervisor.healthy,
-      proxyReady: supervisor.healthy,
-      activation: {
-        requested: supervisor.config?.activationRequested === true,
-        enabled: supervisor.activationEnabled,
-        owned: supervisor.activationOwned,
-        conflict: supervisor.activationConflict,
-        ready: supervisor.activationReady,
-        failOpenLatched: supervisor.config?.failOpenLatched === true,
+      remoteControl: {
+        authorized: true,
+        changed: result.changed,
+        paired,
+        pairingRequired: !paired,
+        ...(paired || !status.code ? {} : { code: status.code }),
       },
-      service: serviceStatus(),
-      supervisor,
-      desktop: inspectDesktopSharedConnection(),
+      service: installed
+        ? { installed: installed.installed, changed: installed.changed }
+        : {
+          installed: false,
+          changed: false,
+          ...(paired && !configured ? { configurationRequired: true } : { pairingRequired: true }),
+        },
     });
     return;
   }
-  if (action === "prepare") {
-    const installed = installSharedBackendSupervisor();
-    const supervisor = sharedBackendSupervisorStatus();
-    if (!supervisor.running || !supervisor.healthy) {
-      throw new Error("The shared app-server supervisor did not become healthy; Codex Desktop was left on its current backend.");
-    }
+  if (action === "pair") {
+    const pairingCode = normalizeManualPairingCode(actionArgument);
+    const result = await controller.pairEnvironment(pairingCode);
+    const installed = hasVerifiedHelperConfig()
+      ? installService({ forceRestart: true })
+      : null;
     print({
       ok: true,
-      prepared: true,
-      daemonRunning: true,
-      proxyReady: true,
-      desktopChanged: false,
-      serviceChanged: false,
-      supervisor: { ...installed, status: supervisor },
-      next: "Run `desktop-sync activate` after current iMessage work is idle.",
+      remoteControl: result,
+      service: installed
+        ? { installed: installed.installed, changed: installed.changed }
+        : { installed: false, changed: false, configurationRequired: true },
     });
     return;
   }
-  if (action === "activate") {
-    requireIdleMessagingService();
-    const supervisor = sharedBackendSupervisorStatus();
-    if (!supervisor.running || !supervisor.healthy) {
-      throw new Error("The shared app-server supervisor is not healthy. Run `desktop-sync prepare` and try again.");
-    }
+  if (action === "deauthorize") {
     const stopped = stopService();
-    try {
-      requestSharedBackendActivation();
-      let activated = sharedBackendSupervisorStatus();
-      for (let attempt = 0; attempt < 90; attempt += 1) {
-        if (activated.running && activated.healthy && activated.activationReady) break;
-        await new Promise((resolve) => setTimeout(resolve, 500));
-        activated = sharedBackendSupervisorStatus();
-      }
-      if (!activated.activationReady) {
-        disableSharedBackendActivation("activation-timeout");
-        throw new Error("Shared mode did not pass its activation soak.");
-      }
-      print({ ok: true, enabled: true, supervised: true, ...stopped, supervisor: activated, next: "Quit and reopen Codex Desktop once, then run `desktop-sync finish`." });
-    } catch (error) {
-      disableSharedBackendActivation("activation-failed");
-      throw error;
-    }
-    return;
-  }
-  if (action === "finish") {
-    requireIdleMessagingService();
-    const desktop = inspectDesktopSharedConnection();
-    if (!desktop.shared) throw new Error("Codex Desktop is not connected to the managed shared server yet. Quit and reopen Codex, then try again.");
-    const supervisor = sharedBackendSupervisorStatus();
-    if (
-      !supervisor.running
-      || !supervisor.healthy
-      || !supervisor.activationReady
-    ) {
-      throw new Error("The shared app-server supervisor is not healthy; the iMessage service remains stopped.");
-    }
-    const installed = installService({ codexBackend: "app-server" });
-    print({ ok: true, active: true, supervised: true, ...installed, desktop: { shared: true, pid: desktop.desktopPid }, supervisor });
-    return;
-  }
-  if (action === "rollback") {
-    requireIdleMessagingService();
-    const stopped = uninstallService();
-    const rollback = disableSharedBackendActivation("rollback");
+    const result = await controller.deauthorize();
     print({
       ok: true,
-      ...stopped,
-      rollback,
-      desktopRestartRequired: true,
-      next: "Quit and reopen Codex Desktop, then run `desktop-sync finish-rollback`.",
+      remoteControl: result,
+      service: { ...stopped, installed: false },
     });
     return;
   }
-  if (action === "finish-rollback") {
-    requireIdleMessagingService();
-    const desktop = inspectDesktopSharedConnection();
-    if (!desktop.desktopRunning || !desktop.stdioHandshake || !desktop.privateAppServerChild) {
-      throw new Error("Codex Desktop is not verified back on its private stdio server yet. Quit and reopen Codex, then try again.");
-    }
-    const supervisor = uninstallSharedBackendSupervisor();
-    const service = uninstallService();
-    print({ ok: true, service, supervisor, desktop: { shared: false, pid: desktop.desktopPid }, rollbackComplete: true });
-    return;
-  }
-  throw new Error("Usage: imessage-handoff desktop-sync prepare|status|activate|finish|rollback|finish-rollback");
+  throw new Error("Usage: imessage-handoff remote-control authorize|pair <8-character-code>|status|deauthorize");
 }
 
 async function main() {
@@ -271,13 +245,14 @@ async function main() {
     await handleTransport(process.argv[3] || "status");
     return;
   }
-  if (first === "desktop-sync") {
-    await handleDesktopSync(process.argv[3] || "status");
+  if (first === "remote-control") {
+    await handleRemoteControl(process.argv[3] || "status", process.argv[4] || "");
     return;
   }
   const action = first === "service" ? process.argv[3] || "status" : first;
   if (action === "install" || action === "start") {
     readConfig();
+    await requireRemoteControlAuthorization();
     const installed = installService();
     print({ ok: true, ...installed, healthy: true });
     return;
@@ -287,6 +262,8 @@ async function main() {
     return;
   }
   if (action === "restart") {
+    readConfig();
+    await requireRemoteControlAuthorization();
     const installed = installService({ forceRestart: true });
     print({ ok: true, ...installed, healthy: true });
     return;
@@ -306,7 +283,7 @@ async function main() {
     child.on("exit", (code) => process.exit(code ?? 0));
     return;
   }
-  throw new Error("Usage: imessage-handoff [service] install|start|stop|restart|status|pause|run|uninstall | desktop-sync prepare|status|activate|finish|rollback|finish-rollback | transport harden-helper|status|check|finish-helper");
+  throw new Error("Usage: imessage-handoff [service] install|start|stop|restart|status|pause|run|uninstall | remote-control authorize|pair <8-character-code>|status|deauthorize | transport harden-helper|status|check|finish-helper");
 }
 
 main().catch((error) => {

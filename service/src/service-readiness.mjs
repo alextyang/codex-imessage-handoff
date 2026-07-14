@@ -43,6 +43,7 @@ export function inspectServiceLaunchdReadiness(output, file, options = {}) {
   const staleAfterMs = options.staleAfterMs ?? SERVICE_READINESS_STALE_AFTER_MS;
   const launchdOutput = String(output || "");
   const pid = Number(launchdOutput.match(/\bpid = (\d+)/)?.[1] || 0) || null;
+  const jobLoaded = launchdOutput.trim().length > 0;
   const jobRunning = /\bstate = running\b/.test(launchdOutput);
   const state = readState(file);
   const statePid = Number(state?.pid || 0) || null;
@@ -63,6 +64,7 @@ export function inspectServiceLaunchdReadiness(output, file, options = {}) {
     && healthHealthy;
   return {
     running: ready,
+    jobLoaded,
     jobRunning,
     pid,
     readiness: {
@@ -73,6 +75,7 @@ export function inspectServiceLaunchdReadiness(output, file, options = {}) {
       fresh,
       healthHealthy,
       health: state?.health && typeof state.health === "object" ? state.health : null,
+      capabilities: state?.capabilities && typeof state.capabilities === "object" ? state.capabilities : null,
       heartbeatAt: typeof state?.heartbeatAt === "string" ? state.heartbeatAt : null,
       readyAt: typeof state?.readyAt === "string" ? state.readyAt : null,
     },
@@ -94,6 +97,7 @@ export class ServiceReadiness {
     this.setIntervalImpl = options.setIntervalImpl ?? setInterval;
     this.clearIntervalImpl = options.clearIntervalImpl ?? clearInterval;
     this.healthCheck = typeof options.healthCheck === "function" ? options.healthCheck : null;
+    this.capabilityCheck = typeof options.capabilityCheck === "function" ? options.capabilityCheck : null;
     this.timer = null;
     this.value = null;
   }
@@ -110,6 +114,7 @@ export class ServiceReadiness {
       readyAt: null,
       heartbeatAt: null,
       health: { healthy: false, checkedAt: startedAt },
+      capabilities: this.#checkCapabilities(startedAt),
     };
     writeState(this.file, this.value);
     return this.value;
@@ -122,7 +127,8 @@ export class ServiceReadiness {
     const readyAt = timestamp(this.now);
     const health = this.#checkHealth(readyAt);
     if (!health.healthy) throw new Error("Service readiness requires a healthy active transport watch.");
-    this.value = { ...this.value, status: "ready", readyAt, heartbeatAt: readyAt, health };
+    const capabilities = this.#checkCapabilities(readyAt);
+    this.value = { ...this.value, status: "ready", readyAt, heartbeatAt: readyAt, health, capabilities };
     writeState(this.file, this.value);
     this.timer = this.setIntervalImpl(() => this.heartbeat(), this.intervalMs);
     this.timer?.unref?.();
@@ -137,12 +143,14 @@ export class ServiceReadiness {
     }
     const heartbeatAt = timestamp(this.now);
     const health = this.#checkHealth(heartbeatAt);
+    const capabilities = this.#checkCapabilities(heartbeatAt);
     const recovered = this.value.status === "degraded" && health.healthy;
     this.value = {
       ...this.value,
       status: health.healthy ? "ready" : "degraded",
       heartbeatAt,
       health,
+      capabilities,
       ...(recovered ? { recoveredAt: heartbeatAt } : {}),
     };
     writeState(this.file, this.value);
@@ -153,6 +161,21 @@ export class ServiceReadiness {
     this.healthCheck = typeof check === "function" ? check : null;
     if (this.value && ["ready", "degraded"].includes(this.value.status)) this.heartbeat();
     return this;
+  }
+
+  setCapabilityCheck(check) {
+    this.capabilityCheck = typeof check === "function" ? check : null;
+    if (this.value && ["ready", "degraded"].includes(this.value.status)) this.heartbeat();
+    else this.refreshCapabilities();
+    return this;
+  }
+
+  refreshCapabilities() {
+    if (!this.value || !this.#ownsState()) return false;
+    const checkedAt = timestamp(this.now);
+    this.value = { ...this.value, capabilities: this.#checkCapabilities(checkedAt) };
+    writeState(this.file, this.value);
+    return true;
   }
 
   markStopped() {
@@ -182,6 +205,21 @@ export class ServiceReadiness {
       return { healthy: result === true, checkedAt };
     } catch {
       return { healthy: false, checkedAt };
+    }
+  }
+
+  #checkCapabilities(checkedAt = timestamp(this.now)) {
+    if (!this.capabilityCheck) return null;
+    try {
+      const result = this.capabilityCheck();
+      if (!result || typeof result !== "object" || Array.isArray(result)) {
+        return { checkedAt, error: "CAPABILITY_CHECK_INVALID" };
+      }
+      return { ...result, checkedAt };
+    } catch {
+      // Capability inspection can never make the core Messages service fail
+      // readiness. It is surfaced independently for diagnostics instead.
+      return { checkedAt, error: "CAPABILITY_CHECK_FAILED" };
     }
   }
 

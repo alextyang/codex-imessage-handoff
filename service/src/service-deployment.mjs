@@ -196,7 +196,6 @@ export function verifyServiceDeployment(root, expectedFingerprint = "") {
     fingerprint: manifest.fingerprint,
     nodePath: path.join(resolved, "runtime", "node"),
     daemonPath: path.join(resolved, "service", "src", "daemon.mjs"),
-    supervisorPath: path.join(resolved, "service", "src", "shared-backend-supervisor.mjs"),
     manifest,
   };
 }
@@ -216,7 +215,7 @@ function preflightDeployment(root, nodePath, options = {}) {
     "--experimental-strip-types",
     "--input-type=module",
     "-e",
-    "await import('./service/src/app-server-runner.mjs'); await import('./service/src/imsg-transport.mjs');",
+    "await import('./service/src/remote-control-runner.mjs'); await import('./service/src/remote-control-controller.mjs'); await import('./service/src/remote-control-transport.mjs'); await import('./service/src/imsg-transport.mjs');",
   ], {
     cwd: root,
     encoding: "utf8",

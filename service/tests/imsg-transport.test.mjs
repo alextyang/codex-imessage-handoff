@@ -1804,6 +1804,138 @@ test("generic action pickers persist new-task flows, refresh actions, and Add Ch
   });
 });
 
+test("task-scoped action pickers stay in the native reply thread and preserve response correlation", async () => {
+  const { transport, client } = fixture();
+  await transport.probe();
+  transport.router.setThreadRoot(THREAD.id, "native-root-guid");
+
+  const result = await transport.sendActionPicker("Codex needs your approval", [
+    {
+      label: "Allow once",
+      action: {
+        kind: "control",
+        command: "respond",
+        threadId: THREAD.id,
+        argument: "allow-token",
+      },
+    },
+    {
+      label: "Deny",
+      action: {
+        kind: "control",
+        command: "respond",
+        threadId: THREAD.id,
+        argument: "deny-token",
+      },
+    },
+  ], {
+    threadId: THREAD.id,
+    operationScope: "server-request:approval-a",
+    allowAddedChoiceSearch: true,
+    addedChoiceAction: {
+      kind: "control",
+      command: "respond",
+      threadId: THREAD.id,
+      commandArgument: "other-token",
+    },
+  });
+
+  assert.equal(result.sent, true);
+  assert.equal(result.parts, 1);
+  const pollGuid = result.guids[0];
+  const pollCall = client.calls.find(([kind]) => kind === "poll");
+  assert.equal(pollCall[1].reply_to, "native-root-guid");
+  assert.equal(transport.router.nativeThread(THREAD.id).rootGuid, "native-root-guid");
+  assert.equal(transport.router.nativeThread(THREAD.id).latestGuid, pollGuid);
+
+  const selected = transport.router.ingest({
+    id: 7_510,
+    guid: "approval-vote",
+    created_at: "2026-07-12T12:00:01.000Z",
+    poll: { kind: "vote", original_guid: pollGuid, vote: { option_id: "option-0" } },
+  });
+  assert.deepEqual({
+    kind: selected.kind,
+    command: selected.command,
+    threadId: selected.threadId,
+    argument: selected.argument,
+  }, {
+    kind: "control",
+    command: "respond",
+    threadId: THREAD.id,
+    argument: "allow-token",
+  });
+  transport.router.acknowledge(selected.messageKey);
+
+  const added = transport.router.ingest({
+    id: 7_511,
+    guid: "approval-other",
+    created_at: "2026-07-12T12:00:02.000Z",
+    poll: {
+      kind: "created",
+      original_guid: pollGuid,
+      options_diff: [{ option_id: "approval-other-option", text: "Only for this file" }],
+    },
+  });
+  assert.deepEqual({
+    kind: added.kind,
+    command: added.command,
+    threadId: added.threadId,
+    argument: added.argument,
+    commandArgument: added.commandArgument,
+  }, {
+    kind: "control",
+    command: "respond",
+    threadId: THREAD.id,
+    argument: "Only for this file",
+    commandArgument: "other-token",
+  });
+  transport.router.acknowledge(added.messageKey);
+
+  const reply = transport.router.ingest({
+    id: 7_512,
+    guid: "approval-poll-reply",
+    reply_to_guid: pollGuid,
+    thread_originator_guid: "native-root-guid",
+    text: "Continue in this task",
+    created_at: "2026-07-12T12:00:03.000Z",
+  });
+  assert.deepEqual({ kind: reply.kind, threadId: reply.threadId, body: reply.body }, {
+    kind: "prompt",
+    threadId: THREAD.id,
+    body: "Continue in this task",
+  });
+});
+
+test("task-scoped action pickers fail closed when their native reply root is missing", async () => {
+  const { transport, client } = fixture();
+  await transport.probe();
+
+  const result = await transport.sendActionPicker("Codex needs your approval", [
+    {
+      label: "Allow once",
+      action: { kind: "control", command: "respond", threadId: THREAD.id, argument: "allow-token" },
+    },
+    {
+      label: "Deny",
+      action: { kind: "control", command: "respond", threadId: THREAD.id, argument: "deny-token" },
+    },
+  ], {
+    threadId: THREAD.id,
+    operationScope: "server-request:approval-without-root",
+  });
+
+  assert.deepEqual(result, {
+    sent: false,
+    status: "NO_REPLY_CONTEXT",
+    terminal: false,
+    parts: 0,
+    guids: [],
+    attempted: false,
+  });
+  assert.equal(client.calls.some(([kind]) => kind === "poll"), false);
+});
+
 test("task picker votes and Add Choice searches preserve the original command argument", async () => {
   const { transport } = fixture();
   await transport.probe();

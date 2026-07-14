@@ -4,6 +4,34 @@ import { RunManager } from "../src/run-manager.mjs";
 
 const tick = () => new Promise((resolve) => setImmediate(resolve));
 
+function fakeClock() {
+  let now = Date.parse("2026-07-14T12:00:00.000Z");
+  let sequence = 0;
+  const timers = new Set();
+  return {
+    now: () => now,
+    setTimeoutImpl(callback, delay) {
+      const timer = { callback, at: now + delay, sequence: sequence++, unref() {} };
+      timers.add(timer);
+      return timer;
+    },
+    clearTimeoutImpl(timer) { timers.delete(timer); },
+    advance(milliseconds) {
+      const target = now + milliseconds;
+      while (true) {
+        const next = [...timers]
+          .filter((timer) => timer.at <= target)
+          .sort((a, b) => a.at - b.at || a.sequence - b.sequence)[0];
+        if (!next) break;
+        timers.delete(next);
+        now = next.at;
+        next.callback();
+      }
+      now = target;
+    },
+  };
+}
+
 test("runs different threads concurrently and queues each thread in order", async () => {
   const releases = new Map();
   const started = [];
@@ -136,4 +164,134 @@ test("service shutdown detaches without interrupting or discarding active iMessa
   await tick();
   assert.deepEqual(started, ["active-1"], "shutdown must not start another queued turn");
   assert.deepEqual(discarded, []);
+});
+
+test("deferred retries use durable exponential backoff without admitting a duplicate turn", async () => {
+  const clock = fakeClock();
+  const retries = [];
+  const entries = [];
+  let starts = 0;
+  let active = 0;
+  let maxActive = 0;
+  const manager = new RunManager({
+    now: clock.now,
+    setTimeoutImpl: clock.setTimeoutImpl,
+    clearTimeoutImpl: clock.clearTimeoutImpl,
+    run: async (event, context) => {
+      starts += 1;
+      active += 1;
+      maxActive = Math.max(maxActive, active);
+      entries.push(event);
+      if (starts <= 3) {
+        retries.push(context.deferWithBackoff("codex-availability", {
+          initialMs: 1_000,
+          maxMs: 4_000,
+        }));
+      }
+      active -= 1;
+    },
+  });
+
+  assert.equal(manager.enqueue({ threadId: "task", replyId: "reply-1" }), true);
+  await tick();
+  await tick();
+  assert.deepEqual(retries, [{ attempt: 1, delayMs: 1_000 }]);
+  assert.equal(manager.has("reply-1"), true);
+  assert.equal(manager.enqueue({ threadId: "task", replyId: "reply-1" }), false);
+
+  clock.advance(999);
+  await tick();
+  assert.equal(starts, 1);
+  clock.advance(1);
+  await tick();
+  await tick();
+  assert.deepEqual(retries.at(-1), { attempt: 2, delayMs: 2_000 });
+
+  clock.advance(2_000);
+  await tick();
+  await tick();
+  assert.deepEqual(retries.at(-1), { attempt: 3, delayMs: 4_000 });
+
+  clock.advance(4_000);
+  await tick();
+  await tick();
+  assert.equal(starts, 4);
+  assert.equal(manager.has("reply-1"), false);
+  assert.equal(maxActive, 1);
+  assert.equal(new Set(entries).size, 1, "every retry must reuse the same admitted entry");
+  assert.equal("deferredRetries" in entries[0], false, "completion resets the backoff state");
+});
+
+test("restored deferred-retry attempts retain their cap and can be reset after Codex succeeds", async () => {
+  const clock = fakeClock();
+  const observed = [];
+  let starts = 0;
+  const manager = new RunManager({
+    now: clock.now,
+    setTimeoutImpl: clock.setTimeoutImpl,
+    clearTimeoutImpl: clock.clearTimeoutImpl,
+    run: async (event, context) => {
+      starts += 1;
+      if (starts === 1) {
+        observed.push(context.deferWithBackoff("codex-pairing", {
+          initialMs: 120_000,
+          maxMs: 480_000,
+        }));
+        return;
+      }
+      context.resetDeferBackoff();
+      observed.push(context.deferWithBackoff("delivery-after-success", {
+        initialMs: 1_000,
+        maxMs: 8_000,
+      }));
+    },
+  });
+  manager.enqueue({
+    threadId: "task",
+    replyId: "reply-restored",
+    deferredRetries: {
+      "codex-pairing": { attempt: 3, delayMs: 480_000 },
+    },
+  });
+  await tick();
+  await tick();
+  assert.deepEqual(observed[0], { attempt: 4, delayMs: 480_000 });
+
+  clock.advance(480_000);
+  await tick();
+  await tick();
+  assert.deepEqual(observed[1], { attempt: 1, delayMs: 1_000 });
+  manager.shutdown();
+});
+
+test("cancelling a deferred retry removes its long block from later messages", async () => {
+  const clock = fakeClock();
+  const started = [];
+  const discarded = [];
+  const manager = new RunManager({
+    now: clock.now,
+    setTimeoutImpl: clock.setTimeoutImpl,
+    clearTimeoutImpl: clock.clearTimeoutImpl,
+    discard: async (event) => { discarded.push(event.replyId); },
+    run: async (event, context) => {
+      started.push(event.replyId);
+      if (event.replyId === "pairing") {
+        context.deferWithBackoff("codex-setup", {
+          initialMs: 30 * 60_000,
+          maxMs: 30 * 60_000,
+        });
+      }
+    },
+  });
+  manager.enqueue({ threadId: "task", replyId: "pairing" });
+  await tick();
+  await tick();
+  assert.equal(manager.state("task").status, "pending");
+
+  assert.deepEqual(await manager.cancel("task"), { active: false, pending: 1 });
+  assert.deepEqual(discarded, ["pairing"]);
+  assert.equal(manager.enqueue({ threadId: "task", replyId: "after-pairing" }), true);
+  await tick();
+  await tick();
+  assert.deepEqual(started, ["pairing", "after-pairing"]);
 });
