@@ -259,6 +259,10 @@ class InteractiveRemoteStream extends EventEmitter {
     } });
   }
 
+  notify(message) {
+    this.#receive(message);
+  }
+
   disconnect() {
     this.readyState = 3;
     this.emit("close");
@@ -392,6 +396,55 @@ test("Remote Control runner preserves input and streams safe output", async (t) 
   assert.deepEqual(images, [image]);
   assert.deepEqual(result, { status: "completed", body: "A clean answer.\n", generatedImages: [image] });
   assert.equal(runner.isRunning(), false);
+});
+
+test("canonical thread-name notifications are bounded and scoped to the active task", async (t) => {
+  const fixture = interactiveRunner(null, { completeOnResponse: false });
+  t.after(() => fixture.client.close());
+  const updates = [];
+  const run = fixture.runner.run({
+    thread: { id: "thread-1", cwd: "/tmp" },
+    prompt: "Keep the canonical sidebar name synchronized.",
+    onThreadNameUpdated: (threadName, context) => {
+      updates.push({ threadName, context });
+      throw new Error("presentation callback failures stay isolated");
+    },
+  });
+
+  await waitFor(() => fixture.socket()?.sent.some((message) => message.method === "turn/start"));
+  fixture.socket().notify({
+    method: "thread/name/updated",
+    params: { threadId: "foreign-thread", threadName: "Foreign task" },
+  });
+  fixture.socket().notify({
+    method: "thread/name/updated",
+    params: { threadId: "thread-1", threadName: null },
+  });
+  fixture.socket().notify({
+    method: "thread/name/updated",
+    params: { threadId: "thread-1", threadName: " \n\t\u0000 " },
+  });
+  fixture.socket().notify({
+    method: "thread/name/updated",
+    params: {
+      threadId: "thread-1",
+      threadName: `  Canonical\n sidebar\t title ${"🧭".repeat(200)}  `,
+    },
+  });
+
+  await waitFor(() => updates.length === 1);
+  assert.deepEqual(updates[0].context, { threadId: "thread-1" });
+  assert.match(updates[0].threadName, /^Canonical sidebar title /u);
+  assert.equal([...updates[0].threadName].length, 160);
+  assert.equal(updates[0].threadName, updates[0].threadName.toWellFormed());
+  assert.doesNotMatch(updates[0].threadName, /[\u0000-\u001f\u007f]/u);
+
+  fixture.socket().complete("Named task completed.");
+  assert.deepEqual(await run, {
+    status: "completed",
+    body: "Named task completed.",
+    generatedImages: [],
+  });
 });
 
 test("Remote Control reconciles a turn by the echoed client user-message id", async (t) => {

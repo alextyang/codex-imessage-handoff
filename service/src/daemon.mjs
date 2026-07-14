@@ -23,7 +23,9 @@ import {
   RemoteControlAvailability,
   remoteControlPresenceState,
 } from "./remote-control-availability.mjs";
-import { normalizeAppServerTimestamp } from "./app-server-timestamp.mjs";
+import { normalizeCreatedThread } from "./new-thread-catalog.mjs";
+import { readSidebarTitleRecords } from "./sidebar-title-index.mjs";
+import { SidebarTitleArbiter } from "./sidebar-title-arbiter.mjs";
 import { RunManager } from "./run-manager.mjs";
 import { RolloutActivityMonitor } from "./rollout-activity-monitor.mjs";
 import { ServerRequestBroker } from "./server-request-broker.mjs";
@@ -170,6 +172,7 @@ let syncTimer = null;
 let syncChain = Promise.resolve([]);
 let settingsWarningLogged = false;
 let catalogById = new Map();
+const sidebarTitleArbiter = new SidebarTitleArbiter();
 let completionMonitoringStarted = false;
 let completionScanInFlight = null;
 let liveMirrorScanInFlight = null;
@@ -339,6 +342,15 @@ function log(message) {
 }
 
 async function sendOutbound(event, options = {}) {
+  if (event?.thread?.id) {
+    try {
+      const sidebarRecords = await readSidebarTitleRecords(paths.sessionIndex);
+      applyCanonicalThreadTitle(event.thread, sidebarRecords.get(String(event.thread.id)), { source: "index" });
+    } catch {
+      // Title refresh is presentation-only. A transient index read must not
+      // block an otherwise durable local Messages delivery.
+    }
+  }
   const action = localActionContext.getStore();
   const outboundEvent = action && !event.deliveryId && !event.completionId && !event.messageId
     ? { ...event, deliveryId: `local-action:${action.messageKey}:${action.sequence++}` }
@@ -378,6 +390,7 @@ function threadLabel(thread) {
   return {
     id: thread.id,
     title: thread.title,
+    sidebarTitle: thread.sidebarTitle || null,
     createdAt: thread.createdAt,
     projectKey: thread.projectKey,
     projectLabel: thread.projectLabel,
@@ -391,6 +404,21 @@ function threadLabel(thread) {
     muted: imsgTransport.router.isThreadMuted(thread.id),
     listening: imsgTransport.router.nativeThread(thread.id)?.listen === true,
   };
+}
+
+function applyCanonicalThreadTitle(thread, value, options = {}) {
+  if (!thread?.id) return false;
+  const id = String(thread.id);
+  const title = sidebarTitleArbiter.resolve(id, value, options);
+  if (!title) return false;
+  thread.title = title;
+  thread.sidebarTitle = title;
+  const catalogThread = catalogById.get(id);
+  if (catalogThread) {
+    catalogThread.title = title;
+    catalogThread.sidebarTitle = title;
+  }
+  return true;
 }
 
 const serverRequests = new ServerRequestBroker({
@@ -519,6 +547,10 @@ function effectiveReasoning(thread) {
 
 async function synchronizeNow() {
   const threads = await listThreads(500);
+  const sidebarRecords = await readSidebarTitleRecords(paths.sessionIndex);
+  for (const thread of threads) {
+    applyCanonicalThreadTitle(thread, sidebarRecords.get(thread.id), { source: "index" });
+  }
   catalogById = new Map(threads.map((thread) => [thread.id, thread]));
   multiLiveMirror.activateCatalog(threads, { resume: true, clearMissing: true });
   await imsgTransport.syncWorkingThreads(
@@ -831,6 +863,9 @@ async function executeReply(event, context) {
       clientUserMessageId: event.clientUserMessageId,
       reasoningEffort: event.reasoningEffort || effectiveReasoning(thread),
       onPhase: (phase) => { pendingPhase = phase; },
+      onThreadNameUpdated: (title) => {
+        applyCanonicalThreadTitle(thread, title, { source: "notification" });
+      },
       onServerRequest: (descriptor, requestContext) => serverRequests.request(descriptor, requestContext),
     });
     // A completed Remote Control RPC is proof that the capability is back.
@@ -1392,36 +1427,6 @@ async function publishNewReasoningPicker(flow) {
       code: result.status || "IMSG_PICKER_PENDING",
     });
   }
-}
-
-function titleForNewThread(prompt) {
-  const text = String(prompt || "").replace(/\s+/g, " ").trim();
-  return compactPickerText(text || "New task", 120);
-}
-
-function normalizeCreatedThread(thread, flow, prompt) {
-  const fallback = new Date().toISOString();
-  const createdAt = normalizeAppServerTimestamp(thread.createdAt, fallback);
-  const updatedAt = normalizeAppServerTimestamp(thread.updatedAt, createdAt);
-  return {
-    ...thread,
-    id: String(thread.id),
-    title: thread.title && !/^untitled/i.test(thread.title) ? thread.title : titleForNewThread(prompt),
-    cwd: flow.cwd,
-    workspaceRoot: flow.otherTask ? null : flow.cwd,
-    groupKind: flow.otherTask ? "other" : "project",
-    projectKey: flow.otherTask ? null : flow.projectKey,
-    projectLabel: flow.otherTask ? null : flow.projectLabel,
-    projectStartedAt: flow.otherTask ? null : flow.projectStartedAt || createdAt,
-    createdAt,
-    updatedAt,
-    recencyAt: normalizeAppServerTimestamp(thread.recencyAt, updatedAt),
-    activityAt: normalizeAppServerTimestamp(thread.activityAt, updatedAt),
-    stateSince: normalizeAppServerTimestamp(thread.stateSince, updatedAt),
-    state: thread.state || "idle",
-    visible: true,
-    threadSource: flow.threadSource,
-  };
 }
 
 async function finishNewThreadFlow(flow, action, promptValue = flow.prompt, attachments = []) {

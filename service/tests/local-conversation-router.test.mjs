@@ -991,7 +991,12 @@ test("persists content-free outbound receipts and GUID routes", () => {
 
 test("persists independent native roots, latest GUIDs, mute, listen, and activity", () => {
   const { router, stateFile, advance } = fixture();
-  router.routeOutboundGuid("root-a", "thread-a", { root: true, createdAt: "2026-07-12T12:00:00.000Z" });
+  router.routeOutboundGuid("root-a", "thread-a", {
+    root: true,
+    createdAt: "2026-07-12T12:00:00.000Z",
+    headerTitleFingerprint: "a".repeat(64),
+    headerRevision: 7,
+  });
   advance(1_000);
   router.routeOutboundGuid("child-a", "thread-a", { createdAt: "2026-07-12T12:00:01.000Z" });
   advance(1_000);
@@ -1002,6 +1007,8 @@ test("persists independent native roots, latest GUIDs, mute, listen, and activit
   const resumed = new LocalConversationRouter({ stateFile });
   assert.deepEqual(resumed.nativeThread("thread-a"), {
     rootGuid: "root-a",
+    headerTitleFingerprint: "a".repeat(64),
+    headerRevision: 7,
     latestGuid: "child-a",
     muted: true,
     listen: true,

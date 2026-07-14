@@ -15,6 +15,7 @@ export function servicePaths() {
     home,
     config: path.join(home, "config.json"),
     stateDb: process.env.IMESSAGE_HANDOFF_STATE_DB || path.join(codexHome(), "state_5.sqlite"),
+    sessionIndex: process.env.IMESSAGE_HANDOFF_SESSION_INDEX || path.join(codexHome(), "session_index.jsonl"),
     sessions: path.join(codexHome(), "sessions"),
     globalState: process.env.IMESSAGE_HANDOFF_GLOBAL_STATE || path.join(codexHome(), ".codex-global-state.json"),
     attachments: path.join(home, "attachments"),

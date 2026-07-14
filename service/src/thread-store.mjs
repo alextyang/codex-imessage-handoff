@@ -4,6 +4,7 @@ import { existsSync, openSync, closeSync, readSync } from "node:fs";
 import path from "node:path";
 import { promisify } from "node:util";
 import { servicePaths } from "./paths.mjs";
+import { readSidebarTitleIndex } from "./sidebar-title-index.mjs";
 import { getThreadState } from "./thread-history.mjs";
 import { readWorkspaceState } from "./workspace-state.mjs";
 
@@ -118,8 +119,9 @@ async function query(sql) {
   return queryWithRetry(database, sql);
 }
 
-function threadFromRow(row, workspaceState = readWorkspaceState()) {
+function threadFromRow(row, workspaceState = readWorkspaceState(), sidebarTitles = new Map()) {
   const id = String(row.id);
+  const sidebarTitle = sidebarTitles.get(id) || null;
   const cwd = normalizedCwd(row.cwd);
   const serviceProjectless = /^imessage-handoff:new:[a-f0-9]{32}:other$/i.test(String(row.thread_source || ""));
   const projectless = workspaceState.projectlessThreadIds.has(id) || serviceProjectless;
@@ -132,7 +134,10 @@ function threadFromRow(row, workspaceState = readWorkspaceState()) {
   const activityAt = observed.activityAt || updatedAt || recencyAt;
   return {
     id,
-    title: String(row.title || "Untitled thread").replace(/\s+/g, " ").trim().slice(0, 160),
+    // SQLite `threads.title` is the first request text in current Codex
+    // builds, not the title shown in the sidebar. Never surface it as a name.
+    title: sidebarTitle || "Untitled task",
+    sidebarTitle,
     cwd,
     workspaceRoot,
     groupKind: projectless ? "other" : "project",
@@ -245,12 +250,6 @@ function lineageMetadata(rows) {
   return { roots, ancestors };
 }
 
-function stableThreadOrder(left, right) {
-  const leftCreated = Date.parse(left.createdAt || "") || Number.MAX_SAFE_INTEGER;
-  const rightCreated = Date.parse(right.createdAt || "") || Number.MAX_SAFE_INTEGER;
-  return leftCreated - rightCreated || left.id.localeCompare(right.id);
-}
-
 function disambiguateProjectLabels(threads) {
   const byLabel = new Map();
   for (const thread of threads) {
@@ -289,27 +288,9 @@ export const threadStoreInternals = Object.freeze({
   sqliteQueryAttempts: SQLITE_QUERY_ATTEMPTS,
 });
 
-function disambiguateDisplayDuplicates(threads, roots) {
-  const groups = new Map();
-  for (const thread of threads) {
-    const key = `${thread.projectKey || "other"}\u0000${thread.title}`;
-    groups.set(key, [...(groups.get(key) || []), thread]);
-  }
-  return threads.map((thread) => {
-    const group = groups.get(`${thread.projectKey || "other"}\u0000${thread.title}`) || [];
-    if (group.length < 2) return thread;
-    const stableGroup = [...group].sort((left, right) => (
-      Number((roots.get(right.id) || right.id) === right.id) - Number((roots.get(left.id) || left.id) === left.id)
-      || stableThreadOrder(left, right)
-    ));
-    const index = stableGroup.findIndex((item) => item.id === thread.id) + 1;
-    const label = new Set(group.map((item) => roots.get(item.id) || item.id)).size === 1 ? "Fork" : "Session";
-    return { ...thread, title: `${label} ${index} · ${thread.title}`.slice(0, 160) };
-  });
-}
-
 export async function listThreads(limit = MAX_THREADS) {
-  const [lineageRows, rows, projectRows] = await Promise.all([
+  const paths = servicePaths();
+  const [lineageRows, rows, projectRows, sidebarTitles] = await Promise.all([
     query(`SELECT t.id, t.rollout_path FROM threads t`),
     query(`
     SELECT ${THREAD_COLUMNS}
@@ -320,6 +301,7 @@ export async function listThreads(limit = MAX_THREADS) {
     SELECT t.id, t.cwd, t.created_at, t.created_at_ms
     FROM threads t
     WHERE ${USER_THREAD_PREDICATE}`),
+    readSidebarTitleIndex(paths.sessionIndex),
   ]);
   const workspaceState = readWorkspaceState();
   const { roots, ancestors } = lineageMetadata(dedupeRows(lineageRows));
@@ -336,14 +318,14 @@ export async function listThreads(limit = MAX_THREADS) {
     if (!Number.isFinite(current) || startedAtMs < current) projectStartedAt.set(key, startedAt);
   }
   const threads = disambiguateProjectLabels(dedupeRows(rows)
-    .map((row) => threadFromRow(row, workspaceState))
+    .map((row) => threadFromRow(row, workspaceState, sidebarTitles))
     .map((thread) => ({
       ...thread,
       projectStartedAt: thread.projectKey ? projectStartedAt.get(thread.projectKey) || thread.createdAt : null,
       lineageRootId: roots.get(thread.id) || thread.id,
       lineageAncestorIds: ancestors.get(thread.id) || [],
     })));
-  return disambiguateDisplayDuplicates(threads, roots).slice(0, safeLimit(limit));
+  return threads.slice(0, safeLimit(limit));
 }
 
 export async function findThread(id) {
@@ -355,7 +337,9 @@ export async function findThread(id) {
     WHERE t.id = ${sqlString(canonicalId)}
       AND ${ROOT_THREAD_PREDICATE}
     LIMIT 1`);
-  return rows[0] ? threadFromRow(rows[0], readWorkspaceState()) : null;
+  if (!rows[0]) return null;
+  const sidebarTitles = await readSidebarTitleIndex(servicePaths().sessionIndex);
+  return threadFromRow(rows[0], readWorkspaceState(), sidebarTitles);
 }
 
 export async function findThreadBySource(source) {
@@ -369,5 +353,7 @@ export async function findThreadBySource(source) {
       AND ${USER_THREAD_PREDICATE}
     ORDER BY t.created_at_ms ASC, t.created_at ASC, t.id ASC
     LIMIT 1`);
-  return rows[0] ? threadFromRow(rows[0], readWorkspaceState()) : null;
+  if (!rows[0]) return null;
+  const sidebarTitles = await readSidebarTitleIndex(servicePaths().sessionIndex);
+  return threadFromRow(rows[0], readWorkspaceState(), sidebarTitles);
 }

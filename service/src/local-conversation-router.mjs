@@ -94,6 +94,8 @@ function isoString(value, fallback = null) {
 function emptyThreadState() {
   return {
     rootGuid: null,
+    headerTitleFingerprint: null,
+    headerRevision: 0,
     latestGuid: null,
     muted: false,
     listen: false,
@@ -105,6 +107,13 @@ function normalizeThreadState(value) {
   const state = emptyThreadState();
   if (!value || typeof value !== "object" || Array.isArray(value)) return state;
   state.rootGuid = cleanString(value.rootGuid, 256);
+  const headerTitleFingerprint = cleanString(value.headerTitleFingerprint, 64);
+  state.headerTitleFingerprint = /^[a-f0-9]{64}$/u.test(headerTitleFingerprint || "")
+    ? headerTitleFingerprint
+    : null;
+  state.headerRevision = Number.isSafeInteger(Number(value.headerRevision)) && Number(value.headerRevision) >= 0
+    ? Number(value.headerRevision)
+    : 0;
   state.latestGuid = cleanString(value.latestGuid, 256);
   state.muted = value.muted === true;
   state.listen = value.listen === true;
@@ -478,14 +487,29 @@ function routeGuid(state, guid, threadId) {
   return true;
 }
 
-function touchThreadState(state, threadId, at, { latestGuid = null, rootGuid = null } = {}) {
+function touchThreadState(state, threadId, at, {
+  latestGuid = null,
+  rootGuid = null,
+  headerTitleFingerprint = null,
+  headerRevision = null,
+} = {}) {
   const cleanThread = cleanString(threadId, 200);
   if (!cleanThread) return null;
   const activityAt = isoString(at, new Date().toISOString());
   const item = threadState(state, cleanThread, { create: true });
   const cleanLatest = cleanString(latestGuid, 256);
   const cleanRoot = cleanString(rootGuid, 256);
+  const cleanHeaderTitleFingerprint = cleanString(headerTitleFingerprint, 64);
   if (cleanRoot) item.rootGuid = cleanRoot;
+  if (/^[a-f0-9]{64}$/u.test(cleanHeaderTitleFingerprint || "")) {
+    item.headerTitleFingerprint = cleanHeaderTitleFingerprint;
+  }
+  if (headerRevision !== null
+    && headerRevision !== undefined
+    && Number.isSafeInteger(Number(headerRevision))
+    && Number(headerRevision) >= 0) {
+    item.headerRevision = Number(headerRevision);
+  }
   if (cleanLatest) item.latestGuid = cleanLatest;
   item.lastActivityAt = activityAt;
   state.mostRecentThreadId = cleanThread;
@@ -978,6 +1002,8 @@ export class LocalConversationRouter {
     const item = touchThreadState(this.state, cleanThread, options.createdAt || new Date(this.now()).toISOString(), {
       rootGuid,
       latestGuid: cleanGuid,
+      headerTitleFingerprint: options.headerTitleFingerprint,
+      headerRevision: options.headerRevision,
     });
     writeState(this.stateFile, this.state);
     return structuredClone(item);

@@ -57,6 +57,7 @@ test("catalog excludes subagents, groups projects, carries state, and finds IDs 
   const directory = mkdtempSync(path.join(os.tmpdir(), "imessage-thread-store-"));
   const database = path.join(directory, "state.sqlite");
   const globalState = path.join(directory, "global-state.json");
+  const sessionIndex = path.join(directory, "session_index.jsonl");
   const project = path.join(directory, "projects", "catalog-app");
   const sameNameProject = path.join(directory, "copies", "catalog-app");
   const idleRollout = path.join(directory, "idle.jsonl");
@@ -121,6 +122,14 @@ test("catalog excludes subagents, groups projects, carries state, and finds IDs 
     "projectless-thread-ids": ["projectless-a", "projectless-b"],
     "thread-workspace-root-hints": { "hinted-worktree": project },
   }));
+  writeFileSync(sessionIndex, `${[
+    ...rows.filter((row) => row.id !== "root-123").map((row) => ({ id: row.id, thread_name: row.title })),
+    { id: "root-000", thread_name: "Initial generated name", updated_at: "2026-07-12T03:00:00Z" },
+    { id: "root-000", thread_name: "Sidebar root title", updated_at: "2026-07-12T03:01:00Z" },
+    { id: "root-124", thread_name: "Sidebar older task", updated_at: "2026-07-12T03:00:00Z" },
+    { id: "fork-root", thread_name: "Codex fork", updated_at: "2026-07-12T03:00:00Z" },
+    { id: "fork-copy", thread_name: "Codex fork (2)", updated_at: "2026-07-12T03:00:00Z" },
+  ].map((record) => JSON.stringify(record)).join("\n")}\n`);
 
   const statements = [
     `CREATE TABLE threads (
@@ -157,18 +166,23 @@ test("catalog excludes subagents, groups projects, carries state, and finds IDs 
 
   const previous = process.env.IMESSAGE_HANDOFF_STATE_DB;
   const previousGlobalState = process.env.IMESSAGE_HANDOFF_GLOBAL_STATE;
+  const previousSessionIndex = process.env.IMESSAGE_HANDOFF_SESSION_INDEX;
   process.env.IMESSAGE_HANDOFF_STATE_DB = database;
   process.env.IMESSAGE_HANDOFF_GLOBAL_STATE = globalState;
+  process.env.IMESSAGE_HANDOFF_SESSION_INDEX = sessionIndex;
   try {
     const all = await listThreads(999);
     assert.equal(all.length, 137);
     assert.equal(new Set(all.map((thread) => thread.id)).size, 137);
     assert.equal(all.some((thread) => thread.id.startsWith("child-")), false);
     assert.equal(all.some((thread) => thread.id === "automated-exec"), false);
-    assert.equal(all.find((thread) => thread.id === "fork-root")?.title, "Fork 1 · Indistinguishable fork");
-    assert.equal(all.find((thread) => thread.id === "fork-copy")?.title, "Fork 2 · Indistinguishable fork");
-    assert.equal(all.find((thread) => thread.id === "fork-hidden-a")?.title, "Fork 1 · Hidden-parent fork");
-    assert.equal(all.find((thread) => thread.id === "fork-hidden-b")?.title, "Fork 2 · Hidden-parent fork");
+    assert.equal(all.find((thread) => thread.id === "fork-root")?.title, "Codex fork");
+    assert.equal(all.find((thread) => thread.id === "fork-copy")?.title, "Codex fork (2)");
+    assert.equal(all.find((thread) => thread.id === "fork-root")?.sidebarTitle, "Codex fork");
+    assert.equal(all.find((thread) => thread.id === "root-123")?.title, "Untitled task");
+    assert.equal(all.find((thread) => thread.id === "root-123")?.sidebarTitle, null);
+    assert.equal(all.find((thread) => thread.id === "fork-hidden-a")?.title, "Hidden-parent fork");
+    assert.equal(all.find((thread) => thread.id === "fork-hidden-b")?.title, "Hidden-parent fork");
     assert.equal(all.some((thread) => thread.id === "fork-hidden-root"), false);
     assert.equal(all.find((thread) => thread.id === "fork-copy")?.lineageRootId, "fork-root");
     assert.equal(all.find((thread) => thread.id === "fork-hidden-a")?.lineageRootId, "fork-hidden-root");
@@ -177,10 +191,13 @@ test("catalog excludes subagents, groups projects, carries state, and finds IDs 
     assert.deepEqual(all.find((thread) => thread.id === "ancestry-root")?.lineageAncestorIds, []);
     assert.deepEqual(all.find((thread) => thread.id === "ancestry-grandchild")?.lineageAncestorIds, ["ancestry-hidden", "ancestry-root"]);
     assert.equal(all.some((thread) => thread.id === "ancestry-hidden"), false);
-    assert.equal(all.find((thread) => thread.id === "session-a")?.title, "Session 1 · Separate conversation");
-    assert.equal(all.find((thread) => thread.id === "session-b")?.title, "Session 2 · Separate conversation");
-    assert.equal(new Set(all.map((thread) => `${thread.cwd}\u0000${thread.title}`)).size, all.length);
+    assert.equal(all.find((thread) => thread.id === "session-a")?.title, "Separate conversation");
+    assert.equal(all.find((thread) => thread.id === "session-b")?.title, "Separate conversation");
+    assert.equal(all.find((thread) => thread.id === "session-a")?.sidebarTitle, "Separate conversation");
+    assert.equal(all.find((thread) => thread.id === "session-b")?.sidebarTitle, "Separate conversation");
     assert.equal(all[0].id, "root-000");
+    assert.equal(all[0].title, "Sidebar root title");
+    assert.equal(all[0].sidebarTitle, "Sidebar root title");
     assert.equal(all[0].state, "running");
     assert.equal(all[0].model, "gpt-fixture");
     assert.equal(all[0].reasoningEffort, "high");
@@ -204,13 +221,15 @@ test("catalog excludes subagents, groups projects, carries state, and finds IDs 
     assert.deepEqual(one.map((thread) => thread.id), ["root-000"]);
     const outsideMenu = await findThread("root-124");
     assert.equal(outsideMenu.id, "root-124");
+    assert.equal(outsideMenu.title, "Sidebar older task");
     assert.equal(outsideMenu.state, "idle");
     assert.equal(await findThread("child-edge"), null);
     assert.equal(await findThread("missing"), null);
     assert.equal(await findThread("blank-new-thread"), null);
     const blankNew = await findThreadBySource("imessage-handoff:new:flow-123");
     assert.equal(blankNew.id, "blank-new-thread");
-    assert.equal(blankNew.title, "Untitled thread");
+    assert.equal(blankNew.title, "Untitled task");
+    assert.equal(blankNew.sidebarTitle, null);
     assert.equal(blankNew.visible, false);
     assert.equal(blankNew.cwd, project);
     assert.equal(await findThreadBySource("subagent"), null);
@@ -221,5 +240,7 @@ test("catalog excludes subagents, groups projects, carries state, and finds IDs 
     else process.env.IMESSAGE_HANDOFF_STATE_DB = previous;
     if (previousGlobalState === undefined) delete process.env.IMESSAGE_HANDOFF_GLOBAL_STATE;
     else process.env.IMESSAGE_HANDOFF_GLOBAL_STATE = previousGlobalState;
+    if (previousSessionIndex === undefined) delete process.env.IMESSAGE_HANDOFF_SESSION_INDEX;
+    else process.env.IMESSAGE_HANDOFF_SESSION_INDEX = previousSessionIndex;
   }
 });

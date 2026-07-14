@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { chmodSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { generateKeyPairSync } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
@@ -96,6 +96,26 @@ class FakeClient {
   async sendStatus(guid) { this.calls.push(["status", guid]); return this.accepted("status", { send_state: "delivered" }); }
   async editMessage(params) { this.calls.push(["edit", params]); return this.accepted("edit"); }
   async unsendMessage(params) { this.calls.push(["unsend", params]); return this.accepted("unsend"); }
+}
+
+class DurableDeduplicatingClient extends FakeClient {
+  constructor(ledger = new Map()) {
+    super();
+    this.ledger = ledger;
+    this.deduplicated = [];
+  }
+
+  async sendRich(params, options) {
+    this.calls.push(["rich", params, options]);
+    const operationId = options?.operationId || null;
+    if (operationId && this.ledger.has(operationId)) {
+      this.deduplicated.push(operationId);
+      return this.ledger.get(operationId);
+    }
+    const result = this.accepted("rich");
+    if (operationId) this.ledger.set(operationId, result);
+    return result;
+  }
 }
 
 function helperReport(overrides = {}) {
@@ -887,6 +907,108 @@ test("creates one durable native root and sends later task output as replies wit
   const second = client.calls.filter(([kind]) => kind === "rich")[2][1];
   assert.equal(second.text, "Then checking the final path.");
   assert.equal(second.reply_to, "rich-1");
+});
+
+test("a canonical sidebar rename refreshes the existing native header exactly once without changing its reply root", async () => {
+  const first = fixture();
+  await first.transport.probe();
+  const provisional = { ...THREAD, title: "Untitled task", sidebarTitle: null };
+  const canonical = { ...THREAD, title: "Stale first request preview", sidebarTitle: "Sidebar release title" };
+
+  await first.transport.outbound({ kind: "thread.output", deliveryId: "provisional", thread: provisional, body: "First result." });
+  await first.transport.outbound({ kind: "thread.output", deliveryId: "canonical-one", thread: canonical, body: "Second result." });
+  await first.transport.outbound({ kind: "thread.output", deliveryId: "canonical-two", thread: canonical, body: "Third result." });
+
+  const rich = first.client.calls.filter(([kind]) => kind === "rich").map(([, params]) => params);
+  const headers = rich.filter((params) => /codex:\/\/threads\/thread-a/u.test(params.text || ""));
+  assert.equal(headers.length, 2);
+  assert.match(headers[0].text, /Untitled task/u);
+  assert.match(headers[1].text, /Sidebar release title/u);
+  assert.equal(headers[0].reply_to, undefined);
+  assert.equal(headers[1].reply_to, "rich-1");
+  assert.deepEqual(
+    rich.filter((params) => /result\.$/u.test(params.text || "")).map((params) => params.reply_to),
+    ["rich-1", "rich-1", "rich-1"],
+  );
+  assert.equal(first.transport.router.nativeThread(THREAD.id).rootGuid, "rich-1");
+  assert.match(first.transport.router.nativeThread(THREAD.id).headerTitleFingerprint, /^[a-f0-9]{64}$/u);
+  assert.equal(first.transport.router.nativeThread(THREAD.id).headerRevision, 2);
+  assert.doesNotMatch(readFileSync(first.stateFile, "utf8"), /Sidebar release title/u);
+
+  const resumedClient = new FakeClient();
+  const resumed = new ImsgTransport({
+    profile: first.profile,
+    stateFile: first.stateFile,
+    client: resumedClient,
+    now: first.now,
+  });
+  await resumed.probe();
+  await resumed.outbound({ kind: "thread.output", deliveryId: "after-restart", thread: canonical, body: "After restart." });
+  const afterRestart = resumedClient.calls.filter(([kind]) => kind === "rich").map(([, params]) => params);
+  assert.deepEqual(afterRestart.map((params) => params.text), ["After restart."]);
+  assert.equal(afterRestart[0].reply_to, "rich-1");
+});
+
+test("A to B to A renames and repeated manual headers use new durable operations across restart", async () => {
+  const ledger = new Map();
+  const firstClient = new DurableDeduplicatingClient(ledger);
+  const first = fixture({ client: firstClient });
+  await first.transport.probe();
+  const titleA = { ...THREAD, title: "Sidebar A", sidebarTitle: "Sidebar A" };
+  const titleB = { ...THREAD, title: "Sidebar B", sidebarTitle: "Sidebar B" };
+
+  await first.transport.outbound({ kind: "thread.output", deliveryId: "cycle-root-a", thread: titleA, body: "A result." });
+  await first.transport.outbound({ kind: "thread.output", deliveryId: "cycle-title-b", thread: titleB, body: "B result." });
+  assert.equal(first.transport.router.nativeThread(THREAD.id).headerRevision, 2);
+
+  const resumedClient = new DurableDeduplicatingClient(ledger);
+  resumedClient.next = firstClient.next;
+  const resumed = new ImsgTransport({
+    profile: first.profile,
+    stateFile: first.stateFile,
+    client: resumedClient,
+    now: first.now,
+  });
+  await resumed.probe();
+  await resumed.outbound({ kind: "thread.output", deliveryId: "cycle-title-a-again", thread: titleA, body: "A again." });
+  await resumed.outbound({ kind: "thread.header", thread: titleA });
+  await resumed.outbound({ kind: "thread.header", thread: titleA });
+
+  const headers = [...firstClient.calls, ...resumedClient.calls]
+    .filter(([kind, params]) => kind === "rich" && /codex:\/\/threads\/thread-a/u.test(params.text || ""));
+  assert.deepEqual(headers.map(([, params]) => params.text.match(/Sidebar [AB]/u)?.[0]), [
+    "Sidebar A",
+    "Sidebar B",
+    "Sidebar A",
+    "Sidebar A",
+    "Sidebar A",
+  ]);
+  assert.equal(new Set(headers.map(([, , options]) => options.operationId)).size, headers.length);
+  assert.deepEqual([...firstClient.deduplicated, ...resumedClient.deduplicated], []);
+  assert.equal(resumed.router.nativeThread(THREAD.id).rootGuid, "rich-1");
+  assert.equal(resumed.router.nativeThread(THREAD.id).headerRevision, 5);
+});
+
+test("attachments also reconcile a canonical sidebar title under the existing native root", async () => {
+  const { transport, client } = fixture();
+  await transport.probe();
+  await transport.outbound({
+    kind: "thread.output",
+    deliveryId: "attachment-provisional",
+    thread: { ...THREAD, title: "Untitled task", sidebarTitle: null },
+    body: "Created the root.",
+  });
+  const before = client.calls.length;
+  const canonical = { ...THREAD, title: "Sidebar image task", sidebarTitle: "Sidebar image task" };
+  await transport.publishImages(canonical, ["/tmp/result.png"], { deliveryId: "canonical-image" });
+
+  const calls = client.calls.slice(before);
+  const refreshed = calls.find(([kind]) => kind === "rich")[1];
+  const attachment = calls.find(([kind]) => kind === "attachment")[1];
+  assert.match(refreshed.text, /Sidebar image task/u);
+  assert.equal(refreshed.reply_to, "rich-1");
+  assert.equal(attachment.reply_to, "rich-1");
+  assert.match(transport.router.nativeThread(THREAD.id).headerTitleFingerprint, /^[a-f0-9]{64}$/u);
 });
 
 test("two consecutive advanced outputs both send and the second remains in the native reply thread", async () => {

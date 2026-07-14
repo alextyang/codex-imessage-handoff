@@ -143,7 +143,34 @@ function resultStatus(result) {
 }
 
 function taskHeader(thread, now = Date.now()) {
-  return clean(thread?.id) ? renderThreadHeader(thread, now) : "";
+  if (!clean(thread?.id)) return "";
+  const title = clean(thread?.sidebarTitle) || clean(thread?.title) || "Untitled task";
+  return renderThreadHeader({ ...thread, title }, now);
+}
+
+function displayedHeaderTitle(thread) {
+  return clean(thread?.sidebarTitle) || clean(thread?.title) || "Untitled task";
+}
+
+function canonicalHeaderTitle(thread) {
+  return clean(thread?.sidebarTitle);
+}
+
+function headerTitleFingerprint(value) {
+  return createHash("sha256").update(clean(value)).digest("hex");
+}
+
+function titleScope(value) {
+  return headerTitleFingerprint(value).slice(0, 24);
+}
+
+function nextHeaderRevision(nativeThread) {
+  const current = Number(nativeThread?.headerRevision);
+  if (!Number.isSafeInteger(current) || current < 0) return 1;
+  if (current >= Number.MAX_SAFE_INTEGER) {
+    throw new RangeError("The native task header revision is exhausted.");
+  }
+  return current + 1;
 }
 
 function balancedPollChunks(items, count) {
@@ -1223,17 +1250,30 @@ export class ImsgTransport {
       const menuResult = await this._sendNativeMenu(event);
       return menuResult;
     }
-    let rootGuid = threadId ? clean(this.router.nativeThread(threadId)?.rootGuid) : "";
+    const nativeThread = threadId ? this.router.nativeThread(threadId) : null;
+    let rootGuid = clean(nativeThread?.rootGuid);
+    const canonicalTitle = canonicalHeaderTitle(event?.thread);
+    const headerRevision = nextHeaderRevision(nativeThread);
+    const refreshCanonicalHeader = Boolean(
+      rootGuid
+      && canonicalTitle
+      && clean(nativeThread?.headerTitleFingerprint) !== headerTitleFingerprint(canonicalTitle),
+    );
     const guids = [];
-    if (threadId && (!rootGuid || event?.kind === "thread.header")) {
+    if (threadId && (!rootGuid || event?.kind === "thread.header" || refreshCanonicalHeader)) {
       const header = richTextIntent(taskHeader(event.thread, this.now()), {
         richText: this.richCapabilities().richText,
         event: { kind: "thread.header", thread: event.thread },
       });
       const establishingRoot = !rootGuid;
+      const headerReason = establishingRoot
+        ? "root"
+        : refreshCanonicalHeader
+          ? `canonical:${titleScope(canonicalTitle)}`
+          : "manual";
       const headerScope = id
-        ? `${id}:${establishingRoot ? "root" : "header"}`
-        : `thread-header:${threadId}:${establishingRoot ? "root" : "repeat"}`;
+        ? `${id}:header:${headerReason}`
+        : `thread-header:${threadId}:revision:${headerRevision}:${headerReason}`;
       const headerResult = await this._sendText(header, {
         replyToGuid: rootGuid,
         effect: options.effect,
@@ -1255,7 +1295,11 @@ export class ImsgTransport {
         };
       }
       guids.push(normalizedHeader.guid);
-      this.router.routeOutboundGuid(normalizedHeader.guid, threadId, { root: establishingRoot });
+      this.router.routeOutboundGuid(normalizedHeader.guid, threadId, {
+        root: establishingRoot,
+        headerTitleFingerprint: headerTitleFingerprint(displayedHeaderTitle(event.thread)),
+        headerRevision,
+      });
       if (establishingRoot) rootGuid = normalizedHeader.guid;
       if (event?.kind === "thread.header") {
         if (id) this.router.recordOutboundReceipt(id, { classification: "accepted", guids });
@@ -1316,7 +1360,15 @@ export class ImsgTransport {
       return { sent: false, status: "AWAITING_PROMPT", terminal: false, guids: [] };
     }
     const guids = [];
-    let rootGuid = threadId ? clean(this.router.nativeThread(threadId)?.rootGuid) : "";
+    const nativeThread = threadId ? this.router.nativeThread(threadId) : null;
+    let rootGuid = clean(nativeThread?.rootGuid);
+    const canonicalTitle = canonicalHeaderTitle(thread);
+    const headerRevision = nextHeaderRevision(nativeThread);
+    const refreshCanonicalHeader = Boolean(
+      rootGuid
+      && canonicalTitle
+      && clean(nativeThread?.headerTitleFingerprint) !== headerTitleFingerprint(canonicalTitle),
+    );
     if (threadId && !rootGuid && (files || []).length) {
       const header = richTextIntent(taskHeader(thread, this.now()), { richText: this.richCapabilities().richText });
       const rootResult = await this._sendText(header, {
@@ -1334,7 +1386,35 @@ export class ImsgTransport {
       }
       rootGuid = normalizedRoot.guid;
       guids.push(rootGuid);
-      this.router.routeOutboundGuid(rootGuid, threadId, { root: true });
+      this.router.routeOutboundGuid(rootGuid, threadId, {
+        root: true,
+        headerTitleFingerprint: headerTitleFingerprint(displayedHeaderTitle(thread)),
+        headerRevision,
+      });
+    } else if (threadId && rootGuid && refreshCanonicalHeader && (files || []).length) {
+      const header = richTextIntent(taskHeader(thread, this.now()), { richText: this.richCapabilities().richText });
+      const refreshResult = await this._sendText(header, {
+        replyToGuid: rootGuid,
+        operationId: outboundOperationId(
+          this.profile.chatGuid,
+          `images:${threadId}:${imageScope}:canonical:${titleScope(canonicalTitle)}`,
+        ),
+      });
+      const normalizedRefresh = resultStatus(refreshResult);
+      if (!normalizedRefresh.sent || !normalizedRefresh.guid) {
+        return {
+          ...normalizedRefresh,
+          sent: false,
+          status: normalizedRefresh.sent ? "HEADER_GUID_MISSING" : normalizedRefresh.status,
+          terminal: false,
+          guids,
+        };
+      }
+      guids.push(normalizedRefresh.guid);
+      this.router.routeOutboundGuid(normalizedRefresh.guid, threadId, {
+        headerTitleFingerprint: headerTitleFingerprint(displayedHeaderTitle(thread)),
+        headerRevision,
+      });
     }
     for (const [index, file] of (files || []).slice(0, 5).entries()) {
       let result;

@@ -19,6 +19,7 @@ const MAX_SERVER_REQUEST_RESPONSE_BYTES = 64 * 1024;
 const MAX_SERVER_REQUEST_STRING_BYTES = 16 * 1024;
 const MAX_SERVER_REQUEST_COLLECTION_ITEMS = 32;
 const MAX_SERVER_REQUEST_JSON_DEPTH = 6;
+const MAX_THREAD_NAME_CODE_POINTS = 160;
 const UNCERTAIN_TURN_OUTCOME_CODES = new Set([
   "CODEX_DISCONNECTED",
   "CODEX_PROTOCOL_ERROR",
@@ -110,6 +111,16 @@ function safely(callback, ...args) {
   } catch {
     // Presentation callbacks must never break the Codex protocol connection.
   }
+}
+
+function normalizedThreadName(value) {
+  if (typeof value !== "string") return null;
+  const normalized = value.toWellFormed()
+    .replace(/[\u0000-\u001f\u007f]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!normalized) return null;
+  return [...normalized].slice(0, MAX_THREAD_NAME_CODE_POINTS).join("");
 }
 
 function phaseForNotification(message) {
@@ -952,6 +963,14 @@ export class AppServerRpcClient {
 
     const active = this.activeTurn;
     if (!active) return;
+    if (message.method === "thread/name/updated") {
+      if (params.threadId !== active.threadId) return;
+      const threadName = normalizedThreadName(params.threadName);
+      if (threadName) {
+        safely(active.onThreadNameUpdated, threadName, { threadId: active.threadId });
+      }
+      return;
+    }
     if (params.threadId && params.threadId !== active.threadId) return;
     const notificationTurnId = params.turnId || params.turn?.id || null;
     if (active.turnId && notificationTurnId && notificationTurnId !== active.turnId) return;
@@ -1076,6 +1095,7 @@ export class AppServerRpcClient {
       onAssistantDelta: options.onAssistantDelta,
       onAssistantMessage: options.onAssistantMessage,
       onGeneratedImage: options.onGeneratedImage,
+      onThreadNameUpdated: options.onThreadNameUpdated,
       onServerRequest: options.onServerRequest,
       turnTimer: null,
       interruptTimer: null,
@@ -1271,6 +1291,7 @@ export class AppServerCodexRunner {
     onAssistantDelta = () => {},
     onAssistantMessage = () => {},
     onGeneratedImage = () => {},
+    onThreadNameUpdated = () => {},
     onServerRequest,
     turnTimeoutMs,
   }) {
@@ -1288,6 +1309,7 @@ export class AppServerCodexRunner {
         onAssistantDelta,
         onAssistantMessage,
         onGeneratedImage,
+        onThreadNameUpdated,
         onServerRequest,
         turnTimeoutMs,
       });
