@@ -188,7 +188,10 @@ test("an ambiguously created task is reconciled after restart without another ta
       createThread,
       normalizeThread: (thread) => thread,
       prepareThread: async () => {},
-      queuePrompt: async () => { queueAdmissions += 1; return true; },
+      queuePrompt: async () => {
+        queueAdmissions += 1;
+        return { accepted: true, reaction: "🔍" };
+      },
       reconcileDelaysMs: [0, 0, 0],
       wait: async () => {},
     };
@@ -206,6 +209,7 @@ test("an ambiguously created task is reconciled after restart without another ta
     const queued = await resumeNewThreadCreation({ ...options, flow: restarted.get(flow.id), store: restarted });
     assert.equal(queued.status, "queued");
     assert.equal(queued.flow.threadId, "created-thread-a");
+    assert.deepEqual(queued.admission, { accepted: true, reaction: "🔍" });
     assert.equal(threadStarts, 1);
     assert.equal(queueAdmissions, 1);
     assert.equal(restarted.get(flow.id).stage, "queued");

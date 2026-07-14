@@ -136,6 +136,19 @@ export function getDefaultReasoning() {
   return readStore().defaultReasoning || null;
 }
 
+export function reasoningAwarenessReaction(effectiveLevel) {
+  try {
+    const serviceDefault = getDefaultReasoning();
+    if (!serviceDefault || effectiveLevel === null || effectiveLevel === undefined) return null;
+    const effective = normalizeLevel(effectiveLevel);
+    return effective !== serviceDefault ? REASONING_PRESENTATION[effective].emoji : null;
+  } catch {
+    // This is a presentation-only acknowledgement. A damaged optional settings
+    // store must never turn an already-admitted Codex prompt into a failure.
+    return null;
+  }
+}
+
 export function setDefaultReasoning(level) {
   const store = readStore();
   if (clearsLevel(level)) {

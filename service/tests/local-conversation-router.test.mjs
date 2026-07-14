@@ -1205,7 +1205,7 @@ test("task commands prefer native reply then recent default context before a pic
   router.acknowledge(unmute.messageKey);
 
   let id = 94;
-  for (const command of ["thread", "request", "message", "turn", "history", "reasoning", "retry", "dismiss", "cancel", "link"]) {
+  for (const command of ["thread", "open", "request", "message", "turn", "history", "reasoning", "status", "retry", "dismiss", "cancel", "link"]) {
     const action = router.ingest(message(id++, `/${command}`));
     assert.equal(action.kind, "thread-picker", command);
     assert.equal(action.command, command);
@@ -1374,16 +1374,21 @@ test("new-task prompt lease lasts 120 seconds, yields to explicit replies, and c
   const { router, advance } = fixture();
   router.routeOutboundGuid("root-a", "thread-a", { root: true });
   assert.equal(router.setAwaitingNewPrompt("flow-a"), true);
+  assert.equal(router.incomingPaused, true);
+  assert.equal(router.shouldPauseIncoming("thread-a"), true);
+  assert.equal(router.shouldPauseIncoming("thread-b"), true);
   const explicit = router.ingest(message(9_020, "Keep working in A.", { thread_originator_guid: "root-a" }));
   assert.equal(explicit.kind, "prompt");
   assert.equal(explicit.threadId, "thread-a");
   assert.equal(router.awaitingNewPrompt.flowId, "flow-a");
+  assert.equal(router.shouldPauseIncoming("thread-b"), true);
   router.acknowledge(explicit.messageKey);
 
   const first = router.ingest(message(9_021, "Create the new task."));
   assert.equal(first.kind, "new-prompt");
   assert.equal(first.flowId, "flow-a");
   assert.equal(router.awaitingNewPrompt, null);
+  assert.equal(router.incomingPaused, false);
   router.acknowledge(first.messageKey);
 
   router.setAwaitingNewPrompt("flow-b");

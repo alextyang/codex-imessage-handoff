@@ -121,11 +121,61 @@ function normalizeRanges(ranges: NativeTextRange[]) {
     || STYLE_ORDER[left.style] - STYLE_ORDER[right.style]);
 }
 
+interface MarkdownLink {
+  end: number;
+  image: boolean;
+  label: string;
+  target: string;
+}
+
+function markdownLinkAt(source: string, index: number): MarkdownLink | null {
+  const image = source[index] === "!" && source[index + 1] === "[";
+  const opening = image ? index + 1 : index;
+  if (source[opening] !== "[") return null;
+
+  let cursor = opening + 1;
+  let bracketDepth = 1;
+  for (; cursor < source.length && bracketDepth > 0; cursor += 1) {
+    if (source[cursor] === "\\") {
+      cursor += 1;
+      continue;
+    }
+    if (source[cursor] === "[") bracketDepth += 1;
+    else if (source[cursor] === "]") bracketDepth -= 1;
+  }
+  if (bracketDepth !== 0 || source[cursor] !== "(") return null;
+
+  const label = source.slice(opening + 1, cursor - 1);
+  const targetStart = cursor + 1;
+  let parenthesisDepth = 1;
+  cursor = targetStart;
+  for (; cursor < source.length && parenthesisDepth > 0; cursor += 1) {
+    if (source[cursor] === "\\") {
+      cursor += 1;
+      continue;
+    }
+    if (source[cursor] === "(") parenthesisDepth += 1;
+    else if (source[cursor] === ")") parenthesisDepth -= 1;
+  }
+  if (parenthesisDepth !== 0) return null;
+
+  let target = source.slice(targetStart, cursor - 1).trim();
+  if (target.startsWith("<") && target.endsWith(">")) target = target.slice(1, -1).trim();
+  target = target.replace(/\\([\\() ])/g, "$1");
+  if (!label.trim() || !target) return null;
+  return { end: cursor, image, label, target };
+}
+
+function isPortableLinkTarget(value: string) {
+  return /^(?:https?:|mailto:|tel:|codex:)/i.test(value);
+}
+
 /**
  * Compile the deliberately small Markdown subset emitted by presentation.ts
  * into attributed-string text and deterministic NSRange-compatible spans.
- * URLs and inline/fenced code stay byte-for-byte visible and are never parsed
- * for formatting.
+ * Portable URLs stay visible so Messages can keep them clickable. Local file
+ * links and images lose their unusable destination and retain a bold label.
+ * Inline/fenced code stays byte-for-byte visible.
  */
 export function compileMarkdownRanges(source: string) {
   let text = "";
@@ -177,6 +227,38 @@ export function compileMarkdownRanges(source: string) {
       }
     }
 
+    const link = markdownLinkAt(source, index);
+    if (link) {
+      const compiledLabel = compileMarkdownRanges(link.label);
+      const untrimmedLabel = compiledLabel.text;
+      const leadingWhitespace = untrimmedLabel.length - untrimmedLabel.trimStart().length;
+      const label = untrimmedLabel.trim();
+      const labelEnd = leadingWhitespace + label.length;
+      if (label) {
+        const labelStart = text.length;
+        text += label;
+        for (const range of compiledLabel.ranges) {
+          const start = Math.max(leadingWhitespace, range.location);
+          const end = Math.min(labelEnd, range.location + range.length);
+          if (end > start) {
+            ranges.push({
+              ...range,
+              location: labelStart + start - leadingWhitespace,
+              length: end - start,
+            });
+          }
+        }
+        if (link.image || !isPortableLinkTarget(link.target)) {
+          ranges.push({ location: labelStart, length: label.length, style: "bold" });
+        } else {
+          ranges.push({ location: labelStart, length: label.length, style: "underline" });
+          if (label !== link.target) text += ` — ${link.target}`;
+        }
+        index = link.end;
+        continue;
+      }
+    }
+
     if (/^https?:\/\//i.test(source.slice(index)) && (index === 0 || /[\s(<[]/.test(source[index - 1]))) {
       const url = source.slice(index).match(/^https?:\/\/[^\s>]+/i)?.[0];
       if (url) {
@@ -217,7 +299,7 @@ export function compileMarkdownRanges(source: string) {
 }
 
 function appendPatternRanges(text: string, ranges: NativeTextRange[], event?: OutboundEvent) {
-  for (const match of text.matchAll(/(^|[\s·(“])\/(?:new|threads|recent|refresh|projects|search|thread|request|message|turn|history|reasoning|defaultreasoning|listen|link|mute|unmute|status|retry|dismiss|cancel|help)\b/gim)) {
+  for (const match of text.matchAll(/(^|[\s·(“])\/(?:new|threads|recent|refresh|projects|search|thread|open|request|message|turn|history|reasoning|defaultreasoning|listen|link|mute|unmute|status|retry|dismiss|cancel|help)\b/gim)) {
     const prefixLength = match[1].length;
     const token = match[0].slice(prefixLength);
     ranges.push({ location: (match.index ?? 0) + prefixLength, length: token.length, style: "bold" });

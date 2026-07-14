@@ -564,8 +564,11 @@ export class ImsgTransport {
   async _start({ onAction, onError } = {}) {
     if (!this.stopped) {
       if (!this.watchHealthy) await this._recoverWatch();
-      else await this._subscribeWatch();
-      await this._flushConfirmationOutboxAfterReconnect();
+      else {
+        await this._subscribeWatch();
+        await this._flushConfirmationOutboxAfterReconnect();
+        await this._observePendingInbound();
+      }
       return this;
     }
     const lifecycleGeneration = this.lifecycleGeneration;
@@ -584,6 +587,7 @@ export class ImsgTransport {
     this.watchCallbacks = { onAction, onError };
     await this._subscribeWatch();
     await this._flushConfirmationOutboxAfterReconnect();
+    await this._observePendingInbound();
     return this;
   }
 
@@ -632,6 +636,10 @@ export class ImsgTransport {
           }
           if (this.router.consumeOutboundEcho(message)) return;
           const action = this.router.ingest(message);
+          // A receipt is visible to the sender, so emit it only after the inbox
+          // cursor/action has been committed. Ignored reactions and poll rows
+          // also reach this point after their durable discard.
+          this.observeInbound().catch(() => {});
           if (action) {
             Promise.resolve(this.watchCallbacks?.onAction?.(action, message))
               .catch((error) => this._handleWatchError(error, generation));
@@ -712,6 +720,7 @@ export class ImsgTransport {
       if (!subscribed || this.stopped || lifecycleGeneration !== this.lifecycleGeneration) return false;
       const subscribedGeneration = this.watchGeneration;
       await this._flushConfirmationOutboxAfterReconnect();
+      await this._observePendingInbound();
       try {
         for (const action of this.router.pendingActions()) {
           await this.watchCallbacks?.onAction?.(action, null);
@@ -803,6 +812,11 @@ export class ImsgTransport {
       ...safeImsgFailureDetails(readValue || {}),
     };
     return readStatus === "accepted" && typingResult.status === "fulfilled";
+  }
+
+  async _observePendingInbound() {
+    if (!this.router.pendingActions().length) return false;
+    return this.observeInbound();
   }
 
   async _settleInbound(action, options = {}, { routeAcceptedGuid = true } = {}) {

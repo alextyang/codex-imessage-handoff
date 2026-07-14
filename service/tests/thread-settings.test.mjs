@@ -8,6 +8,7 @@ import {
   getReasoningOverride,
   listDefaultReasoningOptions,
   listReasoningOptions,
+  reasoningAwarenessReaction,
   REASONING_PRESENTATION,
   setDefaultReasoning,
   setReasoningOverride,
@@ -81,6 +82,11 @@ test("global default reasoning persists privately and exposes every canonical op
     assert.equal(setDefaultReasoning("Extra High"), "xhigh");
     assert.equal(getDefaultReasoning(), "xhigh");
     assert.equal(getReasoningOverride("thread-a"), "low");
+    assert.equal(reasoningAwarenessReaction("xhigh"), null);
+    assert.equal(reasoningAwarenessReaction("low"), "🪶");
+    assert.equal(reasoningAwarenessReaction("high"), "🔍");
+    assert.equal(reasoningAwarenessReaction(null), null);
+    assert.equal(reasoningAwarenessReaction("future"), null);
 
     const options = listDefaultReasoningOptions();
     assert.deepEqual(options.map((option) => option.value), [
@@ -113,6 +119,7 @@ test("global default reasoning persists privately and exposes every canonical op
 
     assert.equal(setDefaultReasoning("none"), null);
     assert.equal(getDefaultReasoning(), null);
+    assert.equal(reasoningAwarenessReaction("low"), null);
     assert.deepEqual(listDefaultReasoningOptions().filter((option) => option.selected).map((option) => option.value), ["default"]);
     assert.equal(getReasoningOverride("thread-a"), "low");
     assert.throws(() => setDefaultReasoning("impossible"), /Unsupported reasoning effort/);
@@ -153,6 +160,7 @@ test("malformed settings are not silently overwritten", () => {
   const file = path.join(home, "thread-settings.json");
   writeFileSync(file, "{broken", "utf8");
   try {
+    assert.equal(reasoningAwarenessReaction("high"), null, "presentation awareness must fail soft");
     assert.throws(() => getReasoningOverride("thread-a"), (error) => error.code === "INVALID_THREAD_SETTINGS");
     assert.throws(() => setReasoningOverride("thread-a", "high"), (error) => error.code === "INVALID_THREAD_SETTINGS");
     assert.equal(readFileSync(file, "utf8"), "{broken");

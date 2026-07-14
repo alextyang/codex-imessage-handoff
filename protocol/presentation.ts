@@ -5,6 +5,7 @@ export interface ThreadLabel {
   title: string;
   projectKey?: string | null;
   projectLabel?: string | null;
+  projectStartedAt?: string | null;
   createdAt?: string | null;
   status?: ThreadStatus | string | null;
   activityAt?: string | null;
@@ -421,6 +422,14 @@ export function reasoningDisplay(value: unknown) {
 }
 
 export function renderThreadHeader(thread: ThreadLabel, now: string | Date | number = new Date()) {
+  const projectLabel = cleanLine(
+    thread.projectLabel || (thread.projectKey ? "Codex" : "Other tasks"),
+    "Other tasks",
+  );
+  const project = `${projectIdentityEmoji({
+    projectLabel,
+    startedAt: thread.projectStartedAt,
+  })} ${bold(projectLabel, "Other tasks")}`;
   const status = directoryStatus(thread, now);
   const reasoningValue = reasoningDisplay(thread.reasoningEffort);
   const sourceLabels: Record<string, string> = {
@@ -438,7 +447,7 @@ export function renderThreadHeader(thread: ThreadLabel, now: string | Date | num
   const listening = thread.listening ? "Listening: next turn" : null;
   const link = thread.id ? `codex://threads/${encodeURIComponent(thread.id)}` : null;
   return [
-    styledThreadTitle(thread, true),
+    `${project}\n${styledThreadTitle(thread, true)}`,
     [status, reasoning, updates, listening].filter(Boolean).join("\n"),
     link,
     `👍 listen · 👎 mute · ❓ status + history\n/link · /cancel`,
@@ -571,6 +580,6 @@ export function parseMenuSelection(value: string) {
 
 export function parseSlashCommand(value: string) {
   const text = value.trim();
-  const match = text.match(/^\/(new|threads|recent|refresh|projects|search|thread|request|message|turn|history|reasoning|defaultreasoning|listen|link|mute|unmute|status|retry|dismiss|cancel|help)(?:\s+([\s\S]+))?$/i);
+  const match = text.match(/^\/(new|threads|recent|refresh|projects|search|thread|open|request|message|turn|history|reasoning|defaultreasoning|listen|link|mute|unmute|status|retry|dismiss|cancel|help)(?:\s+([\s\S]+))?$/i);
   return match ? { command: match[1].toLowerCase(), argument: match[2]?.trim() || null } : null;
 }

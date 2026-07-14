@@ -36,6 +36,7 @@ test("new-task setup is private, durable, idempotent, and restart-safe", () => {
       stage: "reasoning",
       projectKey: "project-a",
       projectLabel: "Messaging",
+      projectStartedAt: "2026-07-01T00:00:00.000Z",
       cwd: "/tmp",
       reasoning: "high",
       threadSource: `${flow.threadSource}:project`,
@@ -43,6 +44,7 @@ test("new-task setup is private, durable, idempotent, and restart-safe", () => {
     assert.equal(selected.reasoning, "high");
     const resumed = new NewThreadFlowStore({ now: () => Date.parse("2026-07-13T12:00:01.000Z") });
     assert.equal(resumed.get(flow.id).cwd, "/tmp");
+    assert.equal(resumed.get(flow.id).projectStartedAt, "2026-07-01T00:00:00.000Z");
 
     const file = path.join(value.home, "new-thread-state.json");
     assert.equal(statSync(file).mode & 0o777, 0o600);

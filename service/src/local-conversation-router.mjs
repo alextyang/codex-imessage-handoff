@@ -18,6 +18,7 @@ const MAX_CONFIRMATIONS = 512;
 
 const THREAD_COMMANDS = new Set([
   "thread",
+  "open",
   "request",
   "message",
   "turn",
@@ -27,6 +28,7 @@ const THREAD_COMMANDS = new Set([
   "link",
   "mute",
   "unmute",
+  "status",
   "retry",
   "dismiss",
   "cancel",
@@ -946,6 +948,7 @@ export class LocalConversationRouter {
   }
 
   shouldPauseIncoming(threadId = null) {
+    if (this.#currentAwaitingNewPrompt()) return true;
     const awaiting = this.#currentAwaitingPrompt();
     const cleanThread = cleanString(threadId, 200);
     return Boolean(awaiting && cleanThread && awaiting.threadId === cleanThread);

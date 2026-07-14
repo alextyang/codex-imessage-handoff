@@ -12,6 +12,7 @@ const THREAD = {
   title: "Rich formatting",
   createdAt: "2026-07-12T12:00:00.000Z",
   projectLabel: "iMessage handoff",
+  projectStartedAt: "2026-07-01T00:00:00.000Z",
 };
 
 class FakeClient {
@@ -346,6 +347,50 @@ test("a mismatched expected sender is durably discarded without creating activit
   assert.equal(transport.router.ingest(mismatch), null);
 });
 
+test("the watch marks every authorized inbound event read, including ignored reactions and polls", async () => {
+  const { transport, client } = fixture();
+  const actions = [];
+  await transport.start({ onAction: (action) => actions.push(action) });
+  const base = {
+    chat_id: 42,
+    chat_guid: "iMessage;-;+15550000000",
+    sender: "+15551111111",
+    is_from_me: false,
+    created_at: "2026-07-12T12:00:00.000Z",
+  };
+
+  client.watchHandlers.onMessage({
+    ...base,
+    id: 700,
+    guid: "ignored-reaction",
+    text: "Loved",
+    is_reaction: true,
+    reaction_type: "love",
+    is_reaction_add: true,
+    reacted_to_guid: "unknown-root",
+  });
+  client.watchHandlers.onMessage({
+    ...base,
+    id: 701,
+    guid: "ignored-foreign-poll",
+    text: "",
+    poll: { kind: "vote", original_guid: "unknown-poll", vote: { option_id: "unknown-option" } },
+  });
+  client.watchHandlers.onMessage({
+    ...base,
+    id: 702,
+    guid: "unauthorized-event",
+    sender: "+15552222222",
+    text: "Do not acknowledge this sender.",
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.deepEqual(actions, []);
+  assert.equal(client.calls.filter(([kind]) => kind === "read").length, 2);
+  assert.equal(transport.router.lastRowId, 702, "the unauthorized row is discarded durably");
+  assert.equal(transport.router.lastUserMessageAt, null);
+});
+
 test("a new conversation baselines existing history before subscribing", async () => {
   const { transport, client } = fixture({
     latestMessage: {
@@ -362,6 +407,27 @@ test("a new conversation baselines existing history before subscribing", async (
   const watch = client.calls.find(([kind]) => kind === "watch");
   assert.equal(watch[1].since_rowid, 150);
   assert.equal(transport.router.lastUserMessageAt, null);
+});
+
+test("startup retries the read receipt once for a durable pending inbox", async () => {
+  const { transport, client } = fixture();
+  await transport.start();
+  transport.setActiveThread(THREAD);
+  transport.router.setDefaultThread(THREAD.id, "2026-07-12T12:00:00.000Z");
+  const pending = transport.router.ingest({
+    id: 151,
+    guid: "pending-before-restart",
+    text: "Resume this durable prompt.",
+    created_at: "2026-07-12T12:00:00.000Z",
+  });
+  assert.equal(pending.kind, "prompt");
+  await transport.stop();
+  client.calls.length = 0;
+
+  await transport.start();
+  assert.equal(transport.pendingActions().length, 1);
+  assert.equal(client.calls.filter(([kind]) => kind === "read").length, 1);
+  await transport.stop();
 });
 
 test("read and semantic-reaction failures cannot prevent durable inbound acknowledgement", async () => {
@@ -791,16 +857,23 @@ test("creates one durable native root and sends later task output as replies wit
     thread: THREAD,
     role: "assistant",
     phase: "commentary",
-    body: "Checking **three paths**.",
+    body: "Checking **three paths**.\nOpen [app.py](/Users/alex/Project/app.py:12).",
   });
   assert.equal(result.sent, true);
   const [header, first] = client.calls.filter(([kind]) => kind === "rich").map(([, params]) => params);
-  assert.match(header.text, /^\S+ Rich formatting\n\n○ unknown\n↩️ Reasoning: Codex default\n\ncodex:\/\/threads\/thread-a\n\n👍 listen · 👎 mute · ❓ status \+ history\n\/link · \/cancel$/u);
+  assert.match(header.text, /^📐 iMessage handoff\n\S+ Rich formatting\n\n○ unknown\n↩️ Reasoning: Codex default\n\ncodex:\/\/threads\/thread-a\n\n👍 listen · 👎 mute · ❓ status \+ history\n\/link · \/cancel$/u);
   assert.equal(header.reply_to, undefined);
-  assert.equal(first.text, "Checking three paths.");
+  assert.equal(first.text, "Checking three paths.\nOpen app.py.");
+  assert.doesNotMatch(first.text, /\/Users\/alex/u);
   assert.equal(first.reply_to, "rich-1");
   assert.ok(first.text_formatting.some((range) => range.styles.includes("italic")));
   assert.ok(first.text_formatting.some((range) => range.styles.includes("bold")));
+  assert.ok(first.text_formatting.some((range) => range.styles.includes("bold")
+    && first.text.slice(range.start, range.start + range.length) === "app.py"));
+  for (const label of ["iMessage handoff", "Rich formatting"]) {
+    assert.ok(header.text_formatting.some((range) => range.styles.includes("bold")
+      && header.text.slice(range.start, range.start + range.length) === label));
+  }
   assert.equal(transport.router.nativeThread(THREAD.id).rootGuid, "rich-1");
 
   await transport.outbound({
@@ -1296,6 +1369,20 @@ test("compact poll labels never split family, skin-tone, or flag graphemes", () 
       `${prefix}${grapheme}…`,
     );
   }
+});
+
+test("multipart poll planning retains every recent project beyond the former menu cap", () => {
+  const choices = Array.from({ length: 50 }, (_, index) => ({
+    label: `○ 📦 Project ${index + 1}`,
+    action: { kind: "new-project", flowId: "flow-many", projectKey: `project-${index + 1}` },
+  }));
+  const plan = imsgTransportInternals.pollPlan("New task · project", choices);
+
+  assert.deepEqual(plan.chunks.flat(), choices);
+  assert.equal(plan.questions.length, plan.chunks.length);
+  assert.ok(plan.chunks.length > 6);
+  assert.ok(plan.chunks.every((chunk) => chunk.length >= 2 && chunk.length <= 7));
+  assert.ok(plan.questions.every((question, index) => question.endsWith(`· ${index + 1}/${plan.chunks.length}`)));
 });
 
 test("deduplicates explicit delivery IDs without persisting message bodies", async () => {
@@ -2254,6 +2341,7 @@ test("an inbound persistence exception rolls the watch back to its committed cur
   client.watchHandlers.onMessage(inbound);
   assert.equal(transport.isHealthy(), false);
   assert.equal(transport.router.lastRowId, 0);
+  assert.equal(client.calls.filter(([kind]) => kind === "read").length, 0);
   await new Promise((resolve) => setTimeout(resolve, 40));
   const watches = client.calls.filter(([kind]) => kind === "watch");
   assert.equal(watches.length, 2);
@@ -2265,6 +2353,7 @@ test("an inbound persistence exception rolls the watch back to its committed cur
   assert.equal(actions[0].messageKey, "persistence-retry-guid");
   assert.equal(errors.length, 1);
   assert.equal(transport.router.lastRowId, 302);
+  assert.equal(client.calls.filter(([kind]) => kind === "read").length, 1);
 });
 
 test("formatting conversion groups styles sharing one UTF-16 range", () => {

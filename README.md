@@ -141,20 +141,24 @@ messages keep using it until the user addresses another task.
 
 Codex Desktop receives the same shared app-server events, but its renderer keeps
 conversation state only for tasks it has loaded itself. A task already open in
-Desktop shows live progress; opening the `codex://threads/<id>` link in its
-Messages header hydrates a cold task and reconstructs its active turn. The
+Desktop shows live progress. A Messages header shows the project first and the
+task immediately underneath, followed by a separated status block and task
+link. Opening its `codex://threads/<id>` link hydrates a cold task and
+reconstructs its active turn. The
 shared protocol does not expose a safe cross-client UI-hydration request, so the
 service does not force-open or retarget Desktop windows or fabricate UI
 notifications.
 
-Directory browsing uses rich project/task polls. Poll selection is task-local,
+Directory browsing uses rich project/task polls. New-task project selection
+includes every active or recently used project and splits long directories into
+bounded native poll parts without dropping choices. Poll selection is task-local,
 expires after five minutes, and never pauses unrelated task updates. Expired or
 unknown votes produce a fresh directory rather than silently changing context.
 
 Available commands:
 
 ```text
-/new message    Create a task through project and reasoning polls
+/new [message]  Choose a project and reasoning, then create a task
 /threads        Browse tasks by project
 /refresh        Refresh the directory
 /search query   Search every visible task
@@ -179,12 +183,16 @@ Adding or removing 👍 on a task message enables or disables one-turn live
 listening. Adding or removing 👎 mutes or unmutes that task. Adding ❓ shows
 its status and recent history. Task-scoped commands sent outside a native reply
 thread use the five-minute default before opening a task picker. Notifications
-cannot silently retarget them.
+cannot silently retarget them. A `/new` command without a message waits up to
+120 seconds for the first unthreaded message and pauses proactive task traffic
+during that short handoff. Its first turn listens for live updates by default.
 
 ## Delivery and recovery
 
 - Inbound text and imported images are persisted locally before a Codex run is
   queued.
+- Every authorized inbound Messages event is marked read, including poll and
+  tapback events that intentionally produce no Codex action.
 - The service uses one Codex run at a time through the shared app-server.
 - Every submitted turn has a durable client message id. If the app-server
   disconnects after accepting `turn/start`, recovery looks up that exact id and

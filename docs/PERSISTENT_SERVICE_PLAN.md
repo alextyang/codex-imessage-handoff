@@ -93,17 +93,20 @@ send API.
 ## Presentation contract
 
 Messages contain no universal header or footer. Native reply threads provide
-task context. The first message for a task includes its deterministic object
-emoji, title, and Codex URI; subsequent messages remain content-first.
+task context. The first message for a task shows the deterministic project
+identity, then the deterministic task identity, status, and Codex URI;
+subsequent messages remain content-first.
 
 Projects and tasks use deterministic object emoji identities. State indicators
 also include readable text. Project/task directories preserve status, recency,
 queue depth, and request previews. Long history responses disclose when older
 turns remain.
 
-Markdown source is the canonical fallback, while the bridge compiles the
-supported subset into native rich text. Polls are enhancements, not the only
-place important context appears.
+Markdown source is the canonical fallback, while the bridge compiles headings,
+emphasis, and supported links into native rich text. Local file and image links
+become bold labels with unusable filesystem targets hidden; portable links keep
+their visible destination. Polls are enhancements, not the only place important
+context appears.
 
 ## Failure behavior
 

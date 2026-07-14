@@ -18,6 +18,7 @@ const ACTIVE = {
   createdAt: "2026-07-12T07:00:00.000Z",
   projectKey: "handoff",
   projectLabel: "iMessage handoff",
+  projectStartedAt: "2026-07-01T00:00:00.000Z",
 };
 
 const OTHER = {
@@ -194,6 +195,7 @@ test("thread header is a separate message with status, reasoning, link, and comm
     reasoningEffort: "high",
   };
   const expected = [
+    "📐 **iMessage handoff**",
     "🪁 **Polish message formatting**",
     "",
     "◷ Working for 4m · 2 queued",
@@ -216,6 +218,28 @@ test("thread header is a separate message with status, reasoning, link, and comm
   const mutedListening = { ...thread, muted: true, listening: true };
   assert.equal(renderThreadHeader(mutedListening, "2026-07-12T08:00:00.000Z"), expected
     .replace("🔍 Reasoning: High", "🔍 Reasoning: High\nUpdates: muted\nListening: next turn"));
+});
+
+test("thread headers keep project identity above task identity", () => {
+  const sibling = {
+    ...ACTIVE,
+    id: "sibling-thread",
+    title: "Verify native links",
+    createdAt: "2026-07-13T07:00:00.000Z",
+  };
+  const projectless = {
+    id: "other-task",
+    title: "General question",
+    createdAt: "2026-07-13T08:00:00.000Z",
+    projectLabel: null,
+    projectStartedAt: null,
+    status: "idle",
+  };
+
+  assert.equal(renderThreadHeader(ACTIVE).split("\n", 1)[0], "📐 **iMessage handoff**");
+  assert.equal(renderThreadHeader(sibling).split("\n", 1)[0], "📐 **iMessage handoff**");
+  assert.match(renderThreadHeader(sibling), /^📐 \*\*iMessage handoff\*\*\n\S+ \*\*Verify native links\*\*\n\n/u);
+  assert.match(renderThreadHeader(projectless), /^🗂️ \*\*Other tasks\*\*\n\S+ \*\*General question\*\*\n\n/u);
 });
 
 test("thread detail is split into semantic messages without repeated framing", () => {

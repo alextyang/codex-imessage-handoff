@@ -13,6 +13,11 @@ function clean(value, limit = 512) {
   return text && text.length <= limit && !/[\u0000-\u001f]/.test(text) ? text : null;
 }
 
+function validDate(value) {
+  const text = clean(value, 64);
+  return text && Number.isFinite(Date.parse(text)) ? text : null;
+}
+
 function flowIdFor(messageKey) {
   const key = clean(messageKey, 256);
   if (!key) throw new TypeError("A durable inbound message key is required.");
@@ -46,6 +51,7 @@ function normalizeFlow(value) {
     guid: clean(value.guid, 256),
     projectKey: clean(value.projectKey, 256),
     projectLabel: clean(value.projectLabel, 256),
+    projectStartedAt: validDate(value.projectStartedAt),
     cwd: clean(value.cwd, 4_096),
     otherTask: value.otherTask === true,
     reasoning: clean(value.reasoning, 32),
@@ -112,6 +118,7 @@ export class NewThreadFlowStore {
       guid: clean(action?.guid, 256),
       projectKey: null,
       projectLabel: null,
+      projectStartedAt: null,
       cwd: null,
       otherTask: false,
       reasoning: null,

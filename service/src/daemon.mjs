@@ -11,6 +11,7 @@ import {
   getReasoningOverride,
   listDefaultReasoningOptions,
   listReasoningOptions,
+  reasoningAwarenessReaction,
   REASONING_PRESENTATION,
   setDefaultReasoning,
   setReasoningOverride,
@@ -307,6 +308,7 @@ function threadLabel(thread) {
     createdAt: thread.createdAt,
     projectKey: thread.projectKey,
     projectLabel: thread.projectLabel,
+    projectStartedAt: thread.projectStartedAt,
     status: state.status,
     stateSince: state.stateSince,
     activityAt: thread.lastTurnAt || thread.activityAt || thread.updatedAt,
@@ -1111,8 +1113,7 @@ function projectGroupsForNewTask(queryValue = "") {
       return priority(right) - priority(left)
         || (Date.parse(right.activityAt || "") || 0) - (Date.parse(left.activityAt || "") || 0)
         || left.projectLabel.localeCompare(right.projectLabel);
-    })
-    .slice(0, 42);
+    });
 }
 
 async function publishNewProjectPicker(flow, query = "") {
@@ -1165,6 +1166,7 @@ async function selectNewProject(flow, projectKey) {
         || [...catalogById.values()].map((thread) => ({
           projectKey: projectKeyFor(thread),
           projectLabel: projectLabelFor(thread),
+          startedAt: thread.projectStartedAt || thread.createdAt || null,
           representative: thread,
         })).find((item) => item.projectKey === requestedKey);
       if (!otherTask && !project) return null;
@@ -1172,6 +1174,7 @@ async function selectNewProject(flow, projectKey) {
       return {
         projectKey: otherTask ? "other-tasks" : project.projectKey,
         projectLabel: otherTask ? "Other tasks" : project.projectLabel,
+        projectStartedAt: otherTask ? null : project.startedAt || null,
         cwd: otherTask ? os.homedir() : representative.workspaceRoot || representative.cwd,
         otherTask,
         threadSource: `imessage-handoff:new:${flow.id}:${otherTask ? "other" : "project"}`,
@@ -1242,7 +1245,7 @@ function normalizeCreatedThread(thread, flow, prompt) {
     groupKind: flow.otherTask ? "other" : "project",
     projectKey: flow.otherTask ? null : flow.projectKey,
     projectLabel: flow.otherTask ? null : flow.projectLabel,
-    projectStartedAt: createdAt,
+    projectStartedAt: flow.otherTask ? null : flow.projectStartedAt || createdAt,
     createdAt,
     updatedAt,
     recencyAt: normalizeAppServerTimestamp(thread.recencyAt, updatedAt),
@@ -1278,9 +1281,15 @@ async function finishNewThreadFlow(flow, action, promptValue = flow.prompt, atta
       else setReasoningOverride(thread.id, "default");
       imsgTransport.router.setThreadListen(thread.id, true);
     },
-    queuePrompt: ({ thread, prompt: queuedPrompt, attachments: queuedAttachments }) => (
-      queueLocalPrompt({ ...action, body: queuedPrompt }, thread.id, queuedPrompt, queuedAttachments)
-    ),
+    queuePrompt: async ({ thread, prompt: queuedPrompt, attachments: queuedAttachments }) => {
+      const queued = await queueLocalPrompt(
+        { ...action, body: queuedPrompt },
+        thread.id,
+        queuedPrompt,
+        queuedAttachments,
+      );
+      return queued;
+    },
   });
   if (result.status === "stale") {
     await sendOutbound({ kind: "service.notice", code: "needs-attention", body: "That new-task submission is no longer current. Continue with the latest setup step or use /cancel." });
@@ -1296,10 +1305,18 @@ async function finishNewThreadFlow(flow, action, promptValue = flow.prompt, atta
       code: "NEW_THREAD_DEFAULT_CONTEXT_FAILED",
     });
   }
+  const createdThread = result.thread || catalogById.get(threadId) || null;
+  const fallbackReasoning = createdThread
+    ? effectiveReasoning(createdThread)
+    : result.flow.reasoning && result.flow.reasoning !== "default"
+      ? result.flow.reasoning
+      : null;
+  const awarenessReaction = result.admission?.reaction
+    || reasoningAwarenessReaction(fallbackReasoning);
   // Keep the queued flow as a replayable tombstone until acceptInbound has
   // durably moved this exact user action from pending to seen.
   return {
-    reaction: "✨",
+    reaction: awarenessReaction || "✨",
     newThreadCompletion: {
       flowId: result.flow.id,
       threadId,
@@ -1806,13 +1823,15 @@ async function queueLocalPrompt(action, threadId, bodyValue = action.body, attac
   const thread = catalogById.get(String(threadId || ""));
   if (!thread) {
     await sendOutbound({ kind: "service.notice", code: "needs-attention", body: "That task is no longer available.\n\n/threads" });
-    return false;
+    return { accepted: false, reaction: null };
   }
   const replyId = `imsg:${action.messageKey}`;
   // A crash can leave the durable run admitted while the separate new-task
   // flow still says `creating`. Treat the exact claimed reply as success and
   // never restage attachments or enqueue the turn a second time.
-  if (runs.has(replyId)) return true;
+  if (runs.has(replyId)) {
+    return { accepted: true, reaction: reasoningAwarenessReaction(effectiveReasoning(thread)) };
+  }
   const images = await imsgTransport.importInboundAttachments(attachments, {
     destinationRoot: `${paths.attachments}/imsg`,
     messageKey: action.messageKey,
@@ -1820,7 +1839,7 @@ async function queueLocalPrompt(action, threadId, bodyValue = action.body, attac
   const body = String(bodyValue || "").trim() || (images.length ? "Please review the attached image." : "");
   if (!body) {
     await sendOutbound({ kind: "service.notice", code: "needs-attention", thread: threadLabel(thread), body: "That message did not contain text or a supported image." });
-    return false;
+    return { accepted: false, reaction: null };
   }
   const reasoningEffort = effectiveReasoning(thread);
   imsgTransport.rememberInbound(thread.id, action.guid);
@@ -1837,19 +1856,13 @@ async function queueLocalPrompt(action, threadId, bodyValue = action.body, attac
       userMirrorMode: submittedUserMirrorMode(action),
     },
   });
-  if (!["queued", "duplicate"].includes(admission) && !runs.has(replyId)) return false;
-  try {
-    const serviceDefault = getDefaultReasoning();
-    const effective = reasoningEffort;
-    if (serviceDefault && effective && effective !== serviceDefault && action.guid) {
-      await imsgTransport.reactInbound(action.guid, reasoningReaction(effective));
-    }
-  } catch {
-    // Reasoning awareness is a presentation aid; the durable prompt is already queued.
+  if (!["queued", "duplicate"].includes(admission) && !runs.has(replyId)) {
+    return { accepted: false, reaction: null };
   }
+  const reaction = reasoningAwarenessReaction(reasoningEffort);
   scheduleLiveMirrorScan();
   scheduleCompletionScan();
-  return true;
+  return { accepted: true, reaction };
 }
 
 async function handleLocalAction(action) {
@@ -1870,10 +1883,9 @@ async function handleLocalAction(action) {
       const muted = action.command === "mute";
       imsgTransport.router.setThreadMuted(thread.id, muted);
       if (!muted) {
-  scheduleLiveMirrorScan();
-  scheduleCompletionScan();
-  return true;
-}
+        scheduleLiveMirrorScan();
+        scheduleCompletionScan();
+      }
       return null;
     }
     if (action.command === "inspect") {
@@ -1951,7 +1963,8 @@ async function handleLocalAction(action) {
     }
     imsgTransport.router.touchThread(thread.id, action.createdAt);
     if (action.prompt) {
-      await queueLocalPrompt(action, thread.id, action.prompt, []);
+      const queued = await queueLocalPrompt(action, thread.id, action.prompt, []);
+      return queued.reaction ? { reaction: queued.reaction } : null;
     } else {
       // Router ingestion established this atomically before the menu action was
       // queued. If a later user message already consumed it, a retried menu
@@ -1981,8 +1994,8 @@ async function handleLocalAction(action) {
     return null;
   }
   if (action.kind === "prompt") {
-    await queueLocalPrompt(action, action.threadId);
-    return null;
+    const queued = await queueLocalPrompt(action, action.threadId);
+    return queued.reaction ? { reaction: queued.reaction } : null;
   }
   if (action.kind === "control") {
     return handleControl(action);
@@ -2073,7 +2086,6 @@ async function processLocalAction(action) {
 const localActionDispatch = new LocalActionDispatch(processLocalAction);
 
 function queueLocalAction(action) {
-  imsgTransport.observeInbound(action).catch(() => {});
   return localActionDispatch.enqueue(action, {
     immediate: action?.kind === "control" && action.command === "cancel",
   });

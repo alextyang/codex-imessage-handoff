@@ -24,6 +24,16 @@ function boundedAttachments(value) {
   return Array.isArray(value) ? structuredClone(value.slice(0, 5)) : [];
 }
 
+function queueAdmission(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return { accepted: Boolean(value), reaction: null };
+  }
+  return {
+    accepted: value.accepted === true,
+    reaction: clean(value.reaction, 16),
+  };
+}
+
 function sleep(milliseconds) {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
@@ -242,14 +252,14 @@ export async function resumeNewThreadCreation({
   current = requireFlow(store, current.id, { threadId, createAttemptedAt: null });
   const prepared = await normalizeThread(thread, current, prompt);
   await prepareThread(prepared, current);
-  const queued = await queuePrompt({
+  const admission = queueAdmission(await queuePrompt({
     flow: current,
     action,
     thread: prepared,
     prompt,
     attachments: storedAttachments,
-  });
-  if (!queued) {
+  }));
+  if (!admission.accepted) {
     current = requireFlow(store, current.id, {
       stage: "prompt",
       threadId,
@@ -260,7 +270,7 @@ export async function resumeNewThreadCreation({
   }
 
   current = requireFlow(store, current.id, { stage: "queued", threadId, createAttemptedAt: null });
-  return { status: "queued", flow: current, thread: prepared, replayed: false };
+  return { status: "queued", flow: current, thread: prepared, replayed: false, admission };
 }
 
 export const newThreadOrchestrationInternals = Object.freeze({
