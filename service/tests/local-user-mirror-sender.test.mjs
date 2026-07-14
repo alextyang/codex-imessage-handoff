@@ -411,6 +411,44 @@ test("accepted sends are delivery-idempotent across sender and router restart", 
   assert.equal(resumedRouter.nativeThread(THREAD_ID).latestGuid, "MIRROR-GUID-1");
 });
 
+test("a durable receiver receipt prevents stale reservation repair after seen-GUID eviction", async () => {
+  const fake = fakeImsg();
+  const item = fixture({ fake });
+  await initialize(item.sender);
+  assert.equal((await item.sender.sendMirror(mirror())).classification, "accepted");
+  const tagged = fake.sendCalls()[0].params.text;
+  const reservationId = localUserMirrorInternals.deliveryKey("delivery-one", THREAD_ID, 0);
+  assert.equal(item.router.consumeUserMirrorEcho({
+    id: 650,
+    guid: "MIRROR-GUID-1",
+    text: tagged,
+    created_at: "2026-07-14T12:00:01.000Z",
+    thread_originator_guid: ROOT_GUID,
+  }).reservationId, reservationId);
+  assert.equal(item.router.userMirrorEchoReceipt(reservationId).guid, "MIRROR-GUID-1");
+  for (let index = 0; index < 513; index += 1) {
+    item.router.discard({ id: 700 + index, guid: `eviction-${index}`, text: "ignored" });
+  }
+  assert.equal(item.router.hasSeenMessageGuid("MIRROR-GUID-1"), false);
+
+  const resumedRouter = new LocalConversationRouter({ stateFile: item.routerFile, now: item.clock.now });
+  const resumed = createSender({
+    stateFile: item.senderFile,
+    router: resumedRouter,
+    fake,
+    clock: item.clock,
+  });
+  await initialize(resumed);
+  assert.equal((await resumed.sendMirror(mirror())).classification, "duplicate");
+  assert.equal(fake.sendCalls().length, 1);
+  assert.equal(resumedRouter.isReservedUserMirrorEcho({
+    id: 1_300,
+    guid: "MIRROR-GUID-1",
+    text: tagged,
+    thread_originator_guid: ROOT_GUID,
+  }), false, "the receipt is durable proof that the already-consumed guard must not be recreated");
+});
+
 test("an accepted sender journal repairs a fresh router ledger and GUID route without resending", async () => {
   const fake = fakeImsg();
   const item = fixture({ fake });

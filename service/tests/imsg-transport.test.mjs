@@ -1012,6 +1012,63 @@ test("an unresolved normalized candidate never consumes the guard for a later sa
   await transport.stop();
 });
 
+test("stop and restart during a provisional hold replays in order without losing the queued follower", async () => {
+  const { transport, client } = fixture({ provisionalMirrorHoldMs: 25, provisionalMirrorPollMs: 1 });
+  const actions = [];
+  await transport.start({ onAction: (action) => actions.push(action) });
+  transport.router.routeOutboundGuid("restart-root", THREAD.id, { root: true });
+  const reservationId = "2".repeat(64);
+  transport.router.reserveUserMirrorEcho({
+    reservationId,
+    threadId: THREAD.id,
+    text: "Restart collision\u{E0001}\u{E0061}\u{E007F}",
+    rootGuid: "restart-root",
+  });
+  const candidate = {
+    id: 20_406,
+    guid: "restart-candidate-guid",
+    chat_id: 42,
+    chat_guid: "iMessage;-;+15550000000",
+    sender: "+15551111111",
+    is_from_me: false,
+    text: "Restart collision",
+    thread_originator_guid: "restart-root",
+    created_at: "2026-07-12T12:00:04.000Z",
+  };
+  const follower = {
+    ...candidate,
+    id: 20_407,
+    guid: "restart-follower-guid",
+    text: "Follower after restart",
+    created_at: "2026-07-12T12:00:05.000Z",
+  };
+  client.watchHandlers.onMessage(candidate);
+  client.watchHandlers.onMessage(follower);
+  await new Promise((resolve) => setTimeout(resolve, 2));
+  assert.equal(transport.router.lastRowId, 0, "the durable cursor stays behind the unresolved ordered candidate");
+  await transport.stop();
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  assert.equal(transport.router.lastRowId, 0);
+  assert.deepEqual(actions, []);
+
+  await transport.start({ onAction: (action) => actions.push(action) });
+  client.watchHandlers.onMessage(candidate);
+  client.watchHandlers.onMessage(follower);
+  await new Promise((resolve) => setTimeout(resolve, 50));
+
+  assert.equal(actions.length, 1);
+  assert.equal(actions[0].messageKey, "restart-follower-guid");
+  assert.equal(actions[0].body, "Follower after restart");
+  assert.equal(transport.router.lastRowId, 20_407);
+  assert.equal(transport.router.userMirrorEchoReceipt(reservationId), null);
+  assert.equal(transport.router.provisionalUserMirrorEcho({
+    ...candidate,
+    id: 20_408,
+    guid: "restart-later-guid",
+  }).reservationId, reservationId);
+  await transport.stop();
+});
+
 test("the provisional hold releases a genuine same-body message when the sender confirms a different GUID", async () => {
   const { transport, client } = fixture({ provisionalMirrorHoldMs: 30, provisionalMirrorPollMs: 1 });
   const actions = [];

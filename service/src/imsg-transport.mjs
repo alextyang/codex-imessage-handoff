@@ -40,7 +40,7 @@ const MULTIPART_PREFIX_RESERVE_BYTES = 32;
 // common case resolves as soon as the GUID arrives, while a hung send remains
 // fail-closed instead of becoming a duplicate Codex prompt.
 const DEFAULT_PROVISIONAL_MIRROR_HOLD_MS = IMSG_LOCAL_MIRROR_CORRELATION_TIMEOUT_MS;
-const DEFAULT_PROVISIONAL_MIRROR_POLL_MS = 25;
+const DEFAULT_PROVISIONAL_MIRROR_POLL_MS = 100;
 
 function delay(milliseconds) {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));

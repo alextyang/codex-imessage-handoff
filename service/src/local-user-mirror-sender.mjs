@@ -678,7 +678,8 @@ export class LocalUserMirrorSender {
     }
     if (entry.status === "accepted") {
       if (entry.guid) {
-        if (!this.router.hasSeenMessageGuid(entry.guid)) {
+        const hasDurableReceiverReceipt = receiverReceiptGuid === entry.guid;
+        if (!hasDurableReceiverReceipt && !this.router.hasSeenMessageGuid(entry.guid)) {
           this.router.reserveUserMirrorEcho({ reservationId: key, threadId, text, rootGuid });
         }
         this.router.confirmUserMirrorEcho(key, entry.guid);

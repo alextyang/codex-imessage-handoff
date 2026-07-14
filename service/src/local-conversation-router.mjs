@@ -592,12 +592,15 @@ function normalizeMessage(message) {
   if (!key) return null;
   const rawReplyToGuid = message?.reply_to_guid ?? message?.replyToGuid;
   const rawThreadOriginatorGuid = message?.thread_originator_guid ?? message?.threadOriginatorGuid;
+  const rawCreatedAt = message?.created_at ?? message?.createdAt;
+  const reliableCreatedAt = isoString(rawCreatedAt);
   return {
     key,
     id: finiteRowId(message?.id),
     guid: cleanString(message?.guid, 256),
     text: typeof message?.text === "string" ? message.text.trim() : "",
-    createdAt: cleanString(message?.created_at || message?.createdAt, 64) || new Date().toISOString(),
+    createdAt: cleanString(rawCreatedAt, 64) || new Date().toISOString(),
+    hasReliableCreatedAt: Boolean(reliableCreatedAt),
     replyToGuid: cleanString(rawReplyToGuid, 256),
     threadOriginatorGuid: cleanString(rawThreadOriginatorGuid, 256),
     hasThreadOriginatorGuid: typeof rawThreadOriginatorGuid === "string" && rawThreadOriginatorGuid.trim().length > 0,
@@ -1270,6 +1273,7 @@ export class LocalConversationRouter {
         // after this reservation and inside its bounded send window. Process
         // time is intentionally irrelevant: a delayed watch may observe a
         // legitimate echo long after the row itself was committed.
+        && message.hasReliableCreatedAt
         && Number.isFinite(messageCreatedAt)
         && messageCreatedAt >= Date.parse(echo.createdAt)
         && messageCreatedAt <= Date.parse(echo.earlyUntil))
@@ -1317,7 +1321,7 @@ export class LocalConversationRouter {
   #consumeUserMirrorEcho(rawMessage) {
     const message = normalizeMessage(rawMessage);
     const fingerprint = userMirrorEchoFingerprint(message?.text);
-    if (!message || this.state.seen.includes(message.key)
+    if (!message || !message.guid || this.state.seen.includes(message.key)
       || this.state.pending.some((action) => action.messageKey === message.key)) return null;
     const nowMs = this.now();
     const pruned = pruneUserMirrorEchoes(this.state, nowMs);

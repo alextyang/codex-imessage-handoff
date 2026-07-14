@@ -1024,6 +1024,14 @@ test("a tagged user-mirror echo can settle before its send GUID is confirmed and
     rootGuid: "root-a",
   });
 
+  assert.equal(router.consumeUserMirrorEcho({
+    id: 58_099,
+    text: tagged,
+    created_at: "2026-07-12T12:00:00.000Z",
+    thread_originator_guid: "root-a",
+  }), null, "even a unique marker and exact root cannot consume the guard without a message GUID");
+  assert.equal(router.isReservedUserMirrorEcho({ id: 58_099, text: tagged }), true);
+
   const consumed = router.consumeUserMirrorEcho(message(58_100, tagged, {
     guid: "early-mirror-guid",
     thread_originator_guid: "root-a",
@@ -1109,6 +1117,29 @@ test("provisional mirror matching excludes pre-reservation backlog and rows outs
     thread_originator_guid: "root-a",
     createdAt: "2026-07-12T12:00:01.000Z",
   })).reservationId, reservationId);
+  assert.equal(router.provisionalUserMirrorEcho(message(58_163, "Repeated visible text", {
+    guid: "lower-bound-guid",
+    thread_originator_guid: "root-a",
+    createdAt: "2026-07-12T12:00:00.000Z",
+  })).reservationId, reservationId, "the exact reservation timestamp is inclusive");
+  assert.equal(router.provisionalUserMirrorEcho(message(58_164, "Repeated visible text", {
+    guid: "upper-bound-guid",
+    thread_originator_guid: "root-a",
+    createdAt: "2026-07-12T12:10:00.000Z",
+  })).reservationId, reservationId, "the exact send-window endpoint is inclusive");
+  assert.equal(router.provisionalUserMirrorEcho({
+    id: 58_165,
+    guid: "missing-time-guid",
+    text: "Repeated visible text",
+    thread_originator_guid: "root-a",
+  }), null, "a synthesized wall-clock timestamp is not correlation evidence");
+  assert.equal(router.provisionalUserMirrorEcho({
+    id: 58_166,
+    guid: "invalid-time-guid",
+    text: "Repeated visible text",
+    thread_originator_guid: "root-a",
+    created_at: "not-a-timestamp",
+  }), null, "an invalid message timestamp is not correlation evidence");
 });
 
 test("a confirmed mirror GUID survives text normalization only with its exact reply root, updates default context, and expires", () => {
