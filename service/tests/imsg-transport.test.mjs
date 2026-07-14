@@ -989,6 +989,46 @@ test("A to B to A renames and repeated manual headers use new durable operations
   assert.equal(resumed.router.nativeThread(THREAD.id).headerRevision, 5);
 });
 
+test("an event-ID header retry keeps its durable operation after the root commits before its receipt", async () => {
+  const ledger = new Map();
+  const firstClient = new DurableDeduplicatingClient(ledger);
+  const first = fixture({ client: firstClient });
+  await first.transport.probe();
+  const event = {
+    kind: "thread.header",
+    deliveryId: "crash-between-route-and-receipt",
+    thread: { ...THREAD, sidebarTitle: THREAD.title },
+  };
+
+  const initial = await first.transport.outbound(event);
+  const [initialAttempt] = firstClient.calls.filter(([kind]) => kind === "rich");
+  const initialOperationId = initialAttempt[2].operationId;
+  assert.deepEqual(initial.guids, ["rich-1"]);
+
+  // Model a process loss after routeOutboundGuid persisted the native root but
+  // before recordOutboundReceipt persisted this event's acceptance.
+  const persisted = JSON.parse(readFileSync(first.stateFile, "utf8"));
+  delete persisted.outboundReceipts["thread.header:crash-between-route-and-receipt"];
+  writeFileSync(first.stateFile, `${JSON.stringify(persisted, null, 2)}\n`, { mode: 0o600 });
+
+  const resumedClient = new DurableDeduplicatingClient(ledger);
+  resumedClient.next = firstClient.next;
+  const resumed = new ImsgTransport({
+    profile: first.profile,
+    stateFile: first.stateFile,
+    client: resumedClient,
+    now: first.now,
+  });
+  await resumed.probe();
+  const replay = await resumed.outbound(event);
+  const [replayAttempt] = resumedClient.calls.filter(([kind]) => kind === "rich");
+
+  assert.equal(replayAttempt[2].operationId, initialOperationId);
+  assert.deepEqual(resumedClient.deduplicated, [initialOperationId]);
+  assert.deepEqual(replay.guids, ["rich-1"]);
+  assert.equal(resumed.router.nativeThread(THREAD.id).rootGuid, "rich-1");
+});
+
 test("attachments also reconcile a canonical sidebar title under the existing native root", async () => {
   const { transport, client } = fixture();
   await transport.probe();
