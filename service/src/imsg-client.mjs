@@ -277,7 +277,9 @@ function normalizedCapabilities(path, raw) {
       readReceipts: advanced && has("read") && raw?.read_receipts === true,
       sendStatus: has("message.send_status"),
       edits: advanced && has("message.edit")
-        && (selectors.editMessage === true || selectors.editMessageItem === true),
+        && (selectors.editMessageItemTranslation === true
+          || selectors.editMessage === true
+          || selectors.editMessageItem === true),
       unsend: advanced && has("message.unsend") && selectors.retractMessagePart === true,
     },
   };

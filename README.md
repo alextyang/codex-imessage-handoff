@@ -30,9 +30,8 @@ Messages account's database or signing material.
 
 - macOS with a separate standard (non-administrator) account signed into the
   service's iMessage identity.
-- `imsg` with both the daemon-safe patch and custom-emoji tapback patch in
-  `docs/`, applied in that order, plus the full IMCore
-  bridge enabled.
+- `imsg` with the daemon-safe, custom-emoji tapback, and macOS 27 edit patches
+  in `docs/`, applied in that order, plus the full IMCore bridge enabled.
 - A healthy supervised shared Codex app-server, with Codex Desktop connected
   to it.
 - Node.js 22.6 or newer and pnpm 10.26.

@@ -152,6 +152,23 @@ test("locates imsg and reports normalized basic and bridge capabilities", async 
   assert.deepEqual(execCalls.map((call) => call.args), [["--version"], ["status", "--json"]]);
 });
 
+test("recognizes the macOS 27 translation-aware edit selector", async () => {
+  const statusFixture = {
+    ...fullStatus,
+    selectors: {
+      ...fullStatus.selectors,
+      editMessage: false,
+      editMessageItem: false,
+      editMessageItemTranslation: true,
+    },
+  };
+  const { client } = createClient({ status: statusFixture });
+
+  const status = await client.probeCapabilities();
+
+  assert.equal(status.capabilities.edits, true);
+});
+
 test("reads one latest local message to baseline a new conversation without RPC", async () => {
   const latest = { id: 902, guid: "LATEST", text: "private existing history" };
   const { client, execCalls } = createClient({ execOptions: { history: [

@@ -1,0 +1,92 @@
+--- a/Sources/IMsgHelper/IMsgInjected.m
++++ b/Sources/IMsgHelper/IMsgInjected.m
+@@ -295,10 +295,11 @@
+ // Populated at startup by probeSelectors(). Surfaced via the `status` action so
+ // the CLI can report which IMCore selectors are present on the running macOS
+ // (edit/unsend names changed across 13/14/15).
+-static BOOL gHasEditMessageItem = NO;        // editMessageItem:atPartIndex:withNewPartText:backwardCompatabilityText:
+-static BOOL gHasEditMessage = NO;            // editMessage:atPartIndex:withNewPartText:backwardCompatabilityText:
+-static BOOL gHasRetractMessagePart = NO;     // retractMessagePart:
+-static BOOL gHasSendMessageReason = NO;      // sendMessage:reason:
++static BOOL gHasEditMessageItemTranslation = NO; // editMessageItem:atPartIndex:withNewPartText:newPartTranslation:backwardCompatabilityText:
++static BOOL gHasEditMessageItem = NO;            // editMessageItem:atPartIndex:withNewPartText:backwardCompatabilityText:
++static BOOL gHasEditMessage = NO;                // editMessage:atPartIndex:withNewPartText:backwardCompatabilityText:
++static BOOL gHasRetractMessagePart = NO;         // retractMessagePart:
++static BOOL gHasSendMessageReason = NO;          // sendMessage:reason:
+ 
+ static BOOL pollPayloadMessageInitializerAvailable(void);
+ static BOOL pollVoteMessageInitializerAvailable(void);
+@@ -308,6 +309,8 @@
+ static void probeSelectors(void) {
+     Class chatClass = NSClassFromString(@"IMChat");
+     if (!chatClass) return;
++    gHasEditMessageItemTranslation = [chatClass instancesRespondToSelector:
++        @selector(editMessageItem:atPartIndex:withNewPartText:newPartTranslation:backwardCompatabilityText:)];
+     gHasEditMessageItem = [chatClass instancesRespondToSelector:
+         @selector(editMessageItem:atPartIndex:withNewPartText:backwardCompatabilityText:)];
+     gHasEditMessage = [chatClass instancesRespondToSelector:
+@@ -317,8 +320,9 @@
+         @selector(retractMessagePart:)];
+     gHasSendMessageReason = [chatClass instancesRespondToSelector:
+         @selector(sendMessage:reason:)];
+-    NSLog(@"[imsg-bridge] Selector probes: editItem=%d editLegacy=%d retract=%d sendReason=%d",
+-          gHasEditMessageItem, gHasEditMessage, gHasRetractMessagePart, gHasSendMessageReason);
++    NSLog(@"[imsg-bridge] Selector probes: editItemTranslation=%d editItem=%d editLegacy=%d retract=%d sendReason=%d",
++          gHasEditMessageItemTranslation, gHasEditMessageItem, gHasEditMessage,
++          gHasRetractMessagePart, gHasSendMessageReason);
+ }
+ 
+ #pragma mark - Forward Declarations for IMCore Classes
+@@ -1001,6 +1005,7 @@
+     BOOL stickerSend = stickerSetIsSticker && stickerSetUserInfo
+         && stickerSetAttribution && stickerTransferCenter && stickerAttachmentMessage;
+     NSDictionary *selectors = @{
++        @"editMessageItemTranslation": @(gHasEditMessageItemTranslation),
+         @"editMessageItem": @(gHasEditMessageItem),
+         @"editMessage": @(gHasEditMessage),
+         @"retractMessagePart": @(gHasRetractMessagePart),
+@@ -5712,7 +5717,7 @@
+         return errorResponse(requestId,
+             [NSString stringWithFormat:@"Chat not found: %@", chatGuid]);
+     }
+-    if (!gHasEditMessageItem && !gHasEditMessage) {
++    if (!gHasEditMessageItemTranslation && !gHasEditMessageItem && !gHasEditMessage) {
+         return errorResponse(requestId, @"No edit-message selector available on this macOS");
+     }
+ 
+@@ -5725,13 +5730,15 @@
+ 
+     @try {
+         NSInteger localPartIndex = partIndex;
+-        if (gHasEditMessageItem) {
++        if (gHasEditMessageItemTranslation || gHasEditMessageItem) {
+             // editMessageItem: takes the IMMessageItem, not the chat item.
+             // findMessageItem returns an IMMessagePartChatItem; reach the
+             // backing item via -messageItem.
+             id messageItem = [item respondsToSelector:@selector(messageItem)]
+                 ? [item performSelector:@selector(messageItem)] : item;
+-            SEL sel = @selector(editMessageItem:atPartIndex:withNewPartText:backwardCompatabilityText:);
++            SEL sel = gHasEditMessageItemTranslation
++                ? @selector(editMessageItem:atPartIndex:withNewPartText:newPartTranslation:backwardCompatabilityText:)
++                : @selector(editMessageItem:atPartIndex:withNewPartText:backwardCompatabilityText:);
+             NSMethodSignature *sig = [chat methodSignatureForSelector:sel];
+             NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
+             [inv setSelector:sel];
+@@ -5741,8 +5748,16 @@
+             [inv setArgument:&localPartIndex atIndex:3];
+             __unsafe_unretained NSAttributedString *newBodyArg = newBody;
+             [inv setArgument:&newBodyArg atIndex:4];
++            NSInteger compatibilityArgumentIndex = 5;
++            if (gHasEditMessageItemTranslation) {
++                // macOS 27 added an optional translated replacement part.
++                // Preserve the user's original language by supplying nil.
++                __unsafe_unretained NSAttributedString *translationArg = nil;
++                [inv setArgument:&translationArg atIndex:5];
++                compatibilityArgumentIndex = 6;
++            }
+             __unsafe_unretained NSAttributedString *bcArg = bcBody;
+-            [inv setArgument:&bcArg atIndex:5];
++            [inv setArgument:&bcArg atIndex:compatibilityArgumentIndex];
+             [inv invoke];
+         } else {
+             // macOS 13 path
