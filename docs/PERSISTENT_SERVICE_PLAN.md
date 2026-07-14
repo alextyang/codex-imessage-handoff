@@ -225,9 +225,14 @@ service chat and exact native task root. Prompt bodies cross stdin rather than
 argv. A private delivery journal, invisible per-part marker, confirmed GUID,
 and dedicated-side echo ledger make the operation crash-idempotent and prevent
 same-body collisions. A provisional bridge response becomes accepted only
-after an exact local GUID/native-root proof. Crash-bound or timed-out writes
-are reconciled without another send; after fifteen minutes, a body-free
-thread notice advances the mirror while the late echo remains quarantined.
+after an exact local GUID/`thread_originator_guid` proof. A short receiver hold
+uses an exact-root visible-body hash only for rows created inside the send's
+timestamp window and lasts through the bounded mutation deadline. Body/root
+correlation never creates a receipt or removes the reservation; if no GUID
+arrives, the candidate is quarantined while the guard remains for later echoes.
+Crash-bound or timed-out writes are reconciled without another send; after
+fifteen minutes, a body-free thread notice advances the mirror while the late
+echo remains quarantined.
 It has no recipient, attachment, URL, watch, launch, or Messages lifecycle API;
 failure is a separate readiness capability and cannot degrade the helper or
 Codex Remote Control.

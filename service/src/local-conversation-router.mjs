@@ -15,6 +15,7 @@ const MAX_RECEIPTS = 512;
 const MAX_THREADS = 512;
 const MAX_OUTBOUND_ECHOES = 128;
 const MAX_USER_MIRROR_ECHOES = 2048;
+const MAX_USER_MIRROR_RECEIPTS = 2048;
 const MAX_CONFIRMATIONS = 512;
 const USER_MIRROR_EARLY_MATCH_MS = 10 * 60 * 1000;
 const USER_MIRROR_RESERVATION_MS = 30 * 24 * 60 * 60 * 1000;
@@ -72,6 +73,7 @@ function emptyState(conversationKey = null) {
     outboundReceipts: {},
     outboundEchoes: [],
     userMirrorEchoes: [],
+    userMirrorReceipts: {},
     confirmationOutbox: [],
     lastUserMessageAt: null,
     lastRowId: 0,
@@ -425,16 +427,30 @@ function normalizeState(value, expectedConversationKey = null) {
       const reservationId = cleanString(echo.reservationId, 96);
       const threadId = cleanString(echo.threadId, 200);
       const fingerprint = cleanString(echo.fingerprint, 64)?.toLowerCase();
+      const provisionalFingerprint = cleanString(echo.provisionalFingerprint, 64)?.toLowerCase();
       const rootGuid = cleanString(echo.rootGuid, 256);
       const expectedGuid = cleanString(echo.expectedGuid, 256);
       const createdAt = isoString(echo.createdAt);
       const earlyUntil = isoString(echo.earlyUntil);
       const expiresAt = isoString(echo.expiresAt);
-      return reservationId && threadId && /^[a-f0-9]{64}$/u.test(fingerprint || "") && rootGuid && createdAt
+      return reservationId && threadId && /^[a-f0-9]{64}$/u.test(fingerprint || "")
+        && (!provisionalFingerprint || /^[a-f0-9]{64}$/u.test(provisionalFingerprint)) && rootGuid && createdAt
         && earlyUntil && expiresAt
-        ? [{ reservationId, threadId, fingerprint, rootGuid, expectedGuid, createdAt, earlyUntil, expiresAt }]
+        ? [{ reservationId, threadId, fingerprint, provisionalFingerprint, rootGuid, expectedGuid, createdAt, earlyUntil, expiresAt }]
         : [];
     }).slice(-MAX_USER_MIRROR_ECHOES);
+  }
+  if (value.userMirrorReceipts && typeof value.userMirrorReceipts === "object" && !Array.isArray(value.userMirrorReceipts)) {
+    for (const [key, receipt] of Object.entries(value.userMirrorReceipts).slice(-MAX_USER_MIRROR_RECEIPTS)) {
+      const reservationId = cleanString(key, 96);
+      const threadId = cleanString(receipt?.threadId, 200);
+      const rootGuid = cleanString(receipt?.rootGuid, 256);
+      const guid = cleanString(receipt?.guid, 256);
+      const consumedAt = isoString(receipt?.consumedAt);
+      if (reservationId && threadId && rootGuid && guid && consumedAt) {
+        state.userMirrorReceipts[reservationId] = { threadId, rootGuid, guid, consumedAt };
+      }
+    }
   }
   if (Array.isArray(value.confirmationOutbox)) {
     state.confirmationOutbox = value.confirmationOutbox
@@ -550,6 +566,13 @@ function echoFingerprint(value) {
 function userMirrorEchoFingerprint(value) {
   const text = typeof value === "string" ? value.trim() : "";
   return text ? createHash("sha256").update(`imsg-user-mirror:${text}`).digest("hex") : null;
+}
+
+function userMirrorProvisionalFingerprint(value) {
+  const text = typeof value === "string"
+    ? value.replace(/\u{E0001}[\u{E0020}-\u{E007E}]*\u{E007F}$/u, "").trim()
+    : "";
+  return text ? createHash("sha256").update(`imsg-user-mirror-visible:${text}`).digest("hex") : null;
 }
 
 function pruneOutboundEchoes(state, nowMs) {
@@ -1157,7 +1180,8 @@ export class LocalConversationRouter {
     const threadId = cleanString(threadIdValue, 200);
     const rootGuid = cleanString(rootGuidValue, 256);
     const fingerprint = userMirrorEchoFingerprint(text);
-    if (!reservationId || !threadId || !rootGuid || !fingerprint) {
+    const provisionalFingerprint = userMirrorProvisionalFingerprint(text);
+    if (!reservationId || !threadId || !rootGuid || !fingerprint || !provisionalFingerprint) {
       throw Object.assign(new TypeError("A complete user-mirror echo reservation is required."), {
         code: "IMSG_MIRROR_ECHO_INVALID",
       });
@@ -1166,12 +1190,15 @@ export class LocalConversationRouter {
     const pruned = pruneUserMirrorEchoes(this.state, nowMs);
     const existing = this.state.userMirrorEchoes.find((echo) => echo.reservationId === reservationId);
     if (existing) {
-      if (existing.threadId !== threadId || existing.rootGuid !== rootGuid || existing.fingerprint !== fingerprint) {
+      if (existing.threadId !== threadId || existing.rootGuid !== rootGuid || existing.fingerprint !== fingerprint
+        || (existing.provisionalFingerprint && existing.provisionalFingerprint !== provisionalFingerprint)) {
         throw Object.assign(new Error("A user-mirror delivery id was reused with different content."), {
           code: "IMSG_MIRROR_ECHO_CONFLICT",
         });
       }
-      if (pruned) writeState(this.stateFile, this.state);
+      const migrated = !existing.provisionalFingerprint;
+      if (migrated) existing.provisionalFingerprint = provisionalFingerprint;
+      if (pruned || migrated) writeState(this.stateFile, this.state);
       return reservationId;
     }
     if (this.state.userMirrorEchoes.length >= MAX_USER_MIRROR_ECHOES) {
@@ -1183,6 +1210,7 @@ export class LocalConversationRouter {
       reservationId,
       threadId,
       fingerprint,
+      provisionalFingerprint,
       rootGuid,
       expectedGuid: null,
       createdAt: new Date(nowMs).toISOString(),
@@ -1201,6 +1229,7 @@ export class LocalConversationRouter {
     const echo = this.state.userMirrorEchoes.find((item) => item.reservationId === reservationId);
     if (!echo && pruned) writeState(this.stateFile, this.state);
     if (!echo) return false;
+    if (echo.expectedGuid && echo.expectedGuid !== guid) return false;
     echo.expectedGuid = guid;
     writeState(this.stateFile, this.state);
     return true;
@@ -1216,6 +1245,63 @@ export class LocalConversationRouter {
     this.state.userMirrorEchoes.splice(index, 1);
     writeState(this.stateFile, this.state);
     return true;
+  }
+
+  userMirrorEchoReceipt(reservationIdValue) {
+    const reservationId = cleanString(reservationIdValue, 96);
+    const receipt = reservationId ? this.state.userMirrorReceipts[reservationId] : null;
+    return receipt ? structuredClone(receipt) : null;
+  }
+
+  provisionalUserMirrorEcho(rawMessage) {
+    const message = normalizeMessage(rawMessage);
+    if (!message || this.state.seen.includes(message.key)
+      || this.state.pending.some((action) => action.messageKey === message.key)) return null;
+    const nowMs = this.now();
+    const pruned = pruneUserMirrorEchoes(this.state, nowMs);
+    const fingerprint = userMirrorProvisionalFingerprint(message.text);
+    const messageCreatedAt = Date.parse(message.createdAt);
+    const index = fingerprint && message.threadOriginatorGuid
+      ? this.state.userMirrorEchoes.findIndex((echo) => !echo.expectedGuid
+        && echo.provisionalFingerprint === fingerprint
+        && echo.rootGuid === message.threadOriginatorGuid
+        // Watch recovery can replay rows that predate a new mirror send. The
+        // visible-body fallback is therefore valid only for a row created
+        // after this reservation and inside its bounded send window. Process
+        // time is intentionally irrelevant: a delayed watch may observe a
+        // legitimate echo long after the row itself was committed.
+        && Number.isFinite(messageCreatedAt)
+        && messageCreatedAt >= Date.parse(echo.createdAt)
+        && messageCreatedAt <= Date.parse(echo.earlyUntil))
+      : -1;
+    if (pruned) writeState(this.stateFile, this.state);
+    if (index < 0) return null;
+    const echo = this.state.userMirrorEchoes[index];
+    return {
+      reservationId: echo.reservationId,
+      threadId: echo.threadId,
+      rootGuid: echo.rootGuid,
+      guid: message.guid,
+      earlyUntil: echo.earlyUntil,
+    };
+  }
+
+  quarantineProvisionalUserMirrorEcho(rawMessage) {
+    const priorState = structuredClone(this.state);
+    try {
+      const candidate = this.provisionalUserMirrorEcho(rawMessage);
+      if (!candidate) return null;
+      // A normalized visible-body match is not proof of which bubble the
+      // normal-profile sender created. Mark this row handled only after the
+      // bounded GUID wait, but retain the reservation so a later exact echo
+      // remains fail-closed. In particular, never create a sender receipt or
+      // remove the only guard based on body/root correlation alone.
+      if (!this.#discard(rawMessage)) return null;
+      return candidate;
+    } catch (error) {
+      this.state = priorState;
+      throw error;
+    }
   }
 
   consumeUserMirrorEcho(rawMessage) {
@@ -1240,7 +1326,7 @@ export class LocalConversationRouter {
       : -1;
     if (index < 0 && fingerprint) index = this.state.userMirrorEchoes.findIndex((echo) => {
       if (echo.expectedGuid || echo.fingerprint !== fingerprint || Date.parse(echo.earlyUntil) < nowMs) return false;
-      const messageRoot = message.threadOriginatorGuid || message.replyToGuid;
+      const messageRoot = message.threadOriginatorGuid;
       return Boolean(messageRoot && messageRoot === echo.rootGuid);
     });
     if (index < 0) {
@@ -1248,25 +1334,42 @@ export class LocalConversationRouter {
       return null;
     }
     const echo = this.state.userMirrorEchoes[index];
-    const messageRoot = message.threadOriginatorGuid || message.replyToGuid;
+    const messageRoot = message.threadOriginatorGuid;
     // A matching send GUID alone does not prove native Reply continuity.
     // Messages can surface a committed bubble before, or without, its reply
     // metadata. Keep the reservation unresolved unless the receiver observes
     // the exact expected root; the transport will quarantine reserved-marker
     // rows that are missing or carry conflicting context.
     if (messageRoot !== echo.rootGuid) return null;
+    return this.#settleUserMirrorEcho(message, echo, index);
+  }
+
+  #settleUserMirrorEcho(message, echo, index) {
     this.state.userMirrorEchoes.splice(index, 1);
     this.state.seen.push(message.key);
     this.state.seen = [...new Set(this.state.seen)].slice(-MAX_SEEN);
     this.state.lastRowId = Math.max(this.state.lastRowId, message.id);
     if (message.guid) routeGuid(this.state, message.guid, echo.threadId);
-    if (messageRoot) routeGuid(this.state, messageRoot, echo.threadId);
+    if (message.threadOriginatorGuid) routeGuid(this.state, message.threadOriginatorGuid, echo.threadId);
     touchThreadState(this.state, echo.threadId, message.createdAt, {
       latestGuid: message.guid,
     });
     this.state.lastUserThreadId = echo.threadId;
     this.state.lastUserThreadAt = message.createdAt;
     this.state.lastUserMessageAt = message.createdAt;
+    if (message.guid) {
+      delete this.state.userMirrorReceipts[echo.reservationId];
+      this.state.userMirrorReceipts[echo.reservationId] = {
+        threadId: echo.threadId,
+        rootGuid: echo.rootGuid,
+        guid: message.guid,
+        consumedAt: new Date(this.now()).toISOString(),
+      };
+      const receipts = Object.entries(this.state.userMirrorReceipts);
+      if (receipts.length > MAX_USER_MIRROR_RECEIPTS) {
+        this.state.userMirrorReceipts = Object.fromEntries(receipts.slice(-MAX_USER_MIRROR_RECEIPTS));
+      }
+    }
     writeState(this.stateFile, this.state);
     return {
       reservationId: echo.reservationId,

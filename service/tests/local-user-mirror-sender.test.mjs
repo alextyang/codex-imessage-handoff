@@ -551,6 +551,56 @@ test("suppresses a tagged receiver echo that arrives before the local send resul
   assert.deepEqual(item.router.pendingActions(), []);
 });
 
+test("a marker-normalized no-GUID response remains ambiguous and cannot promote a body-only candidate", async () => {
+  let item;
+  let delivered = false;
+  const fake = fakeImsg({
+    history: () => delivered
+      ? [
+        rootRow(),
+        {
+          id: 6_101,
+          guid: "NORMALIZED-NO-GUID",
+          chat_id: 42,
+          chat_guid: CHAT_GUID,
+          is_from_me: true,
+          text: "Normalized before bridge result",
+          thread_originator_guid: ROOT_GUID,
+          reply_to_guid: ROOT_GUID,
+        },
+      ]
+      : [rootRow()],
+    onSendRich: ({ params }) => {
+      const candidate = {
+        id: 6_102,
+        guid: "NORMALIZED-NO-GUID",
+        text: "Normalized before bridge result",
+        created_at: "2026-07-14T12:00:01.000Z",
+        thread_originator_guid: ROOT_GUID,
+      };
+      assert.equal(item.router.provisionalUserMirrorEcho(candidate).threadId, THREAD_ID);
+      assert.equal(item.router.quarantineProvisionalUserMirrorEcho(candidate).guid, "NORMALIZED-NO-GUID");
+      delivered = true;
+      assert.equal(localUserMirrorInternals.containsMarker(params.text,
+        localUserMirrorInternals.markerToken("normalized-no-guid", THREAD_ID, 0)), true);
+      return { ok: true, queued: true };
+    },
+  });
+  item = fixture({ fake, reconcileTimeoutMs: 1 });
+  await initialize(item.sender);
+  const result = await item.sender.sendMirror(mirror({
+    deliveryId: "normalized-no-guid",
+    body: "Normalized before bridge result",
+  }));
+  assert.equal(result.classification, "ambiguous");
+  assert.deepEqual(result.guids, []);
+  assert.equal(item.router.userMirrorEchoReceipt(
+    localUserMirrorInternals.deliveryKey("normalized-no-guid", THREAD_ID, 0),
+  ), null);
+  assert.deepEqual(item.router.pendingActions(), []);
+  assert.equal(fake.sendCalls().length, 1);
+});
+
 test("a nominal bridge acceptance remains ambiguous without exact local GUID and Reply-root proof", async (t) => {
   await t.test("accepted response has no GUID", async () => {
     const fake = fakeImsg({
@@ -568,6 +618,7 @@ test("a nominal bridge acceptance remains ambiguous without exact local GUID and
 
   for (const [name, rowContext] of [
     ["accepted GUID row has no Reply root", { thread_originator_guid: null, reply_to_guid: null }],
+    ["accepted GUID row has only an incidental reply parent", { thread_originator_guid: null, reply_to_guid: ROOT_GUID }],
     ["accepted GUID row has the wrong Reply root", { thread_originator_guid: "WRONG-ROOT", reply_to_guid: "WRONG-ROOT" }],
   ]) {
     await t.test(name, async () => {

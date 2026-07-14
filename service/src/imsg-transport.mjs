@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { REQUIRED_PINNED_IMSG_CAPABILITIES } from "./imsg-client.mjs";
 import { createImsgIpcClientFromConfig } from "./imsg-ipc-client.mjs";
 import { safeImsgFailureDetails } from "./imsg-rpc-diagnostics.mjs";
+import { IMSG_LOCAL_MIRROR_CORRELATION_TIMEOUT_MS } from "./imsg-timeouts.mjs";
 import { LocalConversationRouter } from "./local-conversation-router.mjs";
 import { renderRichOutboundIntents, richTextIntent } from "../../protocol/rich-presentation.ts";
 import {
@@ -33,6 +34,17 @@ const POLL_OPTION_IDENTIFIER = "00000000-0000-0000-0000-000000000000";
 // formatting and JSON framing never turn a valid transcript into a retry loop.
 const MAX_TEXT_BUBBLE_BYTES = 96 * 1024;
 const MULTIPART_PREFIX_RESERVE_BYTES = 32;
+// A marker-normalized echo cannot be distinguished from an identical genuine
+// reply until the normal-profile send returns its GUID. Keep the ordered
+// inbound cursor behind that candidate for the complete mutation window; the
+// common case resolves as soon as the GUID arrives, while a hung send remains
+// fail-closed instead of becoming a duplicate Codex prompt.
+const DEFAULT_PROVISIONAL_MIRROR_HOLD_MS = IMSG_LOCAL_MIRROR_CORRELATION_TIMEOUT_MS;
+const DEFAULT_PROVISIONAL_MIRROR_POLL_MS = 25;
+
+function delay(milliseconds) {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
 
 function clean(value) {
   return typeof value === "string" ? value.trim() : "";
@@ -417,6 +429,8 @@ export class ImsgTransport {
     watchRetryBaseMs = 500,
     watchRetryMaxMs = 30_000,
     commandContextTtlMs,
+    provisionalMirrorHoldMs = DEFAULT_PROVISIONAL_MIRROR_HOLD_MS,
+    provisionalMirrorPollMs = DEFAULT_PROVISIONAL_MIRROR_POLL_MS,
     onHealthChange = null,
   } = {}) {
     if (!profile || !Number.isSafeInteger(Number(profile.chatId)) || Number(profile.chatId) <= 0 || !clean(profile.chatGuid)) {
@@ -459,6 +473,9 @@ export class ImsgTransport {
     this.typingThreads = new Set();
     this.readObservation = null;
     this.sendQueue = Promise.resolve();
+    this.inboundQueue = Promise.resolve();
+    this.provisionalMirrorHoldMs = Math.max(0, Number(provisionalMirrorHoldMs) || 0);
+    this.provisionalMirrorPollMs = Math.max(1, Number(provisionalMirrorPollMs) || DEFAULT_PROVISIONAL_MIRROR_POLL_MS);
     this.watchCallbacks = null;
     this.watchSubscribePromise = null;
     this.startPromise = null;
@@ -647,53 +664,15 @@ export class ImsgTransport {
     const watch = await this.client.subscribeWatch(this._watchParams(), {
       onMessage: (message) => {
         if (this.stopped || generation !== this.watchGeneration) return;
-        try {
-          const hasChatId = message.chat_id !== undefined && message.chat_id !== null;
-          const hasChatGuid = Boolean(clean(message.chat_guid));
-          if (!hasChatId && !hasChatGuid) return;
-          if (hasChatId && Number(message.chat_id) !== this.profile.chatId) return;
-          if (hasChatGuid && clean(message.chat_guid) !== this.profile.chatGuid) return;
-          if (message.is_from_me === true) {
-            this.router.discard(message);
-            return;
-          }
-          if (this.profile.expectedSender && clean(message.sender) !== clean(this.profile.expectedSender)) {
-            this.router.discard(message);
-            return;
-          }
-          const userMirror = this.router.consumeUserMirrorEcho(message);
-          if (userMirror) {
-            // The locally-authored user bubble is a real inbound message for
-            // the dedicated service identity. Observe it only after the echo
-            // and route were durably committed so the normal profile gets a
-            // read receipt without the prompt being executed twice.
-            this.observeInbound().catch(() => {});
-            return;
-          }
-          if (this.router.isReservedUserMirrorEcho(message)) {
-            // A copied/normalized marker with conflicting context must never
-            // become a Codex prompt. Quarantine that row while retaining the
-            // real reservation for its confirmed GUID.
-            this.router.discard(message);
-            this.observeInbound().catch(() => {});
-            return;
-          }
-          if (this.router.consumeOutboundEcho(message)) return;
-          const action = this.router.ingest(message);
-          // A receipt is visible to the sender, so emit it only after the inbox
-          // cursor/action has been committed. Ignored reactions and poll rows
-          // also reach this point after their durable discard.
-          this.observeInbound().catch(() => {});
-          if (action) {
-            Promise.resolve(this.watchCallbacks?.onAction?.(action, message))
-              .catch((error) => this._handleWatchError(error, generation));
-          }
-        } catch (error) {
+        const operation = this.inboundQueue.catch(() => {}).then(
+          () => this._processWatchMessage(message, generation),
+        );
+        this.inboundQueue = operation.catch((error) => {
           // Persistence failures must invalidate the watch. LocalConversationRouter
           // rolls its in-memory cursor back, so resubscription starts at the last
           // committed row without logging any inbound content or handles.
           this._handleWatchError(error, generation);
-        }
+        });
       },
       onError: (error) => this._handleWatchError(error, generation),
     });
@@ -705,6 +684,89 @@ export class ImsgTransport {
     this.watchRetryMs = this.watchRetryBaseMs;
     this._setWatchHealth(true);
     return true;
+  }
+
+  async _processWatchMessage(message, generation) {
+    if (this.stopped || generation !== this.watchGeneration) return;
+    const hasChatId = message.chat_id !== undefined && message.chat_id !== null;
+    const hasChatGuid = Boolean(clean(message.chat_guid));
+    if (!hasChatId && !hasChatGuid) return;
+    if (hasChatId && Number(message.chat_id) !== this.profile.chatId) return;
+    if (hasChatGuid && clean(message.chat_guid) !== this.profile.chatGuid) return;
+    if (message.is_from_me === true) {
+      this.router.discard(message);
+      return;
+    }
+    if (this.profile.expectedSender && clean(message.sender) !== clean(this.profile.expectedSender)) {
+      this.router.discard(message);
+      return;
+    }
+    let userMirror = this.router.consumeUserMirrorEcho(message);
+    if (userMirror) {
+      // The locally-authored user bubble is a real inbound message for the
+      // dedicated service identity. Observe it only after the echo and route
+      // were durably committed so it cannot execute as a second Codex prompt.
+      this.observeInbound().catch(() => {});
+      return;
+    }
+    if (this.router.isReservedUserMirrorEcho(message)) {
+      // A copied marker with conflicting context must never become a prompt.
+      this.router.discard(message);
+      this.observeInbound().catch(() => {});
+      return;
+    }
+
+    let provisional = this.router.provisionalUserMirrorEcho(message);
+    if (provisional) {
+      const deadline = Date.now() + this.provisionalMirrorHoldMs;
+      while (provisional && Date.now() < deadline) {
+        await delay(Math.min(this.provisionalMirrorPollMs, Math.max(1, deadline - Date.now())));
+        if (this.stopped || generation !== this.watchGeneration) return;
+        userMirror = this.router.consumeUserMirrorEcho(message);
+        if (userMirror) {
+          this.observeInbound().catch(() => {});
+          return;
+        }
+        provisional = this.router.provisionalUserMirrorEcho(message);
+      }
+      if (provisional) {
+        // The complete sender window elapsed without authoritative GUID
+        // evidence. Quarantine this one candidate but retain the reservation:
+        // a second same-body/root bubble may be the actual mirror, so consuming
+        // the guard here could execute it as a duplicate Codex prompt.
+        const quarantined = this.router.quarantineProvisionalUserMirrorEcho(message);
+        if (quarantined) {
+          this.observeInbound().catch(() => {});
+          return;
+        }
+        // Confirmation can race the final provisional check. Re-evaluate the
+        // authoritative GUID path once more before ordinary prompt ingestion.
+        userMirror = this.router.consumeUserMirrorEcho(message);
+        if (userMirror) {
+          this.observeInbound().catch(() => {});
+          return;
+        }
+      }
+      // The expected GUID may have been committed between the loop's consume
+      // and candidate refresh, causing `provisional` to become null. Close that
+      // last interleaving before allowing ordinary prompt ingestion.
+      userMirror = this.router.consumeUserMirrorEcho(message);
+      if (userMirror) {
+        this.observeInbound().catch(() => {});
+        return;
+      }
+    }
+
+    if (this.router.consumeOutboundEcho(message)) return;
+    const action = this.router.ingest(message);
+    // A receipt is visible to the sender, so emit it only after the inbox
+    // cursor/action has been committed. Ignored reactions and poll rows also
+    // reach this point after their durable discard.
+    this.observeInbound().catch(() => {});
+    if (action) {
+      Promise.resolve(this.watchCallbacks?.onAction?.(action, message))
+        .catch((error) => this._handleWatchError(error, generation));
+    }
   }
 
   _handleWatchError(error, generation) {

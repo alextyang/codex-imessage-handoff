@@ -183,6 +183,8 @@ function fixture(options = {}) {
     watchRetryBaseMs: options.watchRetryBaseMs,
     watchRetryMaxMs: options.watchRetryMaxMs,
     commandContextTtlMs: options.commandContextTtlMs,
+    provisionalMirrorHoldMs: options.provisionalMirrorHoldMs,
+    provisionalMirrorPollMs: options.provisionalMirrorPollMs,
   });
   return { transport, client, profile, stateFile, now: () => now, advance: (milliseconds) => { now += milliseconds; } };
 }
@@ -899,6 +901,182 @@ test("normal-profile user mirrors are GUID-suppressed, routed, and acknowledged 
   assert.equal(transport.router.nativeThread(THREAD.id).latestGuid, "normal-profile-guid");
   assert.equal(transport.router.lastUserThreadId, THREAD.id);
   assert.ok(client.calls.some(([kind]) => kind === "read"));
+  await transport.stop();
+});
+
+test("an early marker-normalized user mirror is held, suppressed on its exact native root, and leaves a sender receipt", async () => {
+  const { transport, client } = fixture({ provisionalMirrorHoldMs: 5, provisionalMirrorPollMs: 1 });
+  const actions = [];
+  await transport.start({ onAction: (action) => actions.push(action) });
+  transport.router.routeOutboundGuid("normalized-root", THREAD.id, { root: true });
+  const reservationId = "f".repeat(64);
+  transport.router.reserveUserMirrorEcho({
+    reservationId,
+    threadId: THREAD.id,
+    text: "Visible normalized body\u{E0001}\u{E0061}\u{E007F}",
+    rootGuid: "normalized-root",
+  });
+
+  client.watchHandlers.onMessage({
+    id: 20_401,
+    guid: "normalized-early-guid",
+    chat_id: 42,
+    chat_guid: "iMessage;-;+15550000000",
+    sender: "+15551111111",
+    is_from_me: false,
+    text: "Visible normalized body",
+    thread_originator_guid: "normalized-root",
+    created_at: "2026-07-12T12:00:03.000Z",
+  });
+  setTimeout(() => transport.router.confirmUserMirrorEcho(reservationId, "normalized-early-guid"), 2);
+  await new Promise((resolve) => setTimeout(resolve, 20));
+
+  assert.deepEqual(actions, []);
+  assert.equal(transport.router.lastRowId, 20_401);
+  assert.deepEqual(transport.router.pendingActions(), []);
+  assert.deepEqual(transport.router.userMirrorEchoReceipt(reservationId), {
+    threadId: THREAD.id,
+    rootGuid: "normalized-root",
+    guid: "normalized-early-guid",
+    consumedAt: "2026-07-12T12:00:00.000Z",
+  });
+  assert.ok(client.calls.some(([kind]) => kind === "read"));
+  await transport.stop();
+});
+
+test("watch recovery routes an identical pre-reservation backlog row as genuine user input", async () => {
+  const { transport, client } = fixture({ provisionalMirrorHoldMs: 5, provisionalMirrorPollMs: 1 });
+  const actions = [];
+  await transport.start({ onAction: (action) => actions.push(action) });
+  transport.router.routeOutboundGuid("backlog-root", THREAD.id, { root: true });
+  transport.router.reserveUserMirrorEcho({
+    reservationId: "4".repeat(64),
+    threadId: THREAD.id,
+    text: "Backlogged identical text\u{E0001}\u{E0061}\u{E007F}",
+    rootGuid: "backlog-root",
+  });
+
+  client.watchHandlers.onMessage({
+    id: 20_403,
+    guid: "old-genuine-guid",
+    chat_id: 42,
+    chat_guid: "iMessage;-;+15550000000",
+    sender: "+15551111111",
+    is_from_me: false,
+    text: "Backlogged identical text",
+    thread_originator_guid: "backlog-root",
+    created_at: "2026-07-12T10:00:00.000Z",
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(actions.length, 1);
+  assert.equal(actions[0].messageKey, "old-genuine-guid");
+  assert.equal(actions[0].threadId, THREAD.id);
+  assert.equal(actions[0].body, "Backlogged identical text");
+  await transport.stop();
+});
+
+test("an unresolved normalized candidate never consumes the guard for a later same-body mirror", async () => {
+  const { transport, client } = fixture({ provisionalMirrorHoldMs: 2, provisionalMirrorPollMs: 1 });
+  const actions = [];
+  await transport.start({ onAction: (action) => actions.push(action) });
+  transport.router.routeOutboundGuid("slow-root", THREAD.id, { root: true });
+  const reservationId = "3".repeat(64);
+  transport.router.reserveUserMirrorEcho({
+    reservationId,
+    threadId: THREAD.id,
+    text: "Slow identical text\u{E0001}\u{E0061}\u{E007F}",
+    rootGuid: "slow-root",
+  });
+
+  const candidate = (id, guid) => ({
+    id,
+    guid,
+    chat_id: 42,
+    chat_guid: "iMessage;-;+15550000000",
+    sender: "+15551111111",
+    is_from_me: false,
+    text: "Slow identical text",
+    thread_originator_guid: "slow-root",
+    created_at: "2026-07-12T12:00:04.000Z",
+  });
+  client.watchHandlers.onMessage(candidate(20_404, "first-unresolved-guid"));
+  client.watchHandlers.onMessage(candidate(20_405, "later-actual-guid"));
+  await new Promise((resolve) => setTimeout(resolve, 20));
+
+  assert.deepEqual(actions, []);
+  assert.equal(transport.router.userMirrorEchoReceipt(reservationId), null);
+  assert.equal(transport.router.provisionalUserMirrorEcho(candidate(20_406, "third-candidate-guid")).reservationId,
+    reservationId, "the fail-closed reservation must survive every body-only candidate");
+  assert.equal(transport.router.lastRowId, 20_405);
+  await transport.stop();
+});
+
+test("the provisional hold releases a genuine same-body message when the sender confirms a different GUID", async () => {
+  const { transport, client } = fixture({ provisionalMirrorHoldMs: 30, provisionalMirrorPollMs: 1 });
+  const actions = [];
+  await transport.start({ onAction: (action) => actions.push(action) });
+  transport.router.routeOutboundGuid("collision-root", THREAD.id, { root: true });
+  const reservationId = "8".repeat(64);
+  transport.router.reserveUserMirrorEcho({
+    reservationId,
+    threadId: THREAD.id,
+    text: "Identical visible text\u{E0001}\u{E0061}\u{E007F}",
+    rootGuid: "collision-root",
+  });
+
+  client.watchHandlers.onMessage({
+    id: 20_405,
+    guid: "genuine-collision-guid",
+    chat_id: 42,
+    chat_guid: "iMessage;-;+15550000000",
+    sender: "+15551111111",
+    is_from_me: false,
+    text: "Identical visible text",
+    thread_originator_guid: "collision-root",
+    created_at: "2026-07-12T12:00:05.000Z",
+  });
+  setTimeout(() => transport.router.confirmUserMirrorEcho(reservationId, "actual-mirror-guid"), 2);
+  await new Promise((resolve) => setTimeout(resolve, 20));
+
+  assert.equal(actions.length, 1);
+  assert.equal(actions[0].messageKey, "genuine-collision-guid");
+  assert.equal(actions[0].body, "Identical visible text");
+  assert.equal(transport.router.userMirrorEchoReceipt(reservationId), null);
+  await transport.stop();
+});
+
+test("reply_to_guid alone cannot settle a local user mirror as a native Reply", async () => {
+  const { transport, client } = fixture({ provisionalMirrorHoldMs: 1, provisionalMirrorPollMs: 1 });
+  const actions = [];
+  await transport.start({ onAction: (action) => actions.push(action) });
+  transport.router.routeOutboundGuid("strict-originator-root", THREAD.id, { root: true });
+  const reservationId = "9".repeat(64);
+  transport.router.reserveUserMirrorEcho({
+    reservationId,
+    threadId: THREAD.id,
+    text: "Tagged malformed reply\u{E0001}\u{E0061}\u{E007F}",
+    rootGuid: "strict-originator-root",
+  });
+  transport.router.confirmUserMirrorEcho(reservationId, "malformed-reply-guid");
+
+  client.watchHandlers.onMessage({
+    id: 20_402,
+    guid: "malformed-reply-guid",
+    chat_id: 42,
+    chat_guid: "iMessage;-;+15550000000",
+    sender: "+15551111111",
+    is_from_me: false,
+    text: "Tagged malformed reply\u{E0001}\u{E0061}\u{E007F}",
+    reply_to_guid: "strict-originator-root",
+    created_at: "2026-07-12T12:00:04.000Z",
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.deepEqual(actions, []);
+  assert.deepEqual(transport.router.pendingActions(), []);
+  assert.equal(transport.router.lastRowId, 20_402, "the malformed reserved echo is quarantined durably");
+  assert.equal(transport.router.userMirrorEchoReceipt(reservationId), null);
   await transport.stop();
 });
 
@@ -2706,6 +2884,7 @@ test("an inbound persistence exception rolls the watch back to its committed cur
     created_at: "2026-07-12T12:00:00.000Z",
   };
   client.watchHandlers.onMessage(inbound);
+  await new Promise((resolve) => setImmediate(resolve));
   assert.equal(transport.isHealthy(), false);
   assert.equal(transport.router.lastRowId, 0);
   assert.equal(client.calls.filter(([kind]) => kind === "read").length, 0);

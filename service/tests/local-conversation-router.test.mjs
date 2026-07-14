@@ -983,6 +983,10 @@ test("user-mirror echo reservations are durable, content-free, root-scoped, and 
   })), null);
   assert.equal(resumed.confirmUserMirrorEcho(reservationId, "confirmed-mirror-guid"), true);
   assert.equal(resumed.consumeUserMirrorEcho(message(58_003, tagged, {
+    guid: "confirmed-mirror-guid",
+    reply_to_guid: "root-a",
+  })), null, "an incidental reply parent is not a native Reply originator");
+  assert.equal(resumed.consumeUserMirrorEcho(message(58_003, tagged, {
     guid: "different-guid",
     thread_originator_guid: "root-a",
   })), null, "a confirmed reservation must not consume a different sender message");
@@ -1036,6 +1040,75 @@ test("a tagged user-mirror echo can settle before its send GUID is confirmed and
     guid: "early-mirror-guid",
     thread_originator_guid: "root-a",
   })), null);
+});
+
+test("an early marker-normalized echo can be quarantined without consuming its fail-closed reservation", () => {
+  const { router, stateFile } = fixture();
+  router.routeOutboundGuid("root-a", "thread-a", { root: true });
+  const reservationId = "7".repeat(64);
+  const tagged = localUserMirrorInternals.taggedText(
+    "Normalized before result",
+    "codex-mirror-77777777777777777777777777777777",
+  );
+  router.reserveUserMirrorEcho({ reservationId, threadId: "thread-a", text: tagged, rootGuid: "root-a" });
+  const normalized = message(58_150, "Normalized before result", {
+    guid: "normalized-before-result-guid",
+    thread_originator_guid: "root-a",
+  });
+
+  assert.equal(router.consumeUserMirrorEcho(normalized), null);
+  assert.equal(router.isReservedUserMirrorEcho(normalized), false);
+  assert.equal(router.provisionalUserMirrorEcho(normalized).reservationId, reservationId);
+  assert.equal(router.provisionalUserMirrorEcho(message(58_151, "Normalized before result", {
+    guid: "incidental-parent-only",
+    reply_to_guid: "root-a",
+  })), null, "an incidental reply parent is not an authoritative provisional root");
+
+  const quarantined = router.quarantineProvisionalUserMirrorEcho(normalized);
+  assert.equal(quarantined.threadId, "thread-a");
+  assert.deepEqual(router.pendingActions(), []);
+  assert.equal(router.userMirrorEchoReceipt(reservationId), null);
+  const laterCandidate = message(58_152, "Normalized before result", {
+    guid: "later-same-body-guid",
+    thread_originator_guid: "root-a",
+    createdAt: "2026-07-12T12:00:02.000Z",
+  });
+  assert.equal(router.provisionalUserMirrorEcho(laterCandidate).reservationId, reservationId,
+    "quarantining one ambiguous row must retain the guard for a later actual mirror");
+  const persisted = readFileSync(stateFile, "utf8");
+  assert.equal(persisted.includes("Normalized before result"), false);
+  assert.equal(persisted.includes("codex-mirror-777"), false);
+
+  const resumed = new LocalConversationRouter({ stateFile });
+  assert.equal(resumed.userMirrorEchoReceipt(reservationId), null);
+  assert.equal(resumed.provisionalUserMirrorEcho(laterCandidate).reservationId, reservationId);
+});
+
+test("provisional mirror matching excludes pre-reservation backlog and rows outside the send window", () => {
+  const { router } = fixture();
+  router.routeOutboundGuid("root-a", "thread-a", { root: true });
+  const reservationId = "6".repeat(64);
+  const tagged = localUserMirrorInternals.taggedText(
+    "Repeated visible text",
+    "codex-mirror-66666666666666666666666666666666",
+  );
+  router.reserveUserMirrorEcho({ reservationId, threadId: "thread-a", text: tagged, rootGuid: "root-a" });
+
+  assert.equal(router.provisionalUserMirrorEcho(message(58_160, "Repeated visible text", {
+    guid: "old-genuine-guid",
+    thread_originator_guid: "root-a",
+    createdAt: "2026-07-12T10:00:00.000Z",
+  })), null, "watch recovery must not correlate a row created before the reservation");
+  assert.equal(router.provisionalUserMirrorEcho(message(58_161, "Repeated visible text", {
+    guid: "too-late-guid",
+    thread_originator_guid: "root-a",
+    createdAt: "2026-07-12T12:10:00.001Z",
+  })), null, "visible-body correlation is bounded by the reservation's send window");
+  assert.equal(router.provisionalUserMirrorEcho(message(58_162, "Repeated visible text", {
+    guid: "in-window-guid",
+    thread_originator_guid: "root-a",
+    createdAt: "2026-07-12T12:00:01.000Z",
+  })).reservationId, reservationId);
 });
 
 test("a confirmed mirror GUID survives text normalization only with its exact reply root, updates default context, and expires", () => {

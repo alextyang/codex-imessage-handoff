@@ -48,9 +48,14 @@ service conversation. The body travels over the child's stdin, never process
 arguments. A durable invisible delivery marker and the shared message GUID
 suppress the dedicated-account echo without suppressing genuine same-text
 messages. A send is accepted only after the normal profile observes that exact
-GUID on the expected native Reply root. Ambiguous writes are reconciled without
-resending; after 15 minutes, a content-free task notice unblocks later output
-while the late-echo quarantine remains active. This sender cannot select
+GUID with the expected native `thread_originator_guid`. If Apple normalizes the
+invisible marker before the GUID returns, the receiver defers an exact-root,
+visible-body-hash candidate created inside that send's timestamp window until
+the complete bounded mutation window ends. Body/root correlation alone never
+creates a receipt or consumes the reservation; an unresolved row is
+quarantined while the guard remains active for any later echo. Ambiguous writes
+are reconciled without resending; after 15 minutes, a content-free task notice
+unblocks later output while the late-echo quarantine remains active. This sender cannot select
 recipients, send files or URLs, watch Messages, launch/relaunch Messages, or
 control any Codex process.
 

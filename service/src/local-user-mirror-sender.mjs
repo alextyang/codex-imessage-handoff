@@ -583,8 +583,7 @@ export class LocalUserMirrorSender {
     const requiredGuid = clean(expectedGuid);
     const rows = await this.#history().catch(() => []);
     return rows.find((row) => {
-      const contextRoot = clean(row?.thread_originator_guid ?? row?.threadOriginatorGuid)
-        || clean(row?.reply_to_guid ?? row?.replyToGuid);
+      const contextRoot = clean(row?.thread_originator_guid ?? row?.threadOriginatorGuid);
       return row?.is_from_me === true
         && (requiredGuid ? messageGuid(row) === requiredGuid : containsMarker(row?.text, entry.token))
         && contextRoot === entry.rootGuid;
@@ -669,6 +668,14 @@ export class LocalUserMirrorSender {
       };
       this.#saveDelivery(key, entry);
     }
+    const receiverReceiptGuid = clean(this.router.userMirrorEchoReceipt?.(key)?.guid);
+    if (!entry.guid && receiverReceiptGuid) entry.guid = receiverReceiptGuid;
+    if (!receiverReceiptGuid && ["attempting", "ambiguous", "dead-letter"].includes(entry.status)) {
+      // Re-establish or migrate the body-free receiver reservation before any
+      // crash reconciliation. This never sends; it only preserves late-echo
+      // suppression if the router restarted between the RPC write and result.
+      this.router.reserveUserMirrorEcho({ reservationId: key, threadId, text, rootGuid });
+    }
     if (entry.status === "accepted") {
       if (entry.guid) {
         if (!this.router.hasSeenMessageGuid(entry.guid)) {
@@ -748,7 +755,7 @@ export class LocalUserMirrorSender {
       }
       result = { classification: "accepted", ok: true, guid: messageGuid(recovered) };
     }
-    const guid = messageGuid(result);
+    const guid = messageGuid(result) || clean(this.router.userMirrorEchoReceipt?.(key)?.guid);
     if (guid) entry.guid = guid;
     // A bridge acknowledgement is only provisional. `send.rich` may return
     // ok/queued without a GUID, and its built-in verifier does not prove that
