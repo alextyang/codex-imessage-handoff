@@ -30,7 +30,7 @@ import { RunManager } from "./run-manager.mjs";
 import { RolloutActivityMonitor } from "./rollout-activity-monitor.mjs";
 import { ServerRequestBroker } from "./server-request-broker.mjs";
 import { FailureQueue } from "./failure-queue.mjs";
-import { isTerminalLocalActionFailure, LocalActionDispatch } from "./local-action-dispatch.mjs";
+import { isImmediateLocalAction, isTerminalLocalActionFailure, LocalActionDispatch } from "./local-action-dispatch.mjs";
 import { loadClaimedJobs, markClaimedJobState, removeClaimedJob, saveClaimedJob } from "./claimed-store.mjs";
 import { admitClaimedJob } from "./claimed-job-admission.mjs";
 import { unconfirmedRecoveryDisposition } from "./recovered-run-policy.mjs";
@@ -942,14 +942,14 @@ async function executeReply(event, context) {
           code: "queued",
           thread: threadLabel(thread),
           body: pairingRequired
-            ? "Remote access needs to be paired with Codex before this message can run. Open Settings → Connections → Control this Mac, then pair the iMessage client. Your message remains pending.\n\n/cancel · /thread"
+            ? "Remote access needs to be paired with Codex before this message can run. Open Settings → Connections → Control this Mac, then pair the iMessage client. Your message remains pending.\n\n‼️ Emphasize to stop · /thread"
             : setupRequired
-            ? "Remote access needs attention on the Mac before this message can run. Your message remains pending.\n\n/cancel · /thread"
+            ? "Remote access needs attention on the Mac before this message can run. Your message remains pending.\n\n‼️ Emphasize to stop · /thread"
             : hostOffline
-            ? "The Codex host is offline. Your message is pending and will start when it reconnects.\n\n/cancel · /thread"
+            ? "The Codex host is offline. Your message is pending and will start when it reconnects.\n\n‼️ Emphasize to stop · /thread"
             : backendUnavailable
-            ? "Remote Control is reconnecting. Your message remains pending.\n\n/cancel · /thread"
-            : "This task is already working locally. Your message is pending and will start when it is free.\n\n/cancel · /thread",
+            ? "Remote Control is reconnecting. Your message remains pending.\n\n‼️ Emphasize to stop · /thread"
+            : "This task is already working locally. Your message is pending and will start when it is free.\n\n‼️ Emphasize to stop · /thread",
         });
       }
     } else {
@@ -1004,7 +1004,7 @@ function enqueueReply(event) {
         deliveryId: `run:${event.replyId}:queued`,
         code: "queued",
         thread: threadLabel(thread),
-        body: "Pending. Codex will start this message when a run slot is free.\n\n/cancel · /thread · /threads",
+        body: "Pending. Codex will start this message when a run slot is free.\n\n‼️ Emphasize to stop · /thread · /threads",
       });
     } catch {
       log("Could not publish pending state.");
@@ -1596,42 +1596,41 @@ async function handleNewThreadAction(action) {
   return null;
 }
 
+async function stopTask(threadIdValue) {
+  const threadId = String(threadIdValue || "");
+  const thread = threadId ? catalogById.get(threadId) : null;
+  if (threadId) imsgTransport.router.consumeThreadListen(threadId);
+  const selectionCleared = imsgTransport.router.clearAwaitingPrompt(threadId || null);
+  if (selectionCleared) {
+    scheduleLiveMirrorScan();
+    scheduleCompletionScan();
+  }
+  cancelledThrough.set(threadId, Date.now());
+  const claiming = ingestPendingCounts.get(threadId)
+    || [...claimingReplyIds.values()].filter((id) => id === threadId).length;
+  const cancelled = await runs.cancel(threadId);
+  const notice = manualSelectionCancellationNotice({
+    selectionCleared,
+    active: cancelled.active,
+    pending: cancelled.pending,
+    claiming,
+  });
+  if (notice) {
+    await sendOutbound({
+      kind: "service.notice",
+      ...notice,
+      thread: thread ? threadLabel(thread) : undefined,
+    });
+  }
+  return notice;
+}
+
 async function handleControl(event) {
   const command = String(event.command || "").toLowerCase();
   const thread = event.threadId ? catalogById.get(String(event.threadId)) : null;
   if (command === "threads" || command === "recent" || command === "refresh") {
     await publishThreadDirectory(event.threadId);
     return null;
-  }
-  if (command === "cancel") {
-    const threadId = event.threadId ? String(event.threadId) : "";
-    if (threadId) imsgTransport.router.consumeThreadListen(threadId);
-    // Top-level /cancel consumes the awaiting-prompt lease atomically during
-    // routing, while a native Reply /cancel is cleared here. Preserve either
-    // path so selection-only cancellation never reports that no work existed.
-    const selectionCleared = imsgTransport.router.clearAwaitingPrompt(threadId || null)
-      || event.fromAwaitingPrompt === true;
-    if (selectionCleared) {
-      scheduleLiveMirrorScan();
-      scheduleCompletionScan();
-    }
-    cancelledThrough.set(threadId, Date.now());
-    const claiming = ingestPendingCounts.get(threadId) || [...claimingReplyIds.values()].filter((id) => id === threadId).length;
-    const cancelled = await runs.cancel(threadId);
-    const notice = manualSelectionCancellationNotice({
-      selectionCleared,
-      active: cancelled.active,
-      pending: cancelled.pending,
-      claiming,
-    });
-    if (notice) {
-      await sendOutbound({
-        kind: "service.notice",
-        ...notice,
-        thread: thread ? threadLabel(thread) : undefined,
-      });
-    }
-    return notice ? { reaction: "🛑" } : { reaction: "❌" };
   }
   if (!thread) {
     await sendOutbound({ kind: "service.notice", code: "needs-attention", body: "That task is no longer available.\n\n/threads" });
@@ -1646,15 +1645,6 @@ async function handleControl(event) {
       body: "Listening for the next turn’s live updates.",
     });
     return { reaction: "👂" };
-  }
-  if (command === "link") {
-    await sendOutbound({
-      kind: "service.notice",
-      code: "updated",
-      thread: threadLabel(thread),
-      body: `codex://threads/${encodeURIComponent(thread.id)}`,
-    });
-    return { reaction: "🔗" };
   }
   if (command === "mute" || command === "unmute") {
     const muted = command === "mute";
@@ -1742,7 +1732,7 @@ async function handleControl(event) {
     const failed = failedRuns.next(thread.id);
     if (!failed) {
       const body = failures.length
-        ? "The failed message is already pending or running.\n\n/thread · /cancel"
+        ? "The failed message is already pending or running.\n\n‼️ Emphasize to stop · /thread"
         : "There is no failed iMessage request to retry.\n\n/turn · /threads";
       await sendOutbound({ kind: "service.notice", code: "needs-attention", thread: threadLabel(thread), body });
       return { reaction: "❌" };
@@ -1768,7 +1758,7 @@ async function handleControl(event) {
       return { reaction: "❌" };
     }
     if (failed.retrying) {
-      await sendOutbound({ kind: "service.notice", code: "needs-attention", thread: threadLabel(thread), body: "That failed request is already pending or running. Use /cancel before dismissing it." });
+      await sendOutbound({ kind: "service.notice", code: "needs-attention", thread: threadLabel(thread), body: "That failed request is already pending or running. Emphasize a message in this task to stop it before dismissing." });
       return { reaction: "❌" };
     }
     await settleLiveSuppression(failed, thread, { forceClear: true });
@@ -2091,6 +2081,10 @@ async function handleLocalAction(action) {
       });
       return null;
     }
+    if (action.command === "stop") {
+      await stopTask(thread.id);
+      return null;
+    }
   }
   if (action.kind === "threads" || action.kind === "refresh") {
     await publishThreadDirectory(imsgTransport.router.lastUserThreadId);
@@ -2177,7 +2171,7 @@ async function handleLocalAction(action) {
           kind: "service.notice",
           code: "updated",
           thread: threadLabel(thread),
-          body: "Send the message you want to run in this task. Reply /cancel to leave this selection.",
+          body: "Send the message you want to run in this task. This selection expires in about 2 minutes if unused.",
         }),
       });
     }
@@ -2277,7 +2271,7 @@ const localActionDispatch = new LocalActionDispatch(processLocalAction);
 
 function queueLocalAction(action) {
   return localActionDispatch.enqueue(action, {
-    immediate: action?.kind === "control" && action.command === "cancel",
+    immediate: isImmediateLocalAction(action),
   });
 }
 

@@ -100,12 +100,12 @@ test("trimmed Markdown link labels clamp nested formatting to the emitted label"
 });
 
 test("rich text intents retain an exact Markdown fallback", () => {
-  const fallbackText = "🧪 **A task**\n\n▲ Needs attention\nReasoning: high\n\ncodex://threads/a-task\n\n/listen · /link · /mute\n/turn · /history · /reasoning · /cancel";
+  const fallbackText = "🧪 **A task**\n\n▲ Needs attention\nReasoning: high\n\ncodex://threads/a-task\n\n/listen · /mute\n/turn · /history · /reasoning · /cancel";
   const intent = richTextIntent(fallbackText);
   assert.equal(intent.fallbackText, fallbackText);
-  assert.equal(intent.text, "🧪 A task\n\n▲ Needs attention\nReasoning: high\n\ncodex://threads/a-task\n\n/listen · /link · /mute\n/turn · /history · /reasoning · /cancel");
+  assert.equal(intent.text, "🧪 A task\n\n▲ Needs attention\nReasoning: high\n\ncodex://threads/a-task\n\n/listen · /mute\n/turn · /history · /reasoning · /cancel");
   assert.ok(rangeFor(intent.ranges, "bold", intent.text.indexOf("A task"), "A task".length));
-  for (const command of ["/listen", "/link", "/mute", "/turn", "/history", "/reasoning", "/cancel"]) {
+  for (const command of ["/listen", "/mute", "/turn", "/history", "/reasoning", "/cancel"]) {
     assert.ok(rangeFor(intent.ranges, "bold", intent.text.indexOf(command), command.length));
   }
 

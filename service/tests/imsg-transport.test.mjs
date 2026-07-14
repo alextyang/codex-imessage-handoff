@@ -881,7 +881,7 @@ test("creates one durable native root and sends later task output as replies wit
   });
   assert.equal(result.sent, true);
   const [header, first] = client.calls.filter(([kind]) => kind === "rich").map(([, params]) => params);
-  assert.match(header.text, /^📐 iMessage handoff\n\S+ Rich formatting\n\n○ unknown\n↩️ Reasoning: Codex default\n\ncodex:\/\/threads\/thread-a\n\n👍 listen · 👎 mute · ❓ status \+ history\n\/link · \/cancel$/u);
+  assert.match(header.text, /^📐 iMessage handoff\n\S+ Rich formatting\n\n○ unknown\n↩️ Reasoning: Codex default\n\ncodex:\/\/threads\/thread-a\n\n👍 listen · 👎 mute · ❓ status \+ history · ‼️ stop$/u);
   assert.equal(header.reply_to, undefined);
   assert.equal(first.text, "Checking three paths.\nOpen app.py.");
   assert.doesNotMatch(first.text, /\/Users\/alex/u);
@@ -1711,23 +1711,19 @@ test("read receipts observe every inbound while only explicit semantic confirmat
     "/reasoning",
     "/reasoning high",
     "/listen",
-    "/link",
     "/mute",
     "/unmute",
     "/retry",
     "/dismiss",
-    "/cancel",
   ];
   const actions = [];
   const confirmations = new Map([
     [3, "🔍"],
     [4, "👂"],
-    [5, "🔗"],
-    [6, "🔕"],
-    [7, "🔔"],
-    [8, "🔄"],
-    [9, "🗑️"],
-    [10, "🛑"],
+    [5, "🔕"],
+    [6, "🔔"],
+    [7, "🔄"],
+    [8, "🗑️"],
   ]);
   for (const [index, text] of messages.entries()) {
     const action = transport.router.ingest({
@@ -1749,15 +1745,13 @@ test("read receipts observe every inbound while only explicit semantic confirmat
     "confirmation-6",
     "confirmation-7",
     "confirmation-8",
-    "confirmation-9",
-    "confirmation-10",
   ]);
   assert.deepEqual(client.calls.filter(([kind]) => kind === "tapback").map(([, params]) => params.reaction), [...confirmations.values()]);
   assert.equal(client.calls.some(([kind, params]) => kind === "tapback" && params.reaction === "like"), false);
   assert.equal(actions[0].kind, "prompt");
   assert.equal(actions[1].command, "thread");
   assert.equal(actions[2].command, "reasoning");
-  assert.equal(actions[5].command, "link");
+  assert.equal(actions[5].command, "mute");
 });
 
 test("uses URL previews, explicit effects, send status, edit, and unsend through documented rich methods", async () => {

@@ -1,6 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { isTerminalLocalActionFailure, LocalActionDispatch } from "../src/local-action-dispatch.mjs";
+import {
+  isImmediateLocalAction,
+  isTerminalLocalActionFailure,
+  LocalActionDispatch,
+} from "../src/local-action-dispatch.mjs";
 
 test("ambiguous sends remain retryable while structural delivery failures fail closed", () => {
   assert.equal(isTerminalLocalActionFailure("AMBIGUOUS"), false);
@@ -39,7 +43,13 @@ test("coalesces live and recovery copies while preserving ordered actions and la
   await retry;
 });
 
-test("an immediate cancellation bypasses an unrelated blocked action but remains deduplicated", async () => {
+test("an emphasis stop action is immediate", () => {
+  assert.equal(isImmediateLocalAction({ kind: "reaction-control", command: "stop" }), true);
+  assert.equal(isImmediateLocalAction({ kind: "reaction-control", command: "inspect" }), false);
+  assert.equal(isImmediateLocalAction({ kind: "control", command: "cancel" }), false);
+});
+
+test("an immediate stop bypasses an unrelated blocked action but remains deduplicated", async () => {
   const started = [];
   let releaseBlocked;
   const blocked = new Promise((resolve) => { releaseBlocked = resolve; });
@@ -50,11 +60,11 @@ test("an immediate cancellation bypasses an unrelated blocked action but remains
 
   const first = dispatch.enqueue({ messageKey: "blocked" });
   await new Promise((resolve) => setImmediate(resolve));
-  const cancel = dispatch.enqueue({ messageKey: "cancel" }, { immediate: true });
-  const duplicateCancel = dispatch.enqueue({ messageKey: "cancel" }, { immediate: true });
-  assert.equal(duplicateCancel, cancel);
-  await cancel;
-  assert.deepEqual(started, ["blocked", "cancel"]);
+  const stop = dispatch.enqueue({ messageKey: "stop" }, { immediate: true });
+  const duplicateStop = dispatch.enqueue({ messageKey: "stop" }, { immediate: true });
+  assert.equal(duplicateStop, stop);
+  await stop;
+  assert.deepEqual(started, ["blocked", "stop"]);
   releaseBlocked();
   await first;
 });

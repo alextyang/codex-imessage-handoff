@@ -401,7 +401,7 @@ export function renderThreadMenu(items: MenuItem[], options: { label?: "THREADS"
 export function renderHelp(_options: PresentationOptions = {}) {
   return [
     "**Browse**\n/new (message) · Start a task\n/threads · Tasks by project\n/refresh · Refresh the task list\n/search (query) · Find a task\n/projects · Browse all projects",
-    "**Task controls**\n👍 add/remove · Listen for the next turn’s live updates\n👎 add/remove · Mute or unmute automatic updates\n❓ add · Show status, current turn, and recent history\n/thread · Status and latest response\n/turn · Show current or last turn\n/history (length) · Completed turn history\n/reasoning (level/none) · View or change reasoning\n/link · Show the Codex task link\n/cancel · Stop iMessage-started work in this task\n/retry · Retry failed iMessage-started work\n/dismiss · Remove failed work from the queue",
+    "**Task controls**\n👍 add/remove · Listen for the next turn’s live updates\n👎 add/remove · Mute or unmute automatic updates\n❓ add · Show status, current turn, and recent history\n‼️ add · Stop iMessage-started work in this task\n/thread · Status, link, and latest response\n/turn · Show current or last turn\n/history (length) · Completed turn history\n/reasoning (level/none) · View or change reasoning\n/retry · Retry failed iMessage-started work\n/dismiss · Remove failed work from the queue",
     "**Settings**\n/defaultreasoning (level/none) · View or change default reasoning",
   ].join("\n\n");
 }
@@ -450,7 +450,7 @@ export function renderThreadHeader(thread: ThreadLabel, now: string | Date | num
     `${project}\n${styledThreadTitle(thread, true)}`,
     [status, reasoning, updates, listening].filter(Boolean).join("\n"),
     link,
-    `👍 listen · 👎 mute · ❓ status + history\n/link · /cancel`,
+    `👍 listen · 👎 mute · ❓ status + history · ‼️ stop`,
   ].filter(Boolean).join("\n\n");
 }
 
@@ -580,6 +580,6 @@ export function parseMenuSelection(value: string) {
 
 export function parseSlashCommand(value: string) {
   const text = value.trim();
-  const match = text.match(/^\/(new|threads|recent|refresh|projects|search|thread|open|request|message|turn|history|reasoning|defaultreasoning|listen|link|mute|unmute|status|retry|dismiss|cancel|help)(?:\s+([\s\S]+))?$/i);
+  const match = text.match(/^\/(new|threads|recent|refresh|projects|search|thread|open|request|message|turn|history|reasoning|defaultreasoning|listen|mute|unmute|status|retry|dismiss|cancel|help)(?:\s+([\s\S]+))?$/i);
   return match ? { command: match[1].toLowerCase(), argument: match[2]?.trim() || null } : null;
 }

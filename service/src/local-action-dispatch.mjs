@@ -14,6 +14,10 @@ export function isTerminalLocalActionFailure(code) {
   return TERMINAL_FAILURE_CODES.has(String(code || ""));
 }
 
+export function isImmediateLocalAction(action) {
+  return action?.kind === "reaction-control" && action.command === "stop";
+}
+
 // Keeps ordinary actions ordered while coalescing the same durable inbound
 // action across watch recovery, startup replay, and the live subscription.
 // Once an attempt settles the key is released so the bounded retry timer can

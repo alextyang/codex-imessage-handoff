@@ -280,29 +280,30 @@ Available commands:
 /refresh        Refresh the directory
 /search query   Search every visible task
 /projects       Browse projects
-/thread         Current status and latest response
+/thread         Current status, Codex link, and latest response
 /request        Latest user request
 /turn           Current or latest turn
 /history 3      Completed turn history
 /reasoning high View or change reasoning
 /defaultreasoning high  View or change the iMessage reasoning default
 /listen         Stream the next turn's visible updates
-/link           Open the task in Codex
 /mute           Mute automatic task updates
 /unmute         Resume automatic task updates
 /retry          Retry failed iMessage work
 /dismiss        Dismiss failed iMessage work
-/cancel         Cancel iMessage-started work
 /help           Show command help
 ```
 
 Adding or removing 👍 on a task message enables or disables one-turn live
 listening. Adding or removing 👎 mutes or unmutes that task. Adding ❓ shows
-its status and recent history. Task-scoped commands sent outside a native reply
-thread use the five-minute default before opening a task picker. Notifications
-cannot silently retarget them. A `/new` command without a message waits up to
-120 seconds for the first unthreaded message and pauses proactive task traffic
-during that short handoff. Its first turn listens for live updates by default.
+its status, Codex link, and recent history. Adding ‼️ stops iMessage-started
+work in that task immediately. Task-scoped commands sent outside a native
+reply thread use the five-minute default before opening a task picker.
+Notifications cannot silently retarget them. A `/new` command without a
+message waits up to 120 seconds for the first unthreaded message and pauses
+proactive task traffic during that short handoff. Its first turn listens for
+live updates by default; `/cancel` remains available only while that new-task
+setup is unfinished.
 
 ### Codex questions and approvals
 
@@ -351,12 +352,12 @@ Codex on the Mac.
   relay failures are reported as degraded without mislabeling the Mac offline.
 - Deferred Remote Control work uses durable capped exponential backoff. A
   pairing/setup failure reaches a 30-minute cap, transient availability a
-  five-minute cap, and busy-task retries a one-minute cap; cancellation removes
+  five-minute cap, and busy-task retries a one-minute cap; stopping removes
   the block immediately.
 - Helper bundle upgrades preserve the existing mutable exchange directory and
   live Unix socket until the newly authorized helper takes over.
 - Closing the service detaches from Remote Control; it does not cancel a
-  canonical Codex turn unless the user explicitly sent `/cancel`.
+  canonical Codex turn unless the user explicitly stopped that task with ‼️.
 - No operation falls back to another Codex transport, another environment, a
   local app-server process, or `imsg send`.
 

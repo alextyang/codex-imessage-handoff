@@ -44,12 +44,11 @@ test("help is the minimal task, tapback, and settings reference", () => {
     "👍 add/remove · Listen for the next turn’s live updates",
     "👎 add/remove · Mute or unmute automatic updates",
     "❓ add · Show status, current turn, and recent history",
-    "/thread · Status and latest response",
+    "‼️ add · Stop iMessage-started work in this task",
+    "/thread · Status, link, and latest response",
     "/turn · Show current or last turn",
     "/history (length) · Completed turn history",
     "/reasoning (level/none) · View or change reasoning",
-    "/link · Show the Codex task link",
-    "/cancel · Stop iMessage-started work in this task",
     "/retry · Retry failed iMessage-started work",
     "/dismiss · Remove failed work from the queue",
     "",
@@ -203,8 +202,7 @@ test("thread header is a separate message with status, reasoning, link, and comm
     "",
     "codex://threads/active-thread",
     "",
-    "👍 listen · 👎 mute · ❓ status + history",
-    "/link · /cancel",
+    "👍 listen · 👎 mute · ❓ status + history · ‼️ stop",
   ].join("\n");
   assert.equal(renderThreadHeader(thread, "2026-07-12T08:00:00.000Z"), expected);
 

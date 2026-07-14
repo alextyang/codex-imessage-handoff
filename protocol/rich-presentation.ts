@@ -299,7 +299,7 @@ export function compileMarkdownRanges(source: string) {
 }
 
 function appendPatternRanges(text: string, ranges: NativeTextRange[], event?: OutboundEvent) {
-  for (const match of text.matchAll(/(^|[\s·(“])\/(?:new|threads|recent|refresh|projects|search|thread|open|request|message|turn|history|reasoning|defaultreasoning|listen|link|mute|unmute|status|retry|dismiss|cancel|help)\b/gim)) {
+  for (const match of text.matchAll(/(^|[\s·(“])\/(?:new|threads|recent|refresh|projects|search|thread|open|request|message|turn|history|reasoning|defaultreasoning|listen|mute|unmute|status|retry|dismiss|cancel|help)\b/gim)) {
     const prefixLength = match[1].length;
     const token = match[0].slice(prefixLength);
     ranges.push({ location: (match.index ?? 0) + prefixLength, length: token.length, style: "bold" });

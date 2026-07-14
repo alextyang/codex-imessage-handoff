@@ -40,7 +40,8 @@ export function manualSelectionCancellationNotice({
   return { code: "needs-attention", body: "There is no iMessage-started work to cancel." };
 }
 
-// Manual selection intentionally runs concurrently with an immediate /cancel.
+// Manual selection intentionally runs concurrently with an immediate stop
+// reaction.
 // Treat the persisted awaiting-prompt lease as a generation token and check it
 // again before every outbound message, so an older selection cannot continue
 // presenting after cancellation, prompt consumption, or a newer selection.

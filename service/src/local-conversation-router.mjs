@@ -25,13 +25,11 @@ const THREAD_COMMANDS = new Set([
   "history",
   "reasoning",
   "listen",
-  "link",
   "mute",
   "unmute",
   "status",
   "retry",
   "dismiss",
-  "cancel",
 ]);
 const POLL_ACTION_KINDS = new Set([
   "control",
@@ -619,6 +617,9 @@ function actionFromReaction(message, state) {
   }
   if (message.reactionType === "question" && message.isReactionAdd) {
     return { action: { kind: "reaction-control", command: "inspect", threadId }, consumed: true };
+  }
+  if ((message.reactionType === "emphasize" || message.reactionType === "emphasis") && message.isReactionAdd) {
+    return { action: { kind: "reaction-control", command: "stop", threadId }, consumed: true };
   }
   return { action: null, consumed: true };
 }
@@ -1231,14 +1232,14 @@ export class LocalConversationRouter {
 
     if (!action && slash) {
       const command = slash.command === "recent" ? "threads" : slash.command;
-      if (THREAD_COMMANDS.has(command) && !explicitThreadId) {
-        if (command === "cancel" && (awaitingNewPrompt?.flowId || this.state.activeNewFlowId)) {
+      if (command === "cancel") {
+        if (!explicitThreadId && (awaitingNewPrompt?.flowId || this.state.activeNewFlowId)) {
           action = { kind: "new-cancel", flowId: awaitingNewPrompt?.flowId || this.state.activeNewFlowId };
-        } else if (command === "cancel" && awaitingPrompt?.threadId) {
-          targetThreadId = awaitingPrompt.threadId;
-          consumedAwaitingPrompt = true;
-          action = { kind: "control", command, argument: slash.argument, threadId: targetThreadId };
-        } else if (this.#recentCommandThreadId(nowMs)) {
+        } else {
+          action = { kind: "unknown-command", threadId: targetThreadId };
+        }
+      } else if (THREAD_COMMANDS.has(command) && !explicitThreadId) {
+        if (this.#recentCommandThreadId(nowMs)) {
           targetThreadId = this.#recentCommandThreadId(nowMs);
           action = { kind: "control", command, argument: slash.argument, threadId: targetThreadId };
         } else {
