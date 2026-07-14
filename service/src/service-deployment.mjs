@@ -106,6 +106,7 @@ function deploymentInputs(options = {}) {
   const runtime = resolveServiceNodeRuntime(nodePath, { allowUntrustedRuntime: options.allowUntrustedRuntime === true });
   const dependency = realpathSync(wsRoot || packageRoot("ws"));
   const inputs = [
+    { source: path.join(root, "package.json"), relative: "package.json" },
     ...filesBelow(path.join(root, "service", "src"), path.join("service", "src")),
     ...filesBelow(path.join(root, "protocol"), "protocol"),
     ...filesBelow(dependency, path.join("node_modules", "ws")),
