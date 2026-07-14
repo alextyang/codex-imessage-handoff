@@ -1271,11 +1271,12 @@ export class ImsgTransport {
         : refreshCanonicalHeader
           ? `canonical:${titleScope(canonicalTitle)}`
           : "manual";
-      // Explicit events must retain one helper operation across a crash even
-      // when route persistence changes this send from "root" to "manual" on
-      // replay. Revision-scoped no-ID headers remain intentionally distinct.
+      // Explicit events retain one helper operation across a crash when route
+      // persistence changes "root" to "manual", while a newly canonicalized
+      // title gets its own operation instead of recovering an older header.
+      // Revision-scoped no-ID headers remain intentionally distinct.
       const headerScope = id
-        ? `${id}:header`
+        ? `${id}:header:${titleScope(displayedHeaderTitle(event.thread))}`
         : `thread-header:${threadId}:revision:${headerRevision}:${headerReason}`;
       const headerResult = await this._sendText(header, {
         replyToGuid: rootGuid,

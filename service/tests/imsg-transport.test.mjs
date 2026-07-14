@@ -1029,6 +1029,49 @@ test("an event-ID header retry keeps its durable operation after the root commit
   assert.equal(resumed.router.nativeThread(THREAD.id).rootGuid, "rich-1");
 });
 
+test("an event-ID header replay sends a new child when the canonical title changed after root commit", async () => {
+  const ledger = new Map();
+  const firstClient = new DurableDeduplicatingClient(ledger);
+  const first = fixture({ client: firstClient });
+  await first.transport.probe();
+  const titleA = { ...THREAD, title: "Crash title A", sidebarTitle: "Crash title A" };
+  const titleB = { ...THREAD, title: "Crash title B", sidebarTitle: "Crash title B" };
+  const initialEvent = {
+    kind: "thread.header",
+    deliveryId: "crash-with-new-title",
+    thread: titleA,
+  };
+
+  const initial = await first.transport.outbound(initialEvent);
+  const [initialAttempt] = firstClient.calls.filter(([kind]) => kind === "rich");
+  const initialFingerprint = first.transport.router.nativeThread(THREAD.id).headerTitleFingerprint;
+  assert.deepEqual(initial.guids, ["rich-1"]);
+
+  const persisted = JSON.parse(readFileSync(first.stateFile, "utf8"));
+  delete persisted.outboundReceipts["thread.header:crash-with-new-title"];
+  writeFileSync(first.stateFile, `${JSON.stringify(persisted, null, 2)}\n`, { mode: 0o600 });
+
+  const resumedClient = new DurableDeduplicatingClient(ledger);
+  resumedClient.next = firstClient.next;
+  const resumed = new ImsgTransport({
+    profile: first.profile,
+    stateFile: first.stateFile,
+    client: resumedClient,
+    now: first.now,
+  });
+  await resumed.probe();
+  const replay = await resumed.outbound({ ...initialEvent, thread: titleB });
+  const [replayAttempt] = resumedClient.calls.filter(([kind]) => kind === "rich");
+
+  assert.notEqual(replayAttempt[2].operationId, initialAttempt[2].operationId);
+  assert.deepEqual(resumedClient.deduplicated, []);
+  assert.deepEqual(replay.guids, ["rich-2"]);
+  assert.match(replayAttempt[1].text, /Crash title B/u);
+  assert.equal(replayAttempt[1].reply_to, "rich-1");
+  assert.equal(resumed.router.nativeThread(THREAD.id).rootGuid, "rich-1");
+  assert.notEqual(resumed.router.nativeThread(THREAD.id).headerTitleFingerprint, initialFingerprint);
+});
+
 test("attachments also reconcile a canonical sidebar title under the existing native root", async () => {
   const { transport, client } = fixture();
   await transport.probe();
