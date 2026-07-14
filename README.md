@@ -20,6 +20,11 @@ Messages / IMCore
 patched imsg + pinned helper
         │ mutually authenticated local IPC
         └──────────────────────────────► iMessage service
+        ▲                                      │
+        │ normal-profile user-mirror echo      │ target-locked imsg RPC
+        └──────────────────────────── Messages / IMCore
+                                               │
+                                      (active Codex user)
                                                 │
                                       Remote Control client
                                                 │ HTTPS + WSS, protocol v3
@@ -37,6 +42,18 @@ iMessage identity, and IMCore process, but it never receives Codex credentials
 or controls Codex processes. The active Codex user owns the service, Codex
 credentials, controller enrollment, and device key.
 
+Codex-authored user messages take one deliberately narrow reverse path: a
+normal-profile `imsg rpc` child sends only rich text to the root-proven direct
+service conversation. The body travels over the child's stdin, never process
+arguments. A durable invisible delivery marker and the shared message GUID
+suppress the dedicated-account echo without suppressing genuine same-text
+messages. A send is accepted only after the normal profile observes that exact
+GUID on the expected native Reply root. Ambiguous writes are reconciled without
+resending; after 15 minutes, a content-free task notice unblocks later output
+while the late-echo quarantine remains active. This sender cannot select
+recipients, send files or URLs, watch Messages, launch/relaunch Messages, or
+control any Codex process.
+
 The Remote Control client is independent from Codex Desktop. It does not
 attach to a local socket, launch `codex app-server`, use `codex remote-control
 start`, switch Desktop to another backend, or signal Desktop-owned processes.
@@ -53,13 +70,17 @@ start`, switch Desktop to another backend, or signal Desktop-owned processes.
   pinned and fail closed after an unsupported Codex update.
 - `imsg` with the daemon-safe, custom-emoji tapback, and macOS 27 edit patches
   in `docs/`, applied in that order, plus the full IMCore bridge enabled.
+- The active Codex profile also needs the local `imsg` IMCore bridge active for
+  outgoing user mirrors. The service probes it but never launches or relaunches
+  Messages automatically; core helper and Codex functions remain independent.
 - Network access to OpenAI authentication and Remote Control endpoints.
 - Node.js 22.6 or newer and pnpm 10.26.
 
-The supported messaging profile is fixed: authenticated helper mode, bridge
+The service transport profile is fixed: authenticated helper mode, bridge
 features, native rich text, native replies, polls, and reactions. Basic,
-automatic-downgrade, plain-text, direct/local CLI, and hosted messaging
-profiles are rejected.
+automatic-downgrade, plain-text, arbitrary-recipient local transport, and
+hosted messaging profiles are rejected. The target-locked user-mirror RPC
+above is the only normal-profile send capability.
 
 ## Setup
 
@@ -340,7 +361,8 @@ Codex on the Mac.
 - Text and generated-image acceptance are checkpointed so a restart does not
   replay an already accepted part.
 - Native message GUID routing, poll state, mute/listen state, run state, and
-  live-mirror offsets are private local files.
+  live-mirror offsets are private local files. The user-mirror journal stores
+  hashes, markers, and routing metadata, never message bodies.
 - Helper/watch degradation changes local service readiness immediately and
   recovers without claiming a healthy state prematurely.
 - Periodic bridge/account checks run asynchronously and sequentially, tolerate
@@ -360,6 +382,9 @@ Codex on the Mac.
   canonical Codex turn unless the user explicitly stopped that task with ‼️.
 - No operation falls back to another Codex transport, another environment, a
   local app-server process, or `imsg send`.
+- Losing the normal-profile rich bridge degrades only the user-mirror
+  capability. The service never restarts Messages, and the authenticated
+  helper/watch and Codex Remote Control paths continue independently.
 
 ## Failure modes
 

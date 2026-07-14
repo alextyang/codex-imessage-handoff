@@ -866,6 +866,42 @@ test("suppresses an inbound self-chat echo even when it arrives before the send 
   assert.equal(actions[0].messageKey, "real-identical-inbound");
 });
 
+test("normal-profile user mirrors are GUID-suppressed, routed, and acknowledged read", async () => {
+  const { transport, client } = fixture();
+  const actions = [];
+  await transport.start({ onAction: (action) => actions.push(action) });
+  transport.router.routeOutboundGuid("user-mirror-root", THREAD.id, { root: true });
+  const reservationId = "e".repeat(64);
+  transport.router.reserveUserMirrorEcho({
+    reservationId,
+    threadId: THREAD.id,
+    text: "Tagged body\u{E0001}\u{E0061}\u{E007F}",
+    rootGuid: "user-mirror-root",
+  });
+  transport.router.confirmUserMirrorEcho(reservationId, "normal-profile-guid");
+
+  client.watchHandlers.onMessage({
+    id: 20_301,
+    guid: "normal-profile-guid",
+    chat_id: 42,
+    chat_guid: "iMessage;-;+15550000000",
+    sender: "+15551111111",
+    is_from_me: false,
+    // GUID-first matching remains safe if Apple normalizes invisible tags.
+    text: "Tagged body",
+    thread_originator_guid: "user-mirror-root",
+    created_at: "2026-07-12T12:00:02.000Z",
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.deepEqual(actions, []);
+  assert.equal(transport.router.lastRowId, 20_301);
+  assert.equal(transport.router.nativeThread(THREAD.id).latestGuid, "normal-profile-guid");
+  assert.equal(transport.router.lastUserThreadId, THREAD.id);
+  assert.ok(client.calls.some(([kind]) => kind === "read"));
+  await transport.stop();
+});
+
 test("creates one durable native root and sends later task output as replies without repeating its header", async () => {
   const { transport, client } = fixture();
   await transport.probe();

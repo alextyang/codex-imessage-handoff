@@ -25,6 +25,7 @@ export function servicePaths() {
     completionState: path.join(home, "completion-state.json"),
     multiLiveMirrorState: path.join(home, "live-mirrors"),
     imsgState: path.join(home, "imsg-state.json"),
+    localUserMirrorState: path.join(home, "local-user-mirror.json"),
     remoteControlClient: path.join(home, "remote-control-client.json"),
     remoteControlStatus: path.join(home, "remote-control-status.json"),
     remoteControlKeyHelper: path.join(home, "bin", "remote-control-key-helper"),

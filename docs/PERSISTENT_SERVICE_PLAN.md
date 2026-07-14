@@ -218,6 +218,20 @@ An ambiguous rich send remains pending. It is never repeated through a simpler
 send API. No operation falls back to direct `imsg send`, a remote messaging
 provider, a local Codex process, or another Remote Control environment.
 
+The sole active-profile messaging exception is a target-locked `imsg rpc`
+child for mirroring Codex-authored user text as the outgoing half of the
+conversation. It may send only formatted text to the root-proven direct
+service chat and exact native task root. Prompt bodies cross stdin rather than
+argv. A private delivery journal, invisible per-part marker, confirmed GUID,
+and dedicated-side echo ledger make the operation crash-idempotent and prevent
+same-body collisions. A provisional bridge response becomes accepted only
+after an exact local GUID/native-root proof. Crash-bound or timed-out writes
+are reconciled without another send; after fifteen minutes, a body-free
+thread notice advances the mirror while the late echo remains quarantined.
+It has no recipient, attachment, URL, watch, launch, or Messages lifecycle API;
+failure is a separate readiness capability and cannot degrade the helper or
+Codex Remote Control.
+
 ## Presentation contract
 
 Messages contain no universal header or footer. Native reply threads provide
@@ -311,6 +325,8 @@ A release also requires:
 - concurrent normal Codex Desktop use while iMessage work runs;
 - directory poll, task selection, native reply routing, unthreaded routing,
   task-scoped command picker, rich text, poll vote, attachment, cancellation,
-  restart recovery, and helper reconnect from the dedicated Messages identity;
+  restart recovery, helper reconnect from the dedicated Messages identity,
+  normal-profile outgoing user mirrors, echo-before-result suppression,
+  same-body collision resistance, and bridge-loss fallback behavior;
 - deauthorization proving the controller is removed while Codex Desktop and its
   normal private app-server remain unaffected.

@@ -81,7 +81,7 @@ export function extractImsgAccountIdentities(value) {
   }
   const identities = [];
   const scalarKeys = ["account_login", "accountLogin", "last_addressed_handle", "lastAddressedHandle", "login"];
-  const arrayKeys = ["account_logins", "accountLogins", "aliases", "handles"];
+  const arrayKeys = ["account_logins", "accountLogins", "aliases", "handles", "vetted_aliases", "vettedAliases"];
   const identityValue = (item) => {
     if (typeof item === "string") return item.trim();
     if (!item || typeof item !== "object" || Array.isArray(item)) return "";

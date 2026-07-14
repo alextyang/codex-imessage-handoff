@@ -3,6 +3,10 @@ import { EventEmitter } from "node:events";
 import { PassThrough, Writable } from "node:stream";
 import test from "node:test";
 import { ImsgClient } from "../src/imsg-client.mjs";
+import {
+  IMSG_RPC_SEND_TIMEOUT_MS,
+  IMSG_UPSTREAM_BRIDGE_SEND_TIMEOUT_MS,
+} from "../src/imsg-timeouts.mjs";
 
 const fullStatus = {
   version: "0.13.0",
@@ -132,6 +136,13 @@ function createClient({ status = fullStatus, child, spawnImpl, execOptions, ...o
   });
   return { client, child: spawned, execCalls: exec.calls };
 }
+
+test("default RPC send timeout exceeds imsg's full private-bridge window", () => {
+  const { client } = createClient({ sendTimeoutMs: undefined });
+
+  assert.equal(client.sendTimeoutMs, IMSG_RPC_SEND_TIMEOUT_MS);
+  assert.ok(client.sendTimeoutMs > IMSG_UPSTREAM_BRIDGE_SEND_TIMEOUT_MS);
+});
 
 test("locates imsg and reports normalized basic and bridge capabilities", async () => {
   const { client, execCalls } = createClient();

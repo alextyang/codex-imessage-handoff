@@ -4,9 +4,9 @@ import {
   safeImsgFailureDetails,
   safeRemoteRpcDiagnostic,
 } from "./imsg-rpc-diagnostics.mjs";
+import { IMSG_RPC_SEND_TIMEOUT_MS } from "./imsg-timeouts.mjs";
 
 const DEFAULT_RPC_TIMEOUT_MS = 8_000;
-const DEFAULT_SEND_TIMEOUT_MS = 20_000;
 const DEFAULT_STOP_TIMEOUT_MS = 500;
 const DEFAULT_MAX_LINE_BYTES = 1024 * 1024;
 const DEFAULT_MAX_MESSAGE_BYTES = 256 * 1024;
@@ -292,7 +292,7 @@ export class ImsgClient {
     this.spawnImpl = options.spawnImpl || nodeSpawn;
     this.execFileImpl = options.execFileImpl || nodeExecFile;
     this.rpcTimeoutMs = options.rpcTimeoutMs ?? DEFAULT_RPC_TIMEOUT_MS;
-    this.sendTimeoutMs = options.sendTimeoutMs ?? DEFAULT_SEND_TIMEOUT_MS;
+    this.sendTimeoutMs = options.sendTimeoutMs ?? IMSG_RPC_SEND_TIMEOUT_MS;
     this.stopTimeoutMs = options.stopTimeoutMs ?? DEFAULT_STOP_TIMEOUT_MS;
     this.maxLineBytes = options.maxLineBytes ?? DEFAULT_MAX_LINE_BYTES;
     this.maxMessageBytes = options.maxMessageBytes ?? DEFAULT_MAX_MESSAGE_BYTES;

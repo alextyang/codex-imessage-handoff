@@ -36,6 +36,7 @@ import {
   signIpcTranscript,
   verifyIpcTranscript,
 } from "./imsg-ipc-protocol.mjs";
+import { IMSG_IPC_MUTATION_TIMEOUT_MS } from "./imsg-timeouts.mjs";
 
 const DEFAULT_CONNECT_TIMEOUT_MS = 5_000;
 const DEFAULT_REQUEST_TIMEOUT_MS = 20_000;
@@ -180,6 +181,7 @@ export class ImsgIpcClient {
     this.maxFrameBytes = options.maxFrameBytes || IMSG_IPC_MAX_FRAME_BYTES;
     this.connectTimeoutMs = options.connectTimeoutMs || DEFAULT_CONNECT_TIMEOUT_MS;
     this.requestTimeoutMs = options.requestTimeoutMs || DEFAULT_REQUEST_TIMEOUT_MS;
+    this.mutationTimeoutMs = options.mutationTimeoutMs ?? IMSG_IPC_MUTATION_TIMEOUT_MS;
     this.socket = null;
     this.decoder = null;
     this.connectPromise = null;
@@ -461,6 +463,7 @@ export class ImsgIpcClient {
       return await this.#request(method, params, {
         mutation: true,
         operationId: clean(options.operationId) || null,
+        timeoutMs: options.timeoutMs ?? this.mutationTimeoutMs,
       });
     } catch (error) {
       return ambiguous(error?.code === "IMSG_IPC_TIMEOUT" ? "ipc-timeout" : "ipc-disconnected");
@@ -536,15 +539,26 @@ export class ImsgIpcClient {
   votePoll(params, options = {}) { return this.sendPollVote(params, options); }
   tapback(params, options = {}) { return this.#mutation("tapback", params, options); }
   setTyping(params, typing = true, options = {}) {
-    return this.#mutation("setTyping", { ...params, typing: typing === true }, options);
+    return this.#mutation("setTyping", { ...params, typing: typing === true }, {
+      ...options,
+      timeoutMs: this.requestTimeoutMs,
+    });
   }
   typing(params, typing = true) { return this.setTyping(params, typing); }
-  markRead(params, options = {}) { return this.#mutation("markRead", params, options); }
+  markRead(params, options = {}) {
+    return this.#mutation("markRead", params, {
+      ...options,
+      timeoutMs: this.requestTimeoutMs,
+    });
+  }
   read(params) { return this.markRead(params); }
 
   async sendStatus(guid, options = {}) {
     if (!this.profile) await this.helperStatus();
-    return this.#mutation("sendStatus", { chat_id: this.profile.chatId, guid }, options);
+    return this.#mutation("sendStatus", { chat_id: this.profile.chatId, guid }, {
+      ...options,
+      timeoutMs: this.requestTimeoutMs,
+    });
   }
 
   getSendStatus(guid) { return this.sendStatus(guid); }

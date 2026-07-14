@@ -2,6 +2,7 @@
 import os from "node:os";
 import { existsSync } from "node:fs";
 import { AsyncLocalStorage } from "node:async_hooks";
+import { createHash } from "node:crypto";
 import { readConfig } from "./config.mjs";
 import { findThreadBySource, listThreads } from "./thread-store.mjs";
 import { assertThreadReadyForIMessageRun, getThreadDetail, getLatestRequest, getTurn, getHistory, readThreadHistory } from "./thread-history.mjs";
@@ -17,6 +18,7 @@ import {
   setReasoningOverride,
 } from "./thread-settings.mjs";
 import { ImsgTransport } from "./imsg-transport.mjs";
+import { LocalUserMirrorSender } from "./local-user-mirror-sender.mjs";
 import { safeImsgFailureDetails } from "./imsg-rpc-diagnostics.mjs";
 import { RemoteControlCodexRuntime } from "./remote-control-runner.mjs";
 import {
@@ -62,9 +64,17 @@ const serviceReadiness = new ServiceReadiness(paths.serviceReadinessState);
 serviceReadiness.markStarting();
 const config = readConfig();
 const imsgTransport = new ImsgTransport({ profile: config.imsg, stateFile: paths.imsgState, logger: log });
+const localUserMirrorSender = new LocalUserMirrorSender({
+  stateFile: paths.localUserMirrorState,
+  router: imsgTransport.router,
+  conversationKey: createHash("sha256").update(`imsg-chat:${config.imsg.chatGuid}`).digest("hex"),
+});
 serviceReadiness.setHealthCheck(() => imsgTransport.healthStatus());
 const remoteControlAvailability = new RemoteControlAvailability();
-serviceReadiness.setCapabilityCheck(() => ({ remoteControl: remoteControlAvailability.snapshot() }));
+serviceReadiness.setCapabilityCheck(() => ({
+  remoteControl: remoteControlAvailability.snapshot(),
+  localUserMirror: localUserMirrorSender.capabilityStatus(),
+}));
 const presenceTracker = new PresenceTracker(paths.presenceState);
 const PRESENCE_OFFLINE_DEBOUNCE_MS = 30_000;
 let presenceOfflineTimer = null;
@@ -250,6 +260,44 @@ async function deliverLiveMessage(message) {
     // A focused Codex window is not proof that it owns the app-server
     // connection which started this turn. Fail open to Messages visibility so
     // cross-connection work is never silent in both interfaces.
+    let rootGuid = imsgTransport.router.nativeThread(thread.id)?.rootGuid || "";
+    if (!rootGuid) {
+      const header = await sendOutbound({
+        kind: "thread.header",
+        deliveryId: `local-user-mirror-root:${thread.id}`,
+        thread: threadLabel(thread),
+      }, { signal: AbortSignal.timeout(15_000), proactive: true });
+      rootGuid = imsgTransport.router.nativeThread(thread.id)?.rootGuid || "";
+      if (!rootGuid) return header;
+    }
+    const local = await localUserMirrorSender.sendMirror({
+      deliveryId: message.deliveryId,
+      threadId: thread.id,
+      rootGuid,
+      body: message.body,
+      phase: message.phase,
+    });
+    if (local.sent) return local;
+    if (local.classification === "dead-letter") {
+      // Do not replay an unverified side effect through another sender. A
+      // content-free, task-scoped notice makes the rare failure visible while
+      // allowing later live messages to advance in strict rollout order.
+      return sendOutbound({
+        kind: "service.notice",
+        code: "needs-attention",
+        deliveryId: `local-user-mirror-unverified:${message.deliveryId}`,
+        thread: threadLabel(thread),
+        body: "⚠️ **User-message mirror not verified**\n\nThe task still ran in Codex. Use /turn to view the current turn.",
+      }, { signal: AbortSignal.timeout(15_000), proactive: true });
+    }
+    // Ambiguous local sends deliberately hold the durable rollout cursor. A
+    // repeat presents the same delivery id to the sender journal, which only
+    // reconciles the tagged row and never blindly sends again.
+    if (local.retryable === true) return local;
+    if (local.fallbackSafe !== true) return local;
+    // Rich mode is optional to core Codex/iMessage health. If it is unavailable
+    // before any local send attempt, retain the prior service-side mirror so a
+    // user turn is never silently lost.
   } else if (!imsgTransport.router.nativeThread(thread.id)?.listen) {
     return { status: "INACTIVE" };
   }
@@ -2295,6 +2343,17 @@ async function main() {
       { code: "IMSG_HELPER_MISMATCH" },
     );
   }
+  localUserMirrorSender.initialize({
+    expectedLocalSender: profile.expectedSender,
+    knownRootGuids: threads.map((thread) => imsgTransport.router.nativeThread(thread.id)?.rootGuid).filter(Boolean),
+    knownThreads: threads.map((thread) => ({
+      threadId: thread.id,
+      rootGuid: imsgTransport.router.nativeThread(thread.id)?.rootGuid,
+    })).filter((thread) => thread.rootGuid),
+  }).then(() => serviceReadiness.refreshCapabilities()).catch(() => {
+    serviceReadiness.refreshCapabilities();
+    log("Normal-profile user mirroring is unavailable; core local Messages transport remains active.");
+  });
   await restoreClaimedState(restoredJobs);
   await imsgTransport.start({
     onAction: (action) => queueLocalAction(action),
@@ -2324,6 +2383,7 @@ async function stop() {
   rolloutActivity.stop();
   serverRequests.stop();
   codexRuntime.close();
+  await localUserMirrorSender.stop().catch(() => {});
   await imsgTransport.stop().catch(() => {});
   clearServiceReadiness();
   process.exit(0);

@@ -34,10 +34,18 @@ import { ImsgHelperServer, inspectLocalImsgIdentity } from "../src/imsg-helper-s
 import { inspectLocalImsgMessage } from "../src/imsg-chat.mjs";
 import { ImsgIpcClient, createImsgIpcClientFromConfig } from "../src/imsg-ipc-client.mjs";
 import { REQUIRED_PINNED_IMSG_CAPABILITIES } from "../src/imsg-client.mjs";
+import {
+  IMSG_IPC_MUTATION_TIMEOUT_MS,
+  IMSG_RPC_SEND_TIMEOUT_MS,
+} from "../src/imsg-timeouts.mjs";
 
 function temporary() {
   const root = mkdtempSync(path.join(os.tmpdir(), "imsg-ipc-test-"));
   return { root, cleanup: () => rmSync(root, { recursive: true, force: true }) };
+}
+
+function delay(milliseconds) {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 
 class FakeImsgClient {
@@ -159,6 +167,8 @@ async function fixture(t, options = {}) {
     helperPublicKey: helperKeys.publicKey,
     controllerAttestation,
     expectedHelperAttestation: options.expectedHelperAttestation || expectedHelperAttestation,
+    ...(options.requestTimeoutMs !== undefined ? { requestTimeoutMs: options.requestTimeoutMs } : {}),
+    ...(options.mutationTimeoutMs !== undefined ? { mutationTimeoutMs: options.mutationTimeoutMs } : {}),
   });
   t.after(() => client.stop());
   return {
@@ -182,10 +192,20 @@ test("shared identity normalization covers Apple prefixes and account envelopes"
   assert.equal(canonicalImsgIdentity("P:+12145550196"), canonicalImsgIdentity("+12145550196"));
   assert.equal(canonicalImsgIdentity("mailto:Person@Example.com"), canonicalImsgIdentity("E:person@example.com"));
   const identities = extractImsgAccountIdentities({
-    account: { login: "E:one@example.com", aliases: ["tel:+14155550100"] },
+    account: {
+      login: "E:one@example.com",
+      aliases: ["tel:+14155550100"],
+      vetted_aliases: ["P:+13105550100"],
+    },
     accounts: [{ account_login: "two@example.com", handles: ["P:+12145550196"] }],
   });
-  assert.deepEqual(identities, ["E:one@example.com", "tel:+14155550100", "two@example.com", "P:+12145550196"]);
+  assert.deepEqual(identities, [
+    "E:one@example.com",
+    "tel:+14155550100",
+    "P:+13105550100",
+    "two@example.com",
+    "P:+12145550196",
+  ]);
   assert.equal(imsgAccountFingerprint(identities), imsgAccountFingerprint([...identities].reverse()));
 });
 
@@ -284,6 +304,86 @@ test("mutually authenticated proxy exposes only the pinned profile and advanced 
   const rejected = await client.sendRich({ chat_id: 99, text: "wrong target", text_formatting: [] });
   assert.equal(rejected.classification, "ambiguous");
   assert.equal(fake.calls.length, calls);
+});
+
+test("controller mutations outlive the short control/status request budget", async (t) => {
+  const fake = new FakeImsgClient();
+  fake.sendRich = async (params) => {
+    fake.calls.push(["sendRich", params]);
+    await delay(75);
+    return fake.accepted("SLOW-RICH-1");
+  };
+  const { client } = await fixture(t, {
+    fake,
+    requestTimeoutMs: 25,
+    mutationTimeoutMs: 250,
+  });
+  await client.start();
+
+  const sent = await client.sendRich({ chat_id: 42, text: "slow but accepted" }, {
+    operationId: `outbound:${"a".repeat(64)}`,
+  });
+
+  assert.equal(sent.classification, "accepted");
+  assert.equal(sent.guid, "SLOW-RICH-1");
+  assert.equal(client.requestTimeoutMs, 25);
+  assert.equal(client.mutationTimeoutMs, 250);
+
+  const immediateStatus = fake.status.bind(fake);
+  fake.status = async () => {
+    await delay(75);
+    return immediateStatus();
+  };
+  await assert.rejects(
+    client.status({ refresh: true }),
+    (error) => error?.code === "IMSG_IPC_TIMEOUT",
+  );
+  await delay(80);
+});
+
+test("ephemeral typing and delivery-status controls retain the short IPC timeout", async (t) => {
+  const fake = new FakeImsgClient();
+  fake.setTyping = async (params, typing) => {
+    fake.calls.push(["typing", params, typing]);
+    await delay(75);
+    return fake.accepted("SLOW-TYPING-1");
+  };
+  const first = await fixture(t, {
+    fake,
+    requestTimeoutMs: 25,
+    mutationTimeoutMs: 250,
+  });
+  await first.client.start();
+
+  const typing = await first.client.setTyping({ chat_id: 42 }, true, {
+    operationId: `control:${"b".repeat(64)}`,
+  });
+  assert.equal(typing.classification, "ambiguous");
+  assert.equal(typing.reason, "ipc-timeout");
+  await delay(80);
+
+  const statusFake = new FakeImsgClient();
+  statusFake.sendStatus = async (guid) => {
+    statusFake.calls.push(["status", guid]);
+    await delay(75);
+    return statusFake.accepted("SLOW-STATUS-1", { send_state: "delivered" });
+  };
+  const second = await fixture(t, {
+    fake: statusFake,
+    requestTimeoutMs: 25,
+    mutationTimeoutMs: 250,
+  });
+  await second.client.start();
+  const sent = await second.client.sendRich({ chat_id: 42, text: "status target" }, {
+    operationId: `outbound:${"c".repeat(64)}`,
+  });
+
+  const status = await second.client.sendStatus(sent.guid, {
+    operationId: `status:${"d".repeat(64)}`,
+  });
+  assert.equal(status.classification, "ambiguous");
+  assert.equal(status.reason, "ipc-timeout");
+  await delay(80);
 });
 
 test("a replacement controller connection can reauthorize only a GUID from the pinned chat", async (t) => {
@@ -620,6 +720,8 @@ test("client factory enforces private config/key permissions and shared hashes",
   }), { mode: 0o600 });
   const client = createImsgIpcClientFromConfig(configPath);
   assert.equal(client instanceof ImsgIpcClient, true);
+  assert.equal(client.mutationTimeoutMs, IMSG_IPC_MUTATION_TIMEOUT_MS);
+  assert.ok(client.mutationTimeoutMs > IMSG_RPC_SEND_TIMEOUT_MS);
   chmodSync(configPath, 0o644);
   assert.throws(() => createImsgIpcClientFromConfig(configPath), { code: "IMSG_IPC_FILE_UNSAFE" });
 });

@@ -4,6 +4,7 @@ import { mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { LocalConversationRouter } from "../src/local-conversation-router.mjs";
+import { localUserMirrorInternals } from "../src/local-user-mirror-sender.mjs";
 
 function fixture(options = {}) {
   const directory = mkdtempSync(path.join(os.tmpdir(), "imsg-router-"));
@@ -945,6 +946,149 @@ test("outbound echo reservations are content-free, durable, bounded, and single-
   router.reserveOutboundEcho("Expiring output", 1_000);
   advance(1_001);
   assert.equal(router.consumeOutboundEcho(message(58, "Expiring output")), false);
+});
+
+test("user-mirror echo reservations are durable, content-free, root-scoped, and preserve genuine same-body prompts", () => {
+  const { router, stateFile } = fixture();
+  router.routeOutboundGuid("root-a", "thread-a", { root: true });
+  const reservationId = "a".repeat(64);
+  const token = "codex-mirror-0123456789abcdef0123456789abcdef";
+  const tagged = localUserMirrorInternals.taggedText("Private mirrored request", token);
+  assert.equal(router.reserveUserMirrorEcho({
+    reservationId,
+    threadId: "thread-a",
+    text: tagged,
+    rootGuid: "root-a",
+  }), reservationId);
+  const persisted = readFileSync(stateFile, "utf8");
+  assert.equal(persisted.includes("Private mirrored request"), false);
+  assert.equal(persisted.includes(token), false);
+
+  const resumed = new LocalConversationRouter({
+    stateFile,
+    now: () => Date.parse("2026-07-12T12:00:00.000Z"),
+  });
+  const genuine = message(58_001, "Private mirrored request", {
+    guid: "genuine-same-body",
+    thread_originator_guid: "root-a",
+  });
+  assert.equal(resumed.consumeUserMirrorEcho(genuine), null);
+  const action = resumed.ingest(genuine);
+  assert.equal(action.kind, "prompt");
+  assert.equal(action.threadId, "thread-a");
+
+  assert.equal(resumed.consumeUserMirrorEcho(message(58_002, tagged, {
+    guid: "wrong-root-echo",
+    thread_originator_guid: "root-b",
+  })), null);
+  assert.equal(resumed.confirmUserMirrorEcho(reservationId, "confirmed-mirror-guid"), true);
+  assert.equal(resumed.consumeUserMirrorEcho(message(58_003, tagged, {
+    guid: "different-guid",
+    thread_originator_guid: "root-a",
+  })), null, "a confirmed reservation must not consume a different sender message");
+
+  const echo = resumed.consumeUserMirrorEcho(message(58_004, tagged, {
+    guid: "confirmed-mirror-guid",
+    thread_originator_guid: "root-a",
+  }));
+  assert.deepEqual(echo, {
+    reservationId,
+    threadId: "thread-a",
+    guid: "confirmed-mirror-guid",
+    expectedGuid: "confirmed-mirror-guid",
+  });
+  assert.equal(resumed.lastRowId, 58_004);
+  assert.equal(resumed.nativeThread("thread-a").latestGuid, "confirmed-mirror-guid");
+  assert.equal(resumed.consumeUserMirrorEcho(message(58_005, tagged, {
+    guid: "confirmed-mirror-guid",
+    thread_originator_guid: "root-a",
+  })), null, "the durable reservation is single-use");
+});
+
+test("a tagged user-mirror echo can settle before its send GUID is confirmed and remains consumed after restart", () => {
+  const { router, stateFile } = fixture();
+  router.routeOutboundGuid("root-a", "thread-a", { root: true });
+  const reservationId = "b".repeat(64);
+  const tagged = localUserMirrorInternals.taggedText(
+    "Echo before result",
+    "codex-mirror-fedcba9876543210fedcba9876543210",
+  );
+  router.reserveUserMirrorEcho({
+    reservationId,
+    threadId: "thread-a",
+    text: tagged,
+    rootGuid: "root-a",
+  });
+
+  const consumed = router.consumeUserMirrorEcho(message(58_100, tagged, {
+    guid: "early-mirror-guid",
+    thread_originator_guid: "root-a",
+  }));
+  assert.equal(consumed.reservationId, reservationId);
+  assert.equal(consumed.expectedGuid, null);
+  assert.equal(router.confirmUserMirrorEcho(reservationId, "early-mirror-guid"), false);
+
+  const resumed = new LocalConversationRouter({ stateFile });
+  assert.equal(resumed.lastRowId, 58_100);
+  assert.deepEqual(resumed.pendingActions(), []);
+  assert.equal(resumed.nativeThread("thread-a").latestGuid, "early-mirror-guid");
+  assert.equal(resumed.consumeUserMirrorEcho(message(58_100, tagged, {
+    guid: "early-mirror-guid",
+    thread_originator_guid: "root-a",
+  })), null);
+});
+
+test("a confirmed mirror GUID survives text normalization only with its exact reply root, updates default context, and expires", () => {
+  const { router, advance } = fixture();
+  router.routeOutboundGuid("root-a", "thread-a", { root: true });
+  const reservationId = "c".repeat(64);
+  const tagged = localUserMirrorInternals.taggedText(
+    "Normalized by Messages",
+    "codex-mirror-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  );
+  router.reserveUserMirrorEcho({
+    reservationId,
+    threadId: "thread-a",
+    text: tagged,
+    rootGuid: "root-a",
+  });
+  router.confirmUserMirrorEcho(reservationId, "confirmed-normalized-guid");
+
+  assert.equal(router.consumeUserMirrorEcho(message(58_200, "Normalized by Messages", {
+    guid: "confirmed-normalized-guid",
+    createdAt: "2026-07-12T12:00:02.000Z",
+  })), null, "a confirmed GUID without native Reply context must remain unresolved");
+  assert.equal(router.isReservedUserMirrorEcho(message(58_200, "Normalized by Messages", {
+    guid: "confirmed-normalized-guid",
+    createdAt: "2026-07-12T12:00:02.000Z",
+  })), true, "the transport can quarantine a malformed matching echo without releasing its reservation");
+
+  const consumed = router.consumeUserMirrorEcho(message(58_201, "Normalized by Messages", {
+    guid: "confirmed-normalized-guid",
+    thread_originator_guid: "root-a",
+    createdAt: "2026-07-12T12:00:03.000Z",
+  }));
+  assert.equal(consumed.threadId, "thread-a");
+  assert.equal(router.lastUserThreadId, "thread-a");
+  assert.equal(router.lastUserMessageAt, "2026-07-12T12:00:03.000Z");
+  assert.equal(router.recentDefaultThreadId, "thread-a");
+
+  const expiringId = "d".repeat(64);
+  router.reserveUserMirrorEcho({
+    reservationId: expiringId,
+    threadId: "thread-a",
+    text: tagged,
+    rootGuid: "root-a",
+  });
+  advance(30 * 24 * 60 * 60 * 1000 + 1);
+  assert.equal(router.isReservedUserMirrorEcho(message(58_201, tagged, {
+    guid: "expired-guid",
+    thread_originator_guid: "root-a",
+  })), false);
+  assert.equal(router.consumeUserMirrorEcho(message(58_201, tagged, {
+    guid: "expired-guid",
+    thread_originator_guid: "root-a",
+  })), null);
 });
 
 test("conversation identity changes reset chat-bound routes, activity, and pending work", () => {

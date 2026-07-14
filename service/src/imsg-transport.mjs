@@ -661,6 +661,23 @@ export class ImsgTransport {
             this.router.discard(message);
             return;
           }
+          const userMirror = this.router.consumeUserMirrorEcho(message);
+          if (userMirror) {
+            // The locally-authored user bubble is a real inbound message for
+            // the dedicated service identity. Observe it only after the echo
+            // and route were durably committed so the normal profile gets a
+            // read receipt without the prompt being executed twice.
+            this.observeInbound().catch(() => {});
+            return;
+          }
+          if (this.router.isReservedUserMirrorEcho(message)) {
+            // A copied/normalized marker with conflicting context must never
+            // become a Codex prompt. Quarantine that row while retaining the
+            // real reservation for its confirmed GUID.
+            this.router.discard(message);
+            this.observeInbound().catch(() => {});
+            return;
+          }
           if (this.router.consumeOutboundEcho(message)) return;
           const action = this.router.ingest(message);
           // A receipt is visible to the sender, so emit it only after the inbox
@@ -1487,6 +1504,7 @@ export class ImsgTransport {
 
 export const imsgTransportInternals = Object.freeze({
   nativeFormatting,
+  splitTextIntent,
   directoryChoices,
   menuChoices,
   pollChunks,
