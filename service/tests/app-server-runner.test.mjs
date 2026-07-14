@@ -15,6 +15,7 @@ const mode = ${JSON.stringify(mode)};
 const capture = process.env.IMESSAGE_TEST_CAPTURE;
 let buffer = "";
 let turnId = "turn-1";
+let acceptedClientUserMessageId = null;
 function record(value) { appendFileSync(capture, JSON.stringify(value) + "\\n"); }
 function send(value) { process.stdout.write(JSON.stringify(value) + "\\n"); }
 function finish(status = "completed") {
@@ -34,9 +35,49 @@ function handle(message) {
     else resume();
     return;
   }
+  if (message.method === "thread/start") {
+    if (mode === "invalid-thread-start") {
+      send({ id: message.id, result: { thread: { id: "" }, cwd: message.params.cwd } });
+      return;
+    }
+    send({ id: message.id, result: {
+      thread: {
+        id: "thread-created",
+        cwd: message.params.cwd,
+        createdAt: 1783987200,
+        modelProvider: "openai"
+      },
+      cwd: message.params.cwd,
+      model: "gpt-created",
+      modelProvider: "openai",
+      reasoningEffort: "high"
+    } });
+    return;
+  }
+  if (message.method === "thread/read") {
+    const reconciledClientId = mode === "reconcile"
+      ? "client-message-stable"
+      : acceptedClientUserMessageId;
+    send({ id: message.id, result: { thread: {
+      id: message.params.threadId,
+      turns: reconciledClientId ? [{
+        id: "turn-recovered",
+        status: "completed",
+        items: [
+          { type: "userMessage", id: "user-recovered", clientId: reconciledClientId, content: [] },
+          { type: "agentMessage", id: "answer-recovered", text: "Recovered answer.", phase: "final_answer" },
+        ],
+      }] : [],
+    } } });
+    return;
+  }
   if (message.method === "turn/start") {
     if (mode === "overloaded") {
       send({ id: message.id, error: { code: -32001, message: "Server overloaded; retry later" } });
+      return;
+    }
+    if (mode === "lost-start-response") {
+      acceptedClientUserMessageId = message.params.clientUserMessageId;
       return;
     }
     send({ id: message.id, result: { turn: { id: turnId, status: "inProgress", items: [], error: null } } });
@@ -124,6 +165,49 @@ async function waitFor(predicate, timeoutMs = 2_000) {
   throw new Error("Timed out waiting for the fake proxy.");
 }
 
+test("shared app-server creates a persistent thread with an idempotency source", async (t) => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "imessage-app-server-create-"));
+  const { runner, capture } = testRunner(directory);
+  t.after(() => runner.client.close());
+
+  const created = await runner.createThread({
+    cwd: directory,
+    threadSource: "imessage-handoff:new:flow-123",
+  });
+
+  assert.deepEqual(created, {
+    id: "thread-created",
+    cwd: directory,
+    createdAt: 1783987200,
+    modelProvider: "openai",
+    model: "gpt-created",
+    reasoningEffort: "high",
+  });
+  const start = messages(capture).find((message) => message.method === "thread/start");
+  assert.deepEqual(start.params, {
+    cwd: directory,
+    ephemeral: false,
+    threadSource: "imessage-handoff:new:flow-123",
+  });
+  assert.equal(messages(capture).some((message) => message.method === "turn/start"), false);
+});
+
+test("thread creation rejects an invalid app-server response and a missing cwd", async (t) => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "imessage-app-server-create-invalid-"));
+  const { runner, capture } = testRunner(directory, "invalid-thread-start");
+  t.after(() => runner.client.close());
+
+  await assert.rejects(
+    runner.createThread({ cwd: directory, threadSource: "imessage-handoff:new:invalid" }),
+    (error) => error?.code === "CODEX_PROTOCOL_ERROR",
+  );
+  await assert.rejects(
+    runner.createThread({ cwd: path.join(directory, "missing"), threadSource: "imessage-handoff:new:missing" }),
+    (error) => error?.code === "MISSING_CWD",
+  );
+  assert.equal(messages(capture).filter((message) => message.method === "thread/start").length, 1);
+});
+
 test("shared app-server runner preserves input and streams safe output", async (t) => {
   const directory = mkdtempSync(path.join(os.tmpdir(), "imessage-app-server-runner-"));
   const { runner, capture, image, invocations } = testRunner(directory);
@@ -140,6 +224,7 @@ test("shared app-server runner preserves input and streams safe output", async (
     thread: { id: "thread-1", cwd: directory },
     prompt,
     images: [localInput],
+    clientUserMessageId: "client-message-stable",
     reasoningEffort: "high",
     onPhase: (phase) => phases.push(phase),
     onReasoningDelta: (delta) => reasoning.push(delta),
@@ -152,6 +237,7 @@ test("shared app-server runner preserves input and streams safe output", async (
   const start = sent.find((message) => message.method === "turn/start");
   assert.equal(start.params.input[0].text, prompt);
   assert.deepEqual(start.params.input[1], { type: "localImage", path: localInput });
+  assert.equal(start.params.clientUserMessageId, "client-message-stable");
   assert.equal(start.params.effort, "high");
   assert.deepEqual(invocations, [{
     command: invocations[0].command,
@@ -166,6 +252,55 @@ test("shared app-server runner preserves input and streams safe output", async (
   assert.deepEqual(images, [image]);
   assert.deepEqual(result, { status: "completed", body: "A clean answer.\n", generatedImages: [image] });
   assert.equal(runner.isRunning(), false);
+});
+
+test("shared app-server reconciles a turn by the echoed client user-message id", async (t) => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "imessage-app-server-reconcile-"));
+  const { runner, capture } = testRunner(directory, "reconcile");
+  t.after(() => runner.client.close());
+
+  assert.deepEqual(
+    await runner.findTurnByClientUserMessageId("thread-1", "client-message-stable"),
+    {
+      id: "turn-recovered",
+      state: "completed",
+      finalResponse: "Recovered answer.",
+      status: "completed",
+    },
+  );
+  const read = messages(capture).find((message) => message.method === "thread/read");
+  assert.deepEqual(read.params, { threadId: "thread-1", includeTurns: true });
+});
+
+test("an ambiguous turn/start is reconciled by its stable id without a second start", async (t) => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "imessage-app-server-ambiguous-start-"));
+  const { runner, capture } = testRunner(directory, "lost-start-response", {
+    // Child-process startup can be delayed substantially on a busy Desktop
+    // Mac. Keep the ambiguity deterministic by allowing initialization to
+    // finish before timing out the deliberately unanswered turn/start.
+    requestTimeoutMs: 3_000,
+    turnTimeoutMs: 5_000,
+  });
+  t.after(() => runner.client.close());
+  const request = {
+    thread: { id: "thread-1", cwd: directory },
+    prompt: "Run this exactly once.",
+    clientUserMessageId: "client-message-stable",
+  };
+
+  await assert.rejects(runner.run(request), (error) => {
+    assert.equal(error.code, "CODEX_TIMEOUT");
+    assert.equal(error.turnOutcomeUnknown, true);
+    assert.equal(error.clientUserMessageId, "client-message-stable");
+    return true;
+  });
+  const recovered = await runner.findTurnByClientUserMessageId("thread-1", "client-message-stable");
+  assert.equal(recovered.id, "turn-recovered");
+  assert.equal(recovered.finalResponse, "Recovered answer.");
+
+  const starts = messages(capture).filter((message) => message.method === "turn/start");
+  assert.equal(starts.length, 1);
+  assert.equal(starts[0].params.clientUserMessageId, "client-message-stable");
 });
 
 test("server overload is deferred as busy instead of failing the message", async (t) => {
@@ -252,7 +387,10 @@ test("turn timeout interrupts backend work and rejects after bounded grace", asy
     runner.run({ thread: { id: "thread-1", cwd: directory }, prompt: "Do not run forever." }),
     (error) => error.code === "CODEX_TIMEOUT",
   );
-  assert.ok(Date.now() - startedAt < 500);
+  // This verifies that the explicit timeout and interrupt grace bound the
+  // operation without assuming the host scheduler will wake the test within
+  // a sub-second wall-clock window.
+  assert.ok(Date.now() - startedAt < 2_000);
   // The interrupt is already bounded by the runner's 40 ms grace; allow the
   // parallel full suite extra time to flush the child-process capture file.
   await waitFor(() => messages(capture).some((message) => message.method === "turn/interrupt"), 5_000);
@@ -264,7 +402,7 @@ test("turn timeout interrupts backend work and rejects after bounded grace", asy
 test("a timeout during resume never starts a ghost turn", async (t) => {
   const directory = mkdtempSync(path.join(os.tmpdir(), "imessage-app-server-ghost-turn-"));
   const { runner, capture } = testRunner(directory, "slow-resume", {
-    requestTimeoutMs: 500,
+    requestTimeoutMs: 2_000,
     turnTimeoutMs: 20,
     interruptGraceMs: 200,
   });

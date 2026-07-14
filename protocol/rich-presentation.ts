@@ -1,4 +1,5 @@
 import {
+  reasoningDisplay,
   renderOutboundMessages,
   type OutboundEvent,
   type PresentationOptions,
@@ -216,7 +217,7 @@ export function compileMarkdownRanges(source: string) {
 }
 
 function appendPatternRanges(text: string, ranges: NativeTextRange[], event?: OutboundEvent) {
-  for (const match of text.matchAll(/(^|[\s·(“])\/(?:threads|recent|refresh|projects|search|thread|request|message|turn|history|reasoning|listen|link|mute|unmute|status|retry|dismiss|cancel|help)\b/gim)) {
+  for (const match of text.matchAll(/(^|[\s·(“])\/(?:new|threads|recent|refresh|projects|search|thread|request|message|turn|history|reasoning|defaultreasoning|listen|link|mute|unmute|status|retry|dismiss|cancel|help)\b/gim)) {
     const prefixLength = match[1].length;
     const token = match[0].slice(prefixLength);
     ranges.push({ location: (match.index ?? 0) + prefixLength, length: token.length, style: "bold" });
@@ -295,15 +296,17 @@ function reasoningPoll(
   capabilities: RichTransportCapabilities,
 ): RichPollIntent {
   const current = reasoningValue(event.current);
+  const currentDisplay = reasoningDisplay(current);
   return {
     kind: "poll",
-    question: `Reasoning · ${current} selected`,
+    question: `Reasoning · ${currentDisplay.emoji} ${currentDisplay.label}`,
     options: event.options.map((option) => {
       const item = typeof option === "string" ? { value: option } : option;
       const value = reasoningValue(item.value);
+      const display = reasoningDisplay(value);
       return {
         id: value,
-        label: `${value}${(item.selected ?? value === current) ? " · selected" : ""}`,
+        label: `${display.emoji} ${display.label}${(item.selected ?? value === current) ? " · selected" : ""}`,
         selected: item.selected ?? value === current,
         command: `/reasoning ${value}`,
       };

@@ -1,0 +1,217 @@
+--- a/Sources/IMsgHelper/IMsgInjected.m
++++ b/Sources/IMsgHelper/IMsgInjected.m
+@@ -133,6 +133,7 @@
+-// from outside the dylib painful. Append-only file in the sandbox container
+-// gives us a stable channel that's readable from outside.
++// from outside the dylib painful. An opt-in, bounded file in the sandbox
++// container gives us a stable channel that's readable from outside.
+ static NSString *kDebugLogFile = nil; // .imsg-bridge.log
++static NSString *kDebugLogRotated = nil; // .imsg-bridge.log.1
+ 
+ static NSTimer *fileWatchTimer = nil;
+ static NSTimer *rpcInboxTimer = nil;
+@@ -141,8 +142,14 @@
+ static int lockFd = -1;
+ 
+ static const NSUInteger kEventsRotateBytes = 1 * 1024 * 1024;
++static const NSUInteger kDebugLogRotateBytes = 256 * 1024;
+ static const NSTimeInterval kV2ClaimMaxAge = 10 * 60;
+ 
++static BOOL debugLoggingEnabled(void) {
++    const char *value = getenv("IMSG_BRIDGE_DEBUG");
++    return value && strcmp(value, "1") == 0;
++}
++
+ static void initFilePaths(void) {
+     if (kCommandFile == nil) {
+         // Messages.app runs in a container; NSHomeDirectory() resolves to
+@@ -156,7 +163,10 @@
+         kRpcOutDir = [kRpcDir stringByAppendingPathComponent:@"out"];
+         kEventsFile = [containerPath stringByAppendingPathComponent:@".imsg-events.jsonl"];
+         kEventsRotated = [containerPath stringByAppendingPathComponent:@".imsg-events.jsonl.1"];
+-        kDebugLogFile = [containerPath stringByAppendingPathComponent:@".imsg-bridge.log"];
++        if (debugLoggingEnabled()) {
++            kDebugLogFile = [containerPath stringByAppendingPathComponent:@".imsg-bridge.log"];
++            kDebugLogRotated = [containerPath stringByAppendingPathComponent:@".imsg-bridge.log.1"];
++        }
+     }
+ }
+ 
+@@ -166,7 +176,7 @@
+ /// inside the injected dylib.
+ __attribute__((format(NSString, 1, 2)))
+ static void debugLog(NSString *fmt, ...) {
+-    if (!kDebugLogFile) return;
++    if (!debugLoggingEnabled() || !kDebugLogFile) return;
+     va_list args;
+     va_start(args, fmt);
+     NSString *msg = [[NSString alloc] initWithFormat:fmt arguments:args];
+@@ -176,6 +186,14 @@
+     dispatch_once(&once, ^{ fmtr = [NSISO8601DateFormatter new]; });
+     NSString *line = [NSString stringWithFormat:@"%@ %@\n",
+                       [fmtr stringFromDate:[NSDate date]], msg];
++    NSDictionary *attributes = [[NSFileManager defaultManager]
++        attributesOfItemAtPath:kDebugLogFile error:nil];
++    if ([attributes fileSize] >= kDebugLogRotateBytes) {
++        [[NSFileManager defaultManager] removeItemAtPath:kDebugLogRotated error:nil];
++        [[NSFileManager defaultManager] moveItemAtPath:kDebugLogFile
++                                                toPath:kDebugLogRotated
++                                                 error:nil];
++    }
+     FILE *fp = fopen(kDebugLogFile.UTF8String, "a");
+     if (fp) { fputs(line.UTF8String, fp); fclose(fp); }
+ }
+@@ -1020,6 +1038,7 @@
+         @"chat_count": @(chatCount),
+         @"typing_available": @(hasRegistry),
+         @"read_available": @(hasRegistry),
++        @"custom_emoji_tapbacks": @YES,
+         @"bridge_version": @2,
+         @"v2_ready": @(rpcInboxTimer != nil),
+         @"attachment_metadata": @YES,
+@@ -5461,6 +5480,15 @@
+     }
+ 
+     long long associatedType = -1;
++    NSString *customEmoji = nil;
++    BOOL removeCustom = [reactionType hasPrefix:@"remove-custom:"];
++    BOOL addCustom = [reactionType hasPrefix:@"custom:"];
++    if (removeCustom || addCustom) {
++        NSString *encoded = [reactionType substringFromIndex:(removeCustom ? 14 : 7)];
++        NSData *emojiData = [[NSData alloc] initWithBase64EncodedString:encoded options:0];
++        customEmoji = emojiData ? [[NSString alloc] initWithData:emojiData encoding:NSUTF8StringEncoding] : nil;
++        if (customEmoji.length) associatedType = removeCustom ? 3006 : 2006;
++    }
+     NSDictionary *kindMap = @{
+         @"love": @2000, @"like": @2001, @"dislike": @2002,
+         @"laugh": @2003, @"emphasize": @2004, @"question": @2005,
+@@ -5494,6 +5522,8 @@
+         case 2003: case 3003: verb = @"Laughed at "; break;
+         case 2004: case 3004: verb = @"Emphasized "; break;
+         case 2005: case 3005: verb = @"Questioned "; break;
++        case 2006: verb = [NSString stringWithFormat:@"Reacted %@ to ", customEmoji ?: @""]; break;
++        case 3006: verb = [NSString stringWithFormat:@"Removed %@ from ", customEmoji ?: @""]; break;
+     }
+     if (associatedType >= 3000) {
+         NSString *removed = @"Removed a like from ";
+@@ -5504,6 +5534,7 @@
+             case 3003: removed = @"Removed a laugh from "; break;
+             case 3004: removed = @"Removed an exclamation from "; break;
+             case 3005: removed = @"Removed a question mark from "; break;
++            case 3006: removed = [NSString stringWithFormat:@"Removed %@ from ", customEmoji ?: @""]; break;
+         }
+         verb = removed;
+     }
+@@ -5540,10 +5571,9 @@
+     // imagent silently dropped the reaction.
+     NSDictionary *summary = @{ @"amc": @1,
+                                @"ams": parentText ?: @"" };
+-    debugLog(@"handleSendReaction: target=%@ type=%lld range={%lu,%lu} body=%@",
+-             associatedRef, associatedType,
+-             (unsigned long)targetRange.location, (unsigned long)targetRange.length,
+-             quoted);
++    debugLog(@"handleSendReaction: type=%lld range={%lu,%lu}",
++             associatedType,
++             (unsigned long)targetRange.location, (unsigned long)targetRange.length);
+ 
+     // One-shot probe: list every IMMessage class method that mentions
+     // "associated" or "instant" so we can see what reaction constructors
+--- a/Sources/imsg/Commands/StatusCommand.swift
++++ b/Sources/imsg/Commands/StatusCommand.swift
+@@ -44,6 +44,7 @@
+     // Probe the bridge for v2 readiness + selector availability.
+     var bridgeVersion: Int = 0
+     var v2Ready: Bool = false
++    var customEmojiTapbacks: Bool = false
+     var selectors: [String: Bool] = [:]
+     if availability.available {
+       do {
+@@ -51,6 +52,7 @@
+           action: .status, params: [:], timeout: 3.0)
+         bridgeVersion = (data["bridge_version"] as? Int) ?? 0
+         v2Ready = (data["v2_ready"] as? Bool) ?? false
++        customEmojiTapbacks = (data["custom_emoji_tapbacks"] as? Bool) ?? false
+         if let raw = data["selectors"] as? [String: Bool] { selectors = raw }
+       } catch {
+         // Bridge probe failure is non-fatal.
+@@ -63,6 +65,7 @@
+         basicFeatures: true,
+         advancedFeatures: availability.available,
+         pollCaptionControl: true,
++        customEmojiTapbacks: customEmojiTapbacks,
+         typingIndicators: availability.available,
+         readReceipts: availability.available,
+         sip: sipStatus,
+@@ -147,6 +150,7 @@
+   let basicFeatures: Bool
+   let advancedFeatures: Bool
+   let pollCaptionControl: Bool
++  let customEmojiTapbacks: Bool
+   let typingIndicators: Bool
+   let readReceipts: Bool
+   let sip: String
+@@ -161,6 +165,7 @@
+     case basicFeatures = "basic_features"
+     case advancedFeatures = "advanced_features"
+     case pollCaptionControl = "poll_caption_control"
++    case customEmojiTapbacks = "custom_emoji_tapbacks"
+     case typingIndicators = "typing_indicators"
+     case readReceipts = "read_receipts"
+     case sip
+--- a/Sources/imsg/RPCServer+BridgeMessageHandlers.swift
++++ b/Sources/imsg/RPCServer+BridgeMessageHandlers.swift
+@@ -475,8 +475,9 @@
+ }
+ 
+ func normalizeBridgeReactionType(_ raw: String, remove: Bool = false) throws -> String {
+-  var value = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+-  if value.isEmpty {
++  let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
++  var value = trimmed.lowercased()
++  if trimmed.isEmpty {
+     throw RPCError.invalidParams("reaction, kind, or emoji is required")
+   }
+   var shouldRemove = remove
+@@ -499,9 +500,16 @@
+   case "question", "?", "❓":
+     normalized = "question"
+   default:
+-    throw RPCError.invalidParams(
+-      "unsupported tapback reaction \(raw); use love, like, dislike, laugh, emphasize, or question"
+-    )
++    let scalars = value.unicodeScalars
++    let emojiPresentation = scalars.contains { $0.properties.isEmojiPresentation }
++    let emojiSequence = scalars.count > 1 && scalars.contains { $0.properties.isEmoji }
++    guard value.count == 1, emojiPresentation || emojiSequence,
++      let encoded = value.data(using: .utf8)?.base64EncodedString(), !encoded.isEmpty else {
++      throw RPCError.invalidParams(
++        "unsupported tapback reaction \(raw); use one emoji or a standard tapback"
++      )
++    }
++    return shouldRemove ? "remove-custom:\(encoded)" : "custom:\(encoded)"
+   }
+   let result = shouldRemove ? "remove-\(normalized)" : normalized
+   guard BridgeReactionKind(rawValue: result) != nil else {
+--- a/Tests/imsgTests/LaunchStatusCommandTests.swift
++++ b/Tests/imsgTests/LaunchStatusCommandTests.swift
+@@ -43,6 +43,7 @@
+   #expect(output.contains("basic_features"))
+   #expect(output.contains("advanced_features"))
+   #expect(output.contains(#""poll_caption_control":true"#))
++  #expect(output.contains("custom_emoji_tapbacks"))
+ }
+ 
+ @Test
+--- a/Tests/imsgTests/RPCBridgeMessageHandlersTests.swift
++++ b/Tests/imsgTests/RPCBridgeMessageHandlersTests.swift
+@@ -251,6 +251,10 @@
+   #expect(try normalizeBridgeReactionType("haha") == "laugh")
+   #expect(try normalizeBridgeReactionType("question", remove: true) == "remove-question")
+   #expect(try normalizeBridgeReactionType("remove-like") == "remove-like")
++  #expect(try normalizeBridgeReactionType("🔕") == "custom:8J+UlQ==")
++  #expect(try normalizeBridgeReactionType("🔕", remove: true) == "remove-custom:8J+UlQ==")
++  #expect(try normalizeBridgeReactionType("remove-🔕") == "remove-custom:8J+UlQ==")
++  #expect(throws: RPCError.self) { try normalizeBridgeReactionType("1") }
+ }
+ 
+ @Test

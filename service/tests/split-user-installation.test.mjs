@@ -12,6 +12,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { createPrivateKey } from "node:crypto";
+import { createConnection, createServer } from "node:net";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -69,8 +70,8 @@ function filesBelow(root) {
   return files;
 }
 
-function makeBundle(t) {
-  const root = mkdtempSync(path.join(os.tmpdir(), "split-user-helper-"));
+function makeBundle(t, { shortRoot = false } = {}) {
+  const root = mkdtempSync(path.join(shortRoot ? "/tmp" : os.tmpdir(), "split-user-helper-"));
   t.after(() => rmSync(root, { recursive: true, force: true }));
   const controllerHome = path.join(root, "controller");
   const codexHome = path.join(controllerHome, ".codex");
@@ -313,6 +314,9 @@ test("staging copies the complete imsg tree, replaces only imsg, and exposes no 
 
 test("staging atomically upgrades an owned signed fixed destination", (t) => {
   const fixture = makeBundle(t);
+  const exchange = path.join(fixture.sharedRoot, "exchange");
+  const exchangeInode = lstatSync(exchange).ino;
+  writeFileSync(path.join(exchange, "live-helper-marker"), "keep the live exchange\n", { mode: 0o660 });
   writeFileSync(fixture.daemonSafeImsg, "upgraded daemon-safe imsg\n", { mode: 0o755 });
   const upgraded = stageSplitUserHelperBundle({
     ...fixture.stageOptions,
@@ -322,7 +326,10 @@ test("staging atomically upgrades an owned signed fixed destination", (t) => {
   const manifest = JSON.parse(readFileSync(upgraded.manifestPath, "utf8"));
   assert.equal(manifest.bundleId, "fixture-bundle-upgraded");
   assert.equal(readFileSync(path.join(fixture.sharedRoot, manifest.imsg), "utf8"), "upgraded daemon-safe imsg\n");
+  assert.equal(lstatSync(exchange).ino, exchangeInode);
+  assert.equal(readFileSync(path.join(exchange, "live-helper-marker"), "utf8"), "keep the live exchange\n");
   assert.equal(readdirSync(path.dirname(fixture.sharedRoot)).some((name) => name.includes(".quarantine-")), false);
+  assert.equal(readdirSync(path.dirname(fixture.sharedRoot)).some((name) => name.includes(".exchange-")), false);
   const active = JSON.parse(readFileSync(path.join(
     fixture.controllerHome,
     ".codex/imessage-handoff/split-user-controller/active-bundle.json",
@@ -330,8 +337,41 @@ test("staging atomically upgrades an owned signed fixed destination", (t) => {
   assert.equal(active.bundleId, "fixture-bundle-upgraded");
 });
 
+test("staging an upgrade preserves a reachable live helper socket", async (t) => {
+  const fixture = makeBundle(t, { shortRoot: true });
+  const socketPath = path.join(fixture.sharedRoot, "exchange", "imsg-helper.sock");
+  const server = createServer((socket) => socket.end());
+  await new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(socketPath, resolve);
+  });
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+
+  const connect = () => new Promise((resolve, reject) => {
+    const socket = createConnection(socketPath);
+    socket.once("connect", () => {
+      socket.destroy();
+      resolve();
+    });
+    socket.once("error", reject);
+  });
+  await connect();
+
+  writeFileSync(fixture.daemonSafeImsg, "live-socket upgrade\n", { mode: 0o755 });
+  stageSplitUserHelperBundle({
+    ...fixture.stageOptions,
+    bundleId: "fixture-live-socket-upgrade",
+  });
+
+  assert.equal(existsSync(socketPath), true);
+  await connect();
+});
+
 test("staging restores the signed prior bundle when active-state commit fails", (t) => {
   const fixture = makeBundle(t);
+  const exchange = path.join(fixture.sharedRoot, "exchange");
+  const exchangeInode = lstatSync(exchange).ino;
+  writeFileSync(path.join(exchange, "live-helper-marker"), "keep the live exchange\n", { mode: 0o660 });
   const priorManifest = readFileSync(path.join(fixture.sharedRoot, "bundle-manifest.json"), "utf8");
   const priorImsg = readFileSync(path.join(fixture.sharedRoot, "payload/runtime/imsg/imsg"), "utf8");
   writeFileSync(fixture.daemonSafeImsg, "upgrade that must roll back\n", { mode: 0o755 });
@@ -345,7 +385,10 @@ test("staging restores the signed prior bundle when active-state commit fails", 
   );
   assert.equal(readFileSync(path.join(fixture.sharedRoot, "bundle-manifest.json"), "utf8"), priorManifest);
   assert.equal(readFileSync(path.join(fixture.sharedRoot, "payload/runtime/imsg/imsg"), "utf8"), priorImsg);
+  assert.equal(lstatSync(exchange).ino, exchangeInode);
+  assert.equal(readFileSync(path.join(exchange, "live-helper-marker"), "utf8"), "keep the live exchange\n");
   assert.equal(readdirSync(path.dirname(fixture.sharedRoot)).some((name) => name.includes(".quarantine-")), false);
+  assert.equal(readdirSync(path.dirname(fixture.sharedRoot)).some((name) => name.includes(".exchange-")), false);
 });
 
 test("a failed helper upgrade restores its prior payload, config, and LaunchAgent", (t) => {

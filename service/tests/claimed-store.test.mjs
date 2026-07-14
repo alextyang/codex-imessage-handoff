@@ -3,7 +3,14 @@ import test from "node:test";
 import { mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { loadClaimedJobs, markClaimedJobState, removeClaimedJob, removeClaimedJobs, saveClaimedJob } from "../src/claimed-store.mjs";
+import {
+  claimedClientUserMessageId,
+  loadClaimedJobs,
+  markClaimedJobState,
+  removeClaimedJob,
+  removeClaimedJobs,
+  saveClaimedJob,
+} from "../src/claimed-store.mjs";
 
 test("claimed prompts survive restart state privately until completion", () => {
   const home = mkdtempSync(path.join(os.tmpdir(), "imessage-claimed-state-"));
@@ -22,6 +29,7 @@ test("claimed prompts survive restart state privately until completion", () => {
     };
     saveClaimedJob({
       ...event,
+      reasoningEffort: "high",
       mirrorSuppressionToken: "token-123",
       imsgGuid: "native-reply-guid",
       backendNoticeSent: true,
@@ -29,9 +37,13 @@ test("claimed prompts survive restart state privately until completion", () => {
       recoveredTurnId: "turn-recovered",
       recoveryMissingSince: "2026-07-12T00:00:10.000Z",
     }, "queued");
+    const stableClientId = claimedClientUserMessageId("thread-a", "reply-a");
     assert.equal(statSync(path.join(home, "run-state.json")).mode & 0o777, 0o600);
+    assert.equal(event.clientUserMessageId, undefined, "saving a copied event does not mutate the caller's original object");
+    assert.equal(loadClaimedJobs()[0].clientUserMessageId, stableClientId);
     assert.equal(loadClaimedJobs()[0].claimed.reply.body, "Exact private prompt");
     assert.equal(loadClaimedJobs()[0].claimed.userMirrorMode, "mirror");
+    assert.equal(loadClaimedJobs()[0].reasoningEffort, "high");
     assert.equal(loadClaimedJobs()[0].mirrorSuppressionToken, "token-123");
     assert.equal(loadClaimedJobs()[0].imsgGuid, "native-reply-guid");
     assert.equal(loadClaimedJobs()[0].backendNoticeSent, true);
@@ -40,10 +52,45 @@ test("claimed prompts survive restart state privately until completion", () => {
     assert.equal(loadClaimedJobs()[0].recoveryMissingSince, "2026-07-12T00:00:10.000Z");
     assert.equal(markClaimedJobState("reply-a", "running").state, "running");
     assert.equal(loadClaimedJobs()[0].state, "running");
-    saveClaimedJob({ ...event, delivery: { body: "Completed response", generatedImages: [] } }, "delivering");
+    assert.equal(loadClaimedJobs()[0].reasoningEffort, "high", "claiming the queued job must retain its reasoning snapshot");
+    const recovered = loadClaimedJobs()[0];
+    saveClaimedJob({ ...recovered, delivery: { body: "Completed response", generatedImages: [] } }, "delivering");
     assert.equal(loadClaimedJobs()[0].delivery.body, "Completed response");
+    assert.equal(loadClaimedJobs()[0].clientUserMessageId, stableClientId, "recovery and delivery reuse the original protocol id");
     assert.equal(removeClaimedJob("reply-a"), true);
     assert.deepEqual(loadClaimedJobs(), []);
+  } finally {
+    if (previous === undefined) delete process.env.IMESSAGE_HANDOFF_HOME;
+    else process.env.IMESSAGE_HANDOFF_HOME = previous;
+  }
+});
+
+test("a retry keeps the persisted client user-message id instead of minting a new turn identity", () => {
+  const home = mkdtempSync(path.join(os.tmpdir(), "imessage-claimed-retry-id-"));
+  const previous = process.env.IMESSAGE_HANDOFF_HOME;
+  process.env.IMESSAGE_HANDOFF_HOME = home;
+  try {
+    const first = {
+      threadId: "thread-retry",
+      replyId: "native-guid-retry",
+      claimed: { reply: { body: "Run once", media: [] }, images: [] },
+    };
+    saveClaimedJob(first, "running");
+    const firstId = first.clientUserMessageId;
+    assert.match(firstId, /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/);
+
+    const restored = loadClaimedJobs()[0];
+    saveClaimedJob({
+      threadId: restored.threadId,
+      replyId: restored.replyId,
+      clientUserMessageId: "attempted-replacement",
+      claimed: restored.claimed,
+      retryOf: restored.replyId,
+    }, "queued");
+
+    assert.equal(loadClaimedJobs()[0].clientUserMessageId, firstId);
+    assert.equal(claimedClientUserMessageId("thread-retry", "native-guid-retry"), firstId);
+    assert.notEqual(claimedClientUserMessageId("thread-retry", "another-guid"), firstId);
   } finally {
     if (previous === undefined) delete process.env.IMESSAGE_HANDOFF_HOME;
     else process.env.IMESSAGE_HANDOFF_HOME = previous;

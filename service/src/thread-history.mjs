@@ -128,6 +128,7 @@ function newTurn(id, sequence) {
   return {
     id,
     state: "running",
+    clientUserMessageId: null,
     request: "",
     assistantMessages: [],
     commentary: [],
@@ -151,6 +152,7 @@ function publicTurn(turn) {
   return {
     id: turn.id,
     state: turn.state,
+    clientUserMessageId: turn.clientUserMessageId,
     request: turn.request,
     assistantMessages: turn.assistantMessages.map(({ text, phase, timestamp }) => ({ text, phase, timestamp })),
     commentary: [...turn.commentary],
@@ -272,6 +274,9 @@ function parseTurns(records, metadata = {}) {
       const turn = ensureTurn(activeTurnId, sequence);
       if (turn && typeof payload.message === "string") {
         assignRequest(turn, payload.message, sequence, "user_message");
+        if (typeof payload.client_id === "string" && payload.client_id) {
+          turn.clientUserMessageId = payload.client_id;
+        }
         turn.activityAt = recordAt || turn.activityAt;
       }
       continue;

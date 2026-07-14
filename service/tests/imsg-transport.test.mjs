@@ -45,6 +45,7 @@ class FakeClient {
         typing: this.advanced,
         readReceipts: this.advanced,
         tapbacks: this.advanced,
+        customEmojiTapbacks: this.advanced,
         attachments: this.advanced,
         sendStatus: true,
         edits: this.advanced,
@@ -85,8 +86,8 @@ class FakeClient {
     if (this.sideEffectsFail) throw new Error("read failed");
     return this.accepted("read");
   }
-  async tapback(params) {
-    this.calls.push(["tapback", params]);
+  async tapback(params, options) {
+    this.calls.push(["tapback", params, options]);
     if (this.sideEffectsFail) throw new Error("tapback failed");
     return this.accepted("tapback");
   }
@@ -160,6 +161,7 @@ function fixture(options = {}) {
     now: () => now,
     watchRetryBaseMs: options.watchRetryBaseMs,
     watchRetryMaxMs: options.watchRetryMaxMs,
+    commandContextTtlMs: options.commandContextTtlMs,
   });
   return { transport, client, profile, stateFile, now: () => now, advance: (milliseconds) => { now += milliseconds; } };
 }
@@ -362,7 +364,7 @@ test("a new conversation baselines existing history before subscribing", async (
   assert.equal(transport.router.lastUserMessageAt, null);
 });
 
-test("read and special-reaction failures cannot prevent durable inbound acknowledgement", async () => {
+test("read and semantic-reaction failures cannot prevent durable inbound acknowledgement", async () => {
   const client = new FakeClient({ sideEffectsFail: true });
   const { transport } = fixture({ client });
   await transport.probe();
@@ -375,14 +377,342 @@ test("read and special-reaction failures cannot prevent durable inbound acknowle
   });
 
   assert.equal(await transport.observeInbound(action), false);
-  assert.equal(await transport.acceptInbound(action, { react: true }), true);
+  assert.equal(await transport.acceptInbound(action, { reaction: "🔕" }), true);
   assert.deepEqual(transport.pendingActions(), []);
+  assert.equal(transport.router.pendingConfirmations().length, 1);
   assert.equal(transport.router.ingest({
     id: 11,
     guid: "durable-inbound",
     text: "Run once",
     created_at: "2026-07-12T12:00:00.000Z",
   }), null);
+});
+
+test("new-task acceptance atomically clears setup routing and installs its durable default task", async () => {
+  const { transport, profile, stateFile } = fixture();
+  const flowId = "new-flow-accepted";
+  transport.router.setActiveNewFlow(flowId);
+  transport.router.setAwaitingNewPrompt(flowId);
+  const action = transport.router.ingest({
+    id: 11_000,
+    guid: "new-task-first-prompt",
+    text: "Build the accepted task.",
+    created_at: "2026-07-12T12:00:00.000Z",
+  });
+  assert.equal(action.kind, "new-prompt");
+  // Model a replay that restored the temporary lease before acceptance.
+  transport.router.setAwaitingNewPrompt(flowId);
+
+  assert.equal(await transport.acceptInbound(action, {
+    reaction: "✨",
+    newThreadCompletion: {
+      flowId,
+      threadId: "created-task-a",
+      updatedAt: action.createdAt,
+    },
+  }), true);
+
+  const resumed = new ImsgTransport({ profile, stateFile, client: new FakeClient() });
+  assert.deepEqual(resumed.pendingActions(), []);
+  assert.equal(resumed.router.activeNewFlowId, null);
+  assert.equal(resumed.router.awaitingNewPrompt, null);
+  assert.equal(resumed.router.lastUserThreadId, "created-task-a");
+});
+
+test("quarantined actions atomically retain their failure confirmation without adding routes", async () => {
+  const client = new FakeClient({ sideEffectsFail: true });
+  const { transport } = fixture({ client });
+  await transport.probe();
+  transport.router.setThreadRoot(THREAD.id, "quarantine-root");
+  const inbound = {
+    id: 11_001,
+    guid: "quarantined-command",
+    text: "/cancel",
+    thread_originator_guid: "quarantine-root",
+    created_at: "2026-07-12T12:00:00.000Z",
+  };
+  const action = transport.router.ingest(inbound);
+  const routesBeforeQuarantine = structuredClone(transport.router.state.guidRoutes);
+
+  assert.equal(await transport.quarantineInbound(action), true);
+  assert.deepEqual(transport.pendingActions(), []);
+  assert.deepEqual(transport.router.state.guidRoutes, routesBeforeQuarantine);
+  assert.deepEqual(transport.router.pendingConfirmations().map((item) => ({
+    messageGuid: item.messageGuid,
+    reaction: item.reaction,
+  })), [{ messageGuid: inbound.guid, reaction: "❌" }]);
+  assert.equal(transport.router.ingest(inbound), null);
+});
+
+test("semantic confirmations retry with one operation id after the next accepted inbound", async () => {
+  class AmbiguousOnceTapbackClient extends FakeClient {
+    async tapback(params, options) {
+      this.calls.push(["tapback", params, options]);
+      if (this.calls.filter(([kind]) => kind === "tapback").length === 1) {
+        return { classification: "ambiguous", accepted: false, reason: "ipc-disconnected" };
+      }
+      return this.accepted("tapback");
+    }
+  }
+  const client = new AmbiguousOnceTapbackClient();
+  const { transport } = fixture({ client });
+  await transport.probe();
+  transport.router.setThreadRoot(THREAD.id, "confirmation-root");
+  const commandMessage = {
+    id: 12,
+    guid: "confirmation-command",
+    text: "/mute",
+    thread_originator_guid: "confirmation-root",
+    created_at: "2026-07-12T12:00:00.000Z",
+  };
+  const command = transport.router.ingest(commandMessage);
+
+  assert.equal(await transport.acceptInbound(command, { reaction: "🔕" }), true);
+  assert.deepEqual(transport.pendingActions(), []);
+  const [queued] = transport.router.pendingConfirmations();
+  assert.equal(queued.reaction, "🔕");
+  assert.equal(transport.router.ingest(commandMessage), null, "confirmation failure must not replay the command");
+
+  const prompt = transport.router.ingest({
+    id: 13,
+    guid: "confirmation-followup",
+    text: "Continue without a generic reaction.",
+    thread_originator_guid: "confirmation-root",
+    created_at: "2026-07-12T12:00:01.000Z",
+  });
+  assert.equal(await transport.acceptInbound(prompt), true);
+  assert.deepEqual(transport.router.pendingConfirmations(), []);
+  const attempts = client.calls.filter(([kind]) => kind === "tapback");
+  assert.equal(attempts.length, 2);
+  assert.deepEqual(attempts.map(([, params]) => params.reaction), ["🔕", "🔕"]);
+  assert.deepEqual(attempts.map(([, , options]) => options.operationId), [queued.operationId, queued.operationId]);
+  assert.equal(attempts.some(([, params]) => params.reaction === "like"), false);
+});
+
+test("a confirmation appended during an active flush is drained in the same pass", async () => {
+  let settleFirstTapback;
+  class DeferredFirstTapbackClient extends FakeClient {
+    async tapback(params, options) {
+      this.calls.push(["tapback", params, options]);
+      if (this.calls.filter(([kind]) => kind === "tapback").length === 1) {
+        return new Promise((resolve) => { settleFirstTapback = resolve; });
+      }
+      return this.accepted("tapback");
+    }
+  }
+  const client = new DeferredFirstTapbackClient();
+  const { transport } = fixture({ client });
+  await transport.probe();
+  transport.router.setThreadRoot(THREAD.id, "concurrent-confirmation-root");
+
+  const first = transport.router.ingest({
+    id: 12_001,
+    guid: "concurrent-confirmation-first",
+    text: "/mute",
+    thread_originator_guid: "concurrent-confirmation-root",
+    created_at: "2026-07-12T12:00:00.000Z",
+  });
+  const firstAcceptance = transport.acceptInbound(first, { reaction: "🔕" });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(client.calls.filter(([kind]) => kind === "tapback").length, 1);
+
+  const second = transport.router.ingest({
+    id: 12_002,
+    guid: "concurrent-confirmation-second",
+    text: "/listen",
+    thread_originator_guid: "concurrent-confirmation-root",
+    created_at: "2026-07-12T12:00:01.000Z",
+  });
+  const secondAcceptance = transport.acceptInbound(second, { reaction: "👂" });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(client.calls.filter(([kind]) => kind === "tapback").length, 1);
+
+  settleFirstTapback({ classification: "accepted", accepted: true });
+  assert.deepEqual(await Promise.all([firstAcceptance, secondAcceptance]), [true, true]);
+  assert.deepEqual(transport.router.pendingConfirmations(), []);
+  assert.deepEqual(
+    client.calls.filter(([kind]) => kind === "tapback").map(([, params]) => params.message_guid),
+    ["concurrent-confirmation-first", "concurrent-confirmation-second"],
+  );
+});
+
+test("startup drains persisted semantic confirmations without replaying accepted actions", async () => {
+  class AmbiguousTapbackClient extends FakeClient {
+    async tapback(params, options) {
+      this.calls.push(["tapback", params, options]);
+      return { classification: "ambiguous", accepted: false, reason: "ipc-disconnected" };
+    }
+  }
+  const firstClient = new AmbiguousTapbackClient();
+  const { transport, profile, stateFile } = fixture({ client: firstClient });
+  await transport.probe();
+  transport.router.setThreadRoot(THREAD.id, "startup-confirmation-root");
+  const inbound = {
+    id: 14,
+    guid: "startup-confirmation-command",
+    text: "/listen",
+    thread_originator_guid: "startup-confirmation-root",
+    created_at: "2026-07-12T12:00:00.000Z",
+  };
+  const action = transport.router.ingest(inbound);
+  await transport.acceptInbound(action, { reaction: "👂" });
+  const [queued] = transport.router.pendingConfirmations();
+  assert.ok(queued);
+
+  const recoveredClient = new FakeClient();
+  const recovered = new ImsgTransport({ profile, stateFile, client: recoveredClient });
+  await recovered.start();
+  assert.deepEqual(recovered.pendingActions(), []);
+  assert.deepEqual(recovered.router.pendingConfirmations(), []);
+  assert.equal(recovered.router.ingest(inbound), null);
+  const retry = recoveredClient.calls.find(([kind]) => kind === "tapback");
+  assert.equal(retry[1].reaction, "👂");
+  assert.equal(retry[2].operationId, queued.operationId);
+  await recovered.stop();
+});
+
+test("a terminal confirmation lookup cannot block later durable confirmations", async () => {
+  class AuthorizingClient extends FakeClient {
+    constructor() {
+      super();
+      this.deletedAvailable = false;
+    }
+
+    async authorizeMessageGuid(params) {
+      this.calls.push(["authorize", params]);
+      if (params.message_guid === "deleted-confirmation" && !this.deletedAvailable) {
+        return {
+          classification: "terminal",
+          accepted: false,
+          authorized: false,
+          terminal: true,
+          reason: "message-not-found",
+        };
+      }
+      return { classification: "accepted", accepted: true, authorized: true, terminal: false };
+    }
+  }
+  const client = new AuthorizingClient();
+  const { transport } = fixture({ client });
+  await transport.probe();
+  transport.setActiveThread(THREAD);
+  const deleted = transport.router.ingest({
+    id: 14_001,
+    guid: "deleted-confirmation",
+    text: "/mute",
+    created_at: "2026-07-12T12:00:00.000Z",
+  });
+  const deliverable = transport.router.ingest({
+    id: 14_002,
+    guid: "deliverable-confirmation",
+    text: "/listen",
+    created_at: "2026-07-12T12:00:01.000Z",
+  });
+  transport.router.acknowledgeWithConfirmation(deleted.messageKey, {
+    messageGuid: deleted.guid,
+    reaction: "🔕",
+  });
+  transport.router.acknowledgeWithConfirmation(deliverable.messageKey, {
+    messageGuid: deliverable.guid,
+    reaction: "👂",
+  });
+  const [deletedEntry, deliverableEntry] = transport.router.pendingConfirmations();
+
+  assert.equal(await transport._flushConfirmationOutbox(), 1);
+  assert.deepEqual(transport.router.pendingConfirmations(), [deletedEntry]);
+  assert.deepEqual(client.calls.filter(([kind]) => kind === "tapback").map(([, params]) => params.message_guid), [
+    "deliverable-confirmation",
+  ]);
+
+  client.deletedAvailable = true;
+  assert.equal(await transport._flushConfirmationOutbox(), 1);
+  assert.deepEqual(transport.router.pendingConfirmations(), []);
+  const attempts = client.calls.filter(([kind]) => kind === "tapback");
+  assert.equal(attempts[1][2].operationId, deletedEntry.operationId);
+  assert.equal(attempts[0][2].operationId, deliverableEntry.operationId);
+});
+
+test("watch recovery drains retained semantic confirmations with their original operation id", async () => {
+  class ToggleTapbackClient extends FakeClient {
+    constructor() {
+      super();
+      this.acceptTapbacks = false;
+    }
+
+    async tapback(params, options) {
+      this.calls.push(["tapback", params, options]);
+      return this.acceptTapbacks
+        ? this.accepted("tapback")
+        : { classification: "ambiguous", accepted: false, reason: "ipc-disconnected" };
+    }
+  }
+  const client = new ToggleTapbackClient();
+  const { transport } = fixture({ client, watchRetryBaseMs: 10, watchRetryMaxMs: 20 });
+  await transport.start();
+  transport.router.setThreadRoot(THREAD.id, "recovery-confirmation-root");
+  const action = transport.router.ingest({
+    id: 15,
+    guid: "recovery-confirmation-command",
+    text: "/unmute",
+    thread_originator_guid: "recovery-confirmation-root",
+    created_at: "2026-07-12T12:00:00.000Z",
+  });
+  await transport.acceptInbound(action, { reaction: "🔔" });
+  const [queued] = transport.router.pendingConfirmations();
+  assert.ok(queued);
+
+  client.acceptTapbacks = true;
+  client.watchHandlers.onError(new Error("helper restarted"));
+  await new Promise((resolve) => setTimeout(resolve, 45));
+  assert.equal(transport.isHealthy(), true);
+  assert.deepEqual(transport.router.pendingConfirmations(), []);
+  const attempts = client.calls.filter(([kind]) => kind === "tapback");
+  assert.equal(attempts.length, 2);
+  assert.deepEqual(attempts.map(([, , options]) => options.operationId), [queued.operationId, queued.operationId]);
+  await transport.stop();
+});
+
+test("watch recovery makes a fresh confirmation attempt after an old connection settles", async () => {
+  let settleFirstTapback;
+  class DeferredTapbackClient extends FakeClient {
+    async tapback(params, options) {
+      this.calls.push(["tapback", params, options]);
+      if (this.calls.filter(([kind]) => kind === "tapback").length === 1) {
+        return new Promise((resolve) => { settleFirstTapback = resolve; });
+      }
+      return this.accepted("tapback");
+    }
+  }
+  const client = new DeferredTapbackClient();
+  const { transport } = fixture({ client });
+  await transport.start();
+  transport.router.setThreadRoot(THREAD.id, "racing-confirmation-root");
+  const action = transport.router.ingest({
+    id: 16,
+    guid: "racing-confirmation-command",
+    text: "/mute",
+    thread_originator_guid: "racing-confirmation-root",
+    created_at: "2026-07-12T12:00:00.000Z",
+  });
+
+  const acceptance = transport.acceptInbound(action, { reaction: "🔕" });
+  await new Promise((resolve) => setImmediate(resolve));
+  const [queued] = transport.router.pendingConfirmations();
+  assert.ok(queued);
+  assert.equal(client.calls.filter(([kind]) => kind === "tapback").length, 1);
+
+  const recovery = transport._recoverWatch();
+  while (client.calls.filter(([kind]) => kind === "watch").length < 2) {
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  settleFirstTapback({ classification: "ambiguous", accepted: false, reason: "old-connection" });
+  await Promise.all([acceptance, recovery]);
+
+  assert.deepEqual(transport.router.pendingConfirmations(), []);
+  const attempts = client.calls.filter(([kind]) => kind === "tapback");
+  assert.equal(attempts.length, 2);
+  assert.deepEqual(attempts.map(([, , options]) => options.operationId), [queued.operationId, queued.operationId]);
+  await transport.stop();
 });
 
 test("read observation reports an ambiguous bridge result without degrading the watch", async () => {
@@ -465,7 +795,7 @@ test("creates one durable native root and sends later task output as replies wit
   });
   assert.equal(result.sent, true);
   const [header, first] = client.calls.filter(([kind]) => kind === "rich").map(([, params]) => params);
-  assert.match(header.text, /^\S+ Rich formatting\n\n○ unknown\n\ncodex:\/\/threads\/thread-a\n\n\/listen · \/link · \/mute\n\/turn · \/history · \/reasoning · \/cancel$/u);
+  assert.match(header.text, /^\S+ Rich formatting\n\n○ unknown\n↩️ Reasoning: Codex default\n\ncodex:\/\/threads\/thread-a\n\n👍 listen · 👎 mute · ❓ status \+ history\n\/link · \/cancel$/u);
   assert.equal(header.reply_to, undefined);
   assert.equal(first.text, "Checking three paths.");
   assert.equal(first.reply_to, "rich-1");
@@ -689,7 +1019,7 @@ test("manual header resends are separate replies under the existing root and uni
   assert.equal(headers[0][1].reply_to, undefined);
   assert.ok(headers.slice(1).every(([, params]) => params.reply_to === rootGuid));
   assert.notEqual(headers[1][2].operationId, headers[2][2].operationId);
-  assert.match(headers[1][1].text, /○ 5m ago\nReasoning: medium/u);
+  assert.match(headers[1][1].text, /○ 5m ago\n⚙️ Reasoning: Medium/u);
   const turn = rich.find(([, params]) => params.text?.includes("Last request."));
   assert.equal(turn[1].reply_to, rootGuid);
 });
@@ -770,8 +1100,8 @@ test("reasoning and small directories use native polls with durable action mappi
   });
   const polls = client.calls.filter(([kind]) => kind === "poll");
   assert.equal(polls.length, 2);
-  assert.equal(polls[0][1].question, "Reasoning · high selected");
-  assert.ok(polls[0][1].options.some((label) => label === "high · selected"));
+  assert.equal(polls[0][1].question, "Reasoning · 🔍 High");
+  assert.ok(polls[0][1].options.some((label) => label === "🔍 High · selected"));
   const reasoningVote = transport.router.ingest({
     id: 90,
     guid: "reasoning-vote",
@@ -922,7 +1252,7 @@ test("CJK and emoji-heavy poll labels are chunked and truncated within the nativ
   }
 });
 
-test("native task choices distinguish duplicate titles with project, state, queue, recency, and request context", async () => {
+test("native task choices stay compact while preserving status, title, project, and idle recency", async () => {
   const { transport, client } = fixture();
   await transport.probe();
   await transport.outbound({
@@ -952,9 +1282,20 @@ test("native task choices distinguish duplicate titles with project, state, queu
     },
   });
   const options = client.calls.find(([kind]) => kind === "poll")[1].options;
-  assert.match(options[0], /Fix transport · Messaging service · Working .* · 2 queued · “Keep the native/u);
-  assert.match(options[1], /Fix transport · Messaging service · .* ago · “Review the presentation/u);
+  assert.match(options[0], /^◷ \S+ Fix transport · Messaging service$/u);
+  assert.match(options[1], /^○ \S+ Fix transport · Messaging service · 1h ago$/u);
+  assert.ok(options.every((label) => !label.includes("queued") && !label.includes("“")));
   assert.notEqual(options[0], options[1]);
+});
+
+test("compact poll labels never split family, skin-tone, or flag graphemes", () => {
+  const prefix = "x".repeat(50);
+  for (const grapheme of ["👨‍👩‍👧‍👦", "👍🏽", "🇺🇸"]) {
+    assert.equal(
+      imsgTransportInternals.compact(`${prefix}${grapheme}tail`, 52),
+      `${prefix}${grapheme}…`,
+    );
+  }
 });
 
 test("deduplicates explicit delivery IDs without persisting message bodies", async () => {
@@ -1054,7 +1395,7 @@ test("uses read receipts routinely, tapbacks only for action commands, default-t
     created_at: "2026-07-12T12:00:01.000Z",
   });
   await transport.observeInbound(control);
-  await transport.acceptInbound(control);
+  await transport.acceptInbound(control, { reaction: "🔕" });
   await transport.setThreadTyping(THREAD.id, true);
   const images = await transport.publishImages(THREAD, ["/tmp/one.png"]);
   assert.equal(images.sent, true);
@@ -1063,11 +1404,12 @@ test("uses read receipts routinely, tapbacks only for action commands, default-t
   assert.equal(transport.notificationStatus().active, false);
   assert.ok(client.calls.some(([kind]) => kind === "read"));
   assert.deepEqual(client.calls.filter(([kind]) => kind === "tapback").map(([, params]) => params.message_guid), ["mute-command"]);
+  assert.deepEqual(client.calls.filter(([kind]) => kind === "tapback").map(([, params]) => params.reaction), ["🔕"]);
   assert.ok(client.calls.some(([kind]) => kind === "typing"));
   assert.ok(client.calls.some(([kind]) => kind === "attachment"));
 });
 
-test("read receipts observe every inbound while reactions are limited to action-taking controls", async () => {
+test("read receipts observe every inbound while only explicit semantic confirmations react", async () => {
   const { transport, client } = fixture();
   await transport.probe();
   transport.router.setThreadRoot(THREAD.id, "action-root");
@@ -1085,6 +1427,16 @@ test("read receipts observe every inbound while reactions are limited to action-
     "/cancel",
   ];
   const actions = [];
+  const confirmations = new Map([
+    [3, "🔍"],
+    [4, "👂"],
+    [5, "🔗"],
+    [6, "🔕"],
+    [7, "🔔"],
+    [8, "🔄"],
+    [9, "🗑️"],
+    [10, "🛑"],
+  ]);
   for (const [index, text] of messages.entries()) {
     const action = transport.router.ingest({
       id: 2_400 + index,
@@ -1095,18 +1447,21 @@ test("read receipts observe every inbound while reactions are limited to action-
     });
     actions.push(action);
     await transport.observeInbound(action);
-    await transport.acceptInbound(action);
+    await transport.acceptInbound(action, { reaction: confirmations.get(index) });
   }
   assert.equal(client.calls.filter(([kind]) => kind === "read").length, messages.length);
   assert.deepEqual(client.calls.filter(([kind]) => kind === "tapback").map(([, params]) => params.message_guid), [
     "confirmation-3",
     "confirmation-4",
+    "confirmation-5",
     "confirmation-6",
     "confirmation-7",
     "confirmation-8",
     "confirmation-9",
     "confirmation-10",
   ]);
+  assert.deepEqual(client.calls.filter(([kind]) => kind === "tapback").map(([, params]) => params.reaction), [...confirmations.values()]);
+  assert.equal(client.calls.some(([kind, params]) => kind === "tapback" && params.reaction === "like"), false);
   assert.equal(actions[0].kind, "prompt");
   assert.equal(actions[1].command, "thread");
   assert.equal(actions[2].command, "reasoning");
@@ -1313,6 +1668,52 @@ test("command-specific thread pickers persist structured control actions", async
     kind: "control",
     command: "mute",
     threadId: "thread-b",
+  });
+});
+
+test("generic action pickers persist new-task flows, refresh actions, and Add Choice search", async () => {
+  const { transport, client } = fixture();
+  await transport.probe();
+  const result = await transport.sendActionPicker("New task · project", [
+    { label: "○ 🧰 Messaging", action: { kind: "new-project", flowId: "flow-a", projectKey: "project-a" } },
+    { label: "○ 📦 Other task", action: { kind: "new-project", flowId: "flow-a", projectKey: "other-tasks" } },
+  ], {
+    addedChoiceAction: { kind: "new-project-search", flowId: "flow-a" },
+    refreshAction: { kind: "new-project-search", flowId: "flow-a" },
+    operationScope: "new-thread:flow-a:project",
+  });
+  assert.equal(result.sent, true);
+  const poll = client.calls.find(([kind]) => kind === "poll");
+  assert.equal(poll[1].send_caption, false);
+  assert.equal(client.calls.some(([kind]) => kind === "rich"), false);
+
+  const vote = transport.router.ingest({
+    id: 7_500,
+    guid: "new-project-vote",
+    created_at: "2026-07-12T12:00:00.000Z",
+    poll: { kind: "vote", original_guid: result.guids[0], vote: { option_id: "option-0" } },
+  });
+  assert.deepEqual({ kind: vote.kind, flowId: vote.flowId, projectKey: vote.projectKey }, {
+    kind: "new-project",
+    flowId: "flow-a",
+    projectKey: "project-a",
+  });
+  transport.router.acknowledge(vote.messageKey);
+
+  const added = transport.router.ingest({
+    id: 7_501,
+    guid: "new-project-added",
+    created_at: "2026-07-12T12:00:01.000Z",
+    poll: {
+      kind: "created",
+      original_guid: result.guids[0],
+      options_diff: [{ id: "new-option", text: "Release" }],
+    },
+  });
+  assert.deepEqual({ kind: added.kind, flowId: added.flowId, argument: added.argument }, {
+    kind: "new-project-search",
+    flowId: "flow-a",
+    argument: "Release",
   });
 });
 
@@ -1579,6 +1980,26 @@ test("typing follows only the current default task across interleaved work", asy
   assert.deepEqual(client.calls.filter(([kind]) => kind === "typing").map((call) => call[2]), [true, false, true]);
   await transport.outbound({ kind: "thread.output", thread: other, body: "B done." });
   assert.deepEqual(client.calls.filter(([kind]) => kind === "typing").map((call) => call[2]), [true, false, true, false]);
+});
+
+test("typing clears on the injected command-context deadline without another message", async () => {
+  const { transport, client, advance } = fixture({ commandContextTtlMs: 25 });
+  await transport.probe();
+  transport.router.setThreadRoot(THREAD.id, "typing-expiry-root");
+  const selected = transport.router.ingest({
+    id: 799,
+    guid: "typing-expiry-selection",
+    text: "/thread",
+    thread_originator_guid: "typing-expiry-root",
+    created_at: "2026-07-12T12:00:00.000Z",
+  });
+  await transport.acceptInbound(selected);
+  await transport.setThreadTyping(THREAD.id, true);
+  assert.deepEqual(client.calls.filter(([kind]) => kind === "typing").map((call) => call[2]), [true]);
+
+  setTimeout(() => advance(26), 5).unref?.();
+  await new Promise((resolve) => setTimeout(resolve, 45));
+  assert.deepEqual(client.calls.filter(([kind]) => kind === "typing").map((call) => call[2]), [true, false]);
 });
 
 test("manual selection immediately exposes typing for an already-running default task", async () => {

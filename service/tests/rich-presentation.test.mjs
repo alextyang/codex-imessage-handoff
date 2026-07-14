@@ -164,14 +164,14 @@ test("unchanged reasoning selectors become native polls when supported", () => {
     capabilities: { richText: true, polls: true },
   });
   assert.equal(intent.kind, "poll");
-  assert.equal(intent.question, "Reasoning · high selected");
+  assert.equal(intent.question, "Reasoning · 🔍 High");
   assert.equal(intent.allowMultiple, false);
   assert.equal(intent.fallback.fallbackText, exactFallback);
   assert.deepEqual(intent.options, [
-    { id: "none", label: "none", selected: false, command: "/reasoning none" },
-    { id: "medium", label: "medium", selected: false, command: "/reasoning medium" },
-    { id: "high", label: "high · selected", selected: true, command: "/reasoning high" },
-    { id: "xhigh", label: "xhigh", selected: false, command: "/reasoning xhigh" },
+    { id: "none", label: "↩️ Inherit", selected: false, command: "/reasoning none" },
+    { id: "medium", label: "⚙️ Medium", selected: false, command: "/reasoning medium" },
+    { id: "high", label: "🔍 High · selected", selected: true, command: "/reasoning high" },
+    { id: "xhigh", label: "🔬 Extra high", selected: false, command: "/reasoning xhigh" },
   ]);
 
   const [fallback] = renderRichOutboundIntents(event, {

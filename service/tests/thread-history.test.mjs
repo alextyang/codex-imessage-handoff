@@ -51,13 +51,13 @@ test("history exposes exact completed output and every current commentary messag
   const lines = [
     record("2026-07-12T01:00:00.000Z", "event_msg", { type: "task_started", turn_id: "turn-1", started_at: 1_783_817_200_000 }),
     message("2026-07-12T01:00:00.010Z", "user", "turn-1", completedRequest),
-    record("2026-07-12T01:00:00.011Z", "event_msg", { type: "user_message", message: completedRequest }),
+    record("2026-07-12T01:00:00.011Z", "event_msg", { type: "user_message", client_id: "client-turn-1", message: completedRequest }),
     message("2026-07-12T01:00:01.000Z", "assistant", "turn-1", "First progress update.", "commentary"),
     message("2026-07-12T01:00:02.000Z", "assistant", "turn-1", "A fallback final.", "final_answer"),
     record("2026-07-12T01:00:02.100Z", "event_msg", { type: "task_complete", turn_id: "turn-1", completed_at: 1_783_817_202_100, last_agent_message: completedFinal }),
     record("2026-07-12T01:01:00.000Z", "event_msg", { type: "task_started", turn_id: "turn-2", started_at: 1_783_817_260_000 }),
     message("2026-07-12T01:01:00.010Z", "user", "turn-2", currentRequest),
-    record("2026-07-12T01:01:00.011Z", "event_msg", { type: "user_message", message: currentRequest }),
+    record("2026-07-12T01:01:00.011Z", "event_msg", { type: "user_message", client_id: "client-turn-2", message: currentRequest }),
     record("2026-07-12T01:01:00.900Z", "event_msg", { type: "agent_message", message: "Inspecting the project.", phase: "commentary" }),
     message("2026-07-12T01:01:01.000Z", "assistant", "turn-2", "Inspecting the project.", "commentary"),
     message("2026-07-12T01:01:02.000Z", "assistant", "turn-2", "Running focused checks.", "commentary"),
@@ -69,10 +69,12 @@ test("history exposes exact completed output and every current commentary messag
   assert.equal(parsed.state, "running");
   assert.equal(parsed.malformedTail, true);
   assert.equal(parsed.currentTurn.request, currentRequest);
+  assert.equal(parsed.currentTurn.clientUserMessageId, "client-turn-2");
   assert.deepEqual(parsed.currentTurn.commentary, ["Inspecting the project.", "Running focused checks.", "Checking deployment state."]);
   assert.equal(parsed.currentTurn.lastMessage, "Checking deployment state.");
   assert.equal(parsed.currentTurn.assistantMessages.length, 3, "response/event duplicates are collapsed");
   assert.equal(parsed.latestCompletedTurn.request, completedRequest);
+  assert.equal(parsed.latestCompletedTurn.clientUserMessageId, "client-turn-1");
   assert.equal(parsed.latestCompletedTurn.finalResponse, completedFinal);
   assert.equal(parsed.turnCount, 2);
   assert.equal(parsed.turnCountLowerBound, false);

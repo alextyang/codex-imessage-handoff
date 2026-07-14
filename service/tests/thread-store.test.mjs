@@ -4,7 +4,7 @@ import { execFileSync } from "node:child_process";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { findThread, listThreads, projectKey, projectLabel, threadStoreInternals } from "../src/thread-store.mjs";
+import { findThread, findThreadBySource, listThreads, projectKey, projectLabel, threadStoreInternals } from "../src/thread-store.mjs";
 
 function sql(value) {
   if (value === null || value === undefined) return "NULL";
@@ -138,6 +138,18 @@ test("catalog excludes subagents, groups projects, carries state, and finds IDs 
       ${sql(row.model)}, ${sql(row.reasoning)}, 'openai', NULL, NULL,
       ${sql(row.source)}, ${sql(row.threadSource)}
     );`),
+    `INSERT INTO threads VALUES (
+      'blank-new-thread', ${sql(path.join(directory, "blank-new-thread.jsonl"))}, '', ${sql(project)}, 0,
+      1783824002, 1783824002, 1783824002000, 1783824002000,
+      1783824002, 1783824002000, '', NULL, NULL, 'openai', NULL, NULL,
+      'appServer', 'imessage-handoff:new:flow-123'
+    );`,
+    `INSERT INTO threads VALUES (
+      'blank-subagent-thread', ${sql(path.join(directory, "blank-subagent-thread.jsonl"))}, '', ${sql(project)}, 0,
+      1783824003, 1783824003, 1783824003000, 1783824003000,
+      1783824003, 1783824003000, '', NULL, NULL, 'openai', NULL, NULL,
+      'appServer', 'subagent'
+    );`,
     "UPDATE threads SET created_at = 1, created_at_ms = 1000 WHERE id = 'fork-hidden-root';",
     "INSERT INTO thread_spawn_edges VALUES ('root-000','child-edge','closed');",
   ];
@@ -195,6 +207,15 @@ test("catalog excludes subagents, groups projects, carries state, and finds IDs 
     assert.equal(outsideMenu.state, "idle");
     assert.equal(await findThread("child-edge"), null);
     assert.equal(await findThread("missing"), null);
+    assert.equal(await findThread("blank-new-thread"), null);
+    const blankNew = await findThreadBySource("imessage-handoff:new:flow-123");
+    assert.equal(blankNew.id, "blank-new-thread");
+    assert.equal(blankNew.title, "Untitled thread");
+    assert.equal(blankNew.visible, false);
+    assert.equal(blankNew.cwd, project);
+    assert.equal(await findThreadBySource("subagent"), null);
+    assert.equal(await findThreadBySource("missing-source"), null);
+    assert.equal(await findThreadBySource(""), null);
   } finally {
     if (previous === undefined) delete process.env.IMESSAGE_HANDOFF_STATE_DB;
     else process.env.IMESSAGE_HANDOFF_STATE_DB = previous;

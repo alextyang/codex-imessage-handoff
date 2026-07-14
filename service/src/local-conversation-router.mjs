@@ -6,13 +6,15 @@ import { parseMenuSelection, parseSlashCommand } from "../../protocol/presentati
 const STATE_VERSION = 5;
 const DEFAULT_MENU_TTL_MS = 10 * 60 * 1000;
 const DEFAULT_AWAITING_PROMPT_TTL_MS = 2 * 60 * 1000;
+const DEFAULT_COMMAND_CONTEXT_TTL_MS = 5 * 60 * 1000;
 const MAX_PENDING = 128;
 const MAX_SEEN = 512;
-const MAX_GUID_ROUTES = 512;
+const MAX_GUID_ROUTES = 4096;
 const MAX_POLLS = 64;
 const MAX_RECEIPTS = 512;
 const MAX_THREADS = 512;
 const MAX_OUTBOUND_ECHOES = 128;
+const MAX_CONFIRMATIONS = 512;
 
 const THREAD_COMMANDS = new Set([
   "thread",
@@ -38,6 +40,11 @@ const POLL_ACTION_KINDS = new Set([
   "refresh",
   "search",
   "thread-picker",
+  "new-project",
+  "new-project-search",
+  "new-reasoning",
+  "new-reasoning-refresh",
+  "default-reasoning",
 ]);
 
 function emptyState(conversationKey = null) {
@@ -51,6 +58,8 @@ function emptyState(conversationKey = null) {
     lastUserThreadId: null,
     lastUserThreadAt: null,
     awaitingPrompt: null,
+    awaitingNewPrompt: null,
+    activeNewFlowId: null,
     threads: {},
     menu: null,
     pending: [],
@@ -59,6 +68,7 @@ function emptyState(conversationKey = null) {
     polls: {},
     outboundReceipts: {},
     outboundEchoes: [],
+    confirmationOutbox: [],
     lastUserMessageAt: null,
     lastRowId: 0,
   };
@@ -105,7 +115,7 @@ function normalizePollAction(value) {
   const kind = cleanString(value.kind, 40);
   if (!kind || !POLL_ACTION_KINDS.has(kind)) return null;
   const action = { kind };
-  for (const key of ["command", "argument", "threadId", "projectKey", "prompt"]) {
+  for (const key of ["command", "argument", "threadId", "projectKey", "prompt", "flowId"]) {
     const item = cleanString(value[key], key === "prompt" ? 32_000 : 512);
     if (item) action[key] = item;
   }
@@ -115,6 +125,10 @@ function normalizePollAction(value) {
   if (kind === "project" && !action.projectKey) return null;
   if (kind === "control" && !action.command) return null;
   if (kind === "thread-picker" && !THREAD_COMMANDS.has(action.command)) return null;
+  if (["new-project", "new-project-search", "new-reasoning", "new-reasoning-refresh"].includes(kind) && !action.flowId) return null;
+  if (kind === "new-project" && !action.projectKey) return null;
+  if (kind === "new-reasoning" && !action.argument) return null;
+  if (kind === "default-reasoning" && !action.argument) return null;
   return action;
 }
 
@@ -173,6 +187,7 @@ function normalizePollMetadata(value) {
       512,
     ),
     refreshAction: normalizePollAction(metadata.refreshAction ?? metadata.staleAction),
+    addedChoiceAction: normalizePollAction(metadata.addedChoiceAction),
     knownOptionIds: [...knownOptionIds].slice(-500),
     knownOptionLabels: [...knownOptionLabels].slice(-500),
   };
@@ -229,7 +244,7 @@ function cleanAction(value) {
   if (!kind || !messageKey) return null;
   const action = { kind, messageKey };
   if (threadId) action.threadId = threadId;
-  for (const key of ["command", "argument", "commandArgument", "body", "prompt", "projectKey", "guid", "replyToGuid", "threadOriginatorGuid", "createdAt"]) {
+  for (const key of ["command", "argument", "commandArgument", "body", "prompt", "projectKey", "flowId", "guid", "replyToGuid", "threadOriginatorGuid", "createdAt"]) {
     const item = cleanString(value[key], key === "body" || key === "prompt" ? 32_000 : 512);
     if (item) action[key] = item;
   }
@@ -237,8 +252,44 @@ function cleanAction(value) {
   for (const key of ["awaitingPrompt", "fromAwaitingPrompt"]) {
     if (value[key] === true) action[key] = true;
   }
+  if (typeof value.enabled === "boolean") action.enabled = value.enabled;
   if (Array.isArray(value.attachments)) action.attachments = value.attachments.slice(0, 5);
   return action;
+}
+
+function confirmationOperationId(messageKey, messageGuid, reaction, remove = false) {
+  return `confirmation:${createHash("sha256")
+    .update(`imsg-confirmation-v1\u0000${messageKey}\u0000${messageGuid}\u0000${reaction}\u0000${remove ? "remove" : "add"}`)
+    .digest("hex")}`;
+}
+
+function newConfirmation(messageKeyValue, value, now = Date.now()) {
+  const messageKey = cleanString(messageKeyValue, 256);
+  const messageGuid = cleanString(value?.messageGuid ?? value?.guid, 256);
+  const reaction = cleanString(value?.reaction, 128);
+  if (!messageKey || !messageGuid || !reaction) return null;
+  const remove = value?.remove === true;
+  return {
+    operationId: confirmationOperationId(messageKey, messageGuid, reaction, remove),
+    messageKey,
+    messageGuid,
+    reaction,
+    remove,
+    createdAt: new Date(now).toISOString(),
+  };
+}
+
+function normalizeConfirmation(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const messageKey = cleanString(value.messageKey, 256);
+  const messageGuid = cleanString(value.messageGuid, 256);
+  const reaction = cleanString(value.reaction, 128);
+  const operationId = cleanString(value.operationId, 160);
+  const createdAt = isoString(value.createdAt);
+  const remove = value.remove === true;
+  if (!messageKey || !messageGuid || !reaction || !operationId || !createdAt) return null;
+  if (operationId !== confirmationOperationId(messageKey, messageGuid, reaction, remove)) return null;
+  return { operationId, messageKey, messageGuid, reaction, remove, createdAt };
 }
 
 function normalizeState(value, expectedConversationKey = null) {
@@ -264,6 +315,13 @@ function normalizeState(value, expectedConversationKey = null) {
     const expiresAt = isoString(value.awaitingPrompt.expiresAt);
     if (threadId && selectedAt && expiresAt) state.awaitingPrompt = { threadId, selectedAt, expiresAt };
   }
+  if (value.awaitingNewPrompt && typeof value.awaitingNewPrompt === "object" && !Array.isArray(value.awaitingNewPrompt)) {
+    const flowId = cleanString(value.awaitingNewPrompt.flowId, 64);
+    const selectedAt = isoString(value.awaitingNewPrompt.selectedAt);
+    const expiresAt = isoString(value.awaitingNewPrompt.expiresAt);
+    if (flowId && selectedAt && expiresAt) state.awaitingNewPrompt = { flowId, selectedAt, expiresAt };
+  }
+  state.activeNewFlowId = cleanString(value.activeNewFlowId, 64);
   if (value.threads && typeof value.threads === "object" && !Array.isArray(value.threads)) {
     const entries = Object.entries(value.threads)
       .flatMap(([threadId, thread]) => {
@@ -317,6 +375,7 @@ function normalizeState(value, expectedConversationKey = null) {
           ...(addChoiceCommand ? { addChoiceCommand } : {}),
           ...(metadata.addChoiceArgument ? { addChoiceArgument: metadata.addChoiceArgument } : {}),
           ...(refreshAction ? { refreshAction } : {}),
+          ...(metadata.addedChoiceAction ? { addedChoiceAction: metadata.addedChoiceAction } : {}),
           knownOptionIds: [...new Set([...Object.keys(options), ...metadata.knownOptionIds])].slice(-500),
           knownOptionLabels: metadata.knownOptionLabels,
         };
@@ -346,6 +405,12 @@ function normalizeState(value, expectedConversationKey = null) {
         ? [{ fingerprint: fingerprint.toLowerCase(), expiresAt, remaining: Math.min(remaining, 32) }]
         : [];
     }).slice(-MAX_OUTBOUND_ECHOES);
+  }
+  if (Array.isArray(value.confirmationOutbox)) {
+    state.confirmationOutbox = value.confirmationOutbox
+      .map(normalizeConfirmation)
+      .filter(Boolean)
+      .slice(-MAX_CONFIRMATIONS);
   }
   state.lastUserMessageAt = cleanString(value.lastUserMessageAt, 64);
   state.lastRowId = finiteRowId(value.lastRowId);
@@ -460,6 +525,11 @@ function normalizeMessage(message) {
     attachments: Array.isArray(message?.attachments) ? message.attachments.slice(0, 5) : [],
     poll: message?.poll && typeof message.poll === "object" ? message.poll : null,
     isReaction: message?.is_reaction === true || message?.isReaction === true,
+    reactionType: cleanString(message?.reaction_type ?? message?.reactionType, 40)?.toLowerCase() || null,
+    isReactionAdd: typeof (message?.is_reaction_add ?? message?.isReactionAdd) === "boolean"
+      ? (message?.is_reaction_add ?? message?.isReactionAdd)
+      : null,
+    reactedToGuid: cleanString(message?.reacted_to_guid ?? message?.reactedToGuid, 256),
   };
 }
 
@@ -493,6 +563,38 @@ function resolveNativeReplyContext(message, state) {
   if (matches.length > 1) return { explicit: true, threadId: null, error: { kind: "ambiguous-reply-context" } };
   if (matches.length === 0) return { explicit: true, threadId: null, error: { kind: "stale-reply-context" } };
   return { explicit: true, threadId: matches[0], error: null };
+}
+
+function actionFromReaction(message, state) {
+  if (!message.isReaction) return { action: null, consumed: false };
+  let matches = threadsForGuid(state, message.reactedToGuid);
+  if (matches.length === 0 && message.hasThreadOriginatorGuid) {
+    matches = threadsForGuid(state, message.threadOriginatorGuid);
+  }
+  if (matches.length !== 1 || typeof message.isReactionAdd !== "boolean") {
+    return { action: null, consumed: true };
+  }
+  const threadId = matches[0];
+  if (message.reactionType === "like") {
+    return {
+      action: { kind: "reaction-control", command: "listen", enabled: message.isReactionAdd, threadId },
+      consumed: true,
+    };
+  }
+  if (message.reactionType === "dislike") {
+    return {
+      action: {
+        kind: "reaction-control",
+        command: message.isReactionAdd ? "mute" : "unmute",
+        threadId,
+      },
+      consumed: true,
+    };
+  }
+  if (message.reactionType === "question" && message.isReactionAdd) {
+    return { action: { kind: "reaction-control", command: "inspect", threadId }, consumed: true };
+  }
+  return { action: null, consumed: true };
 }
 
 function uniquePollRegistrationForOption(state, optionId) {
@@ -609,13 +711,18 @@ function pollAddedChoice(message, state, nowMs) {
   registration.knownOptionIds = [...knownIds].slice(-500);
   registration.knownOptionLabels = [...knownLabels].slice(-500);
   const query = added.at(-1)?.text || null;
+  const addedChoiceAction = normalizePollAction(registration.addedChoiceAction);
   return {
-    action: query ? {
-      kind: "search",
-      command: registration.addChoiceCommand || "search",
-      argument: query,
-      ...(registration.addChoiceArgument ? { commandArgument: registration.addChoiceArgument } : {}),
-    } : null,
+    action: query
+      ? addedChoiceAction
+        ? { ...addedChoiceAction, argument: query }
+        : {
+          kind: "search",
+          command: registration.addChoiceCommand || "search",
+          argument: query,
+          ...(registration.addChoiceArgument ? { commandArgument: registration.addChoiceArgument } : {}),
+        }
+      : null,
     consumed: true,
   };
 }
@@ -629,11 +736,21 @@ function actionFromPoll(message, state, nowMs) {
 }
 
 export class LocalConversationRouter {
-  constructor({ stateFile, conversationKey = null, now = () => Date.now(), menuTtlMs = DEFAULT_MENU_TTL_MS } = {}) {
+  constructor({
+    stateFile,
+    conversationKey = null,
+    now = () => Date.now(),
+    menuTtlMs = DEFAULT_MENU_TTL_MS,
+    commandContextTtlMs = DEFAULT_COMMAND_CONTEXT_TTL_MS,
+  } = {}) {
     if (!stateFile) throw new TypeError("LocalConversationRouter requires stateFile.");
     this.stateFile = path.resolve(stateFile);
     this.now = now;
     this.menuTtlMs = menuTtlMs;
+    const requestedCommandTtl = Number(commandContextTtlMs);
+    this.commandContextTtlMs = Number.isFinite(requestedCommandTtl) && requestedCommandTtl >= 0
+      ? requestedCommandTtl
+      : DEFAULT_COMMAND_CONTEXT_TTL_MS;
     this.conversationReset = conversationNeedsReset(this.stateFile, conversationKey);
     this.state = readState(this.stateFile, conversationKey);
   }
@@ -641,13 +758,26 @@ export class LocalConversationRouter {
   get activeThreadId() { return this.state.activeThreadId; }
   get mostRecentThreadId() { return this.state.mostRecentThreadId; }
   get lastUserThreadId() { return this.state.lastUserThreadId; }
+  get recentDefaultThreadId() { return this.#recentCommandThreadId(); }
+  get recentDefaultExpiresAt() {
+    const threadId = this.#recentCommandThreadId();
+    const updatedAt = Date.parse(this.state.lastUserThreadAt || "");
+    return threadId && Number.isFinite(updatedAt)
+      ? new Date(updatedAt + this.commandContextTtlMs).toISOString()
+      : null;
+  }
   get lastRowId() { return this.state.lastRowId; }
   get lastUserMessageAt() { return this.state.lastUserMessageAt; }
   get awaitingPrompt() {
     const awaiting = this.#currentAwaitingPrompt();
     return awaiting ? structuredClone(awaiting) : null;
   }
-  get incomingPaused() { return Boolean(this.#currentAwaitingPrompt()); }
+  get awaitingNewPrompt() {
+    const awaiting = this.#currentAwaitingNewPrompt();
+    return awaiting ? structuredClone(awaiting) : null;
+  }
+  get activeNewFlowId() { return cleanString(this.state.activeNewFlowId, 64); }
+  get incomingPaused() { return Boolean(this.#currentAwaitingPrompt() || this.#currentAwaitingNewPrompt()); }
 
   #currentAwaitingPrompt() {
     const awaiting = this.state.awaitingPrompt;
@@ -656,6 +786,22 @@ export class LocalConversationRouter {
     this.state.awaitingPrompt = null;
     writeState(this.stateFile, this.state);
     return null;
+  }
+
+  #currentAwaitingNewPrompt() {
+    const awaiting = this.state.awaitingNewPrompt;
+    if (!awaiting) return null;
+    if (Date.parse(awaiting.expiresAt || "") > this.now()) return awaiting;
+    this.state.awaitingNewPrompt = null;
+    writeState(this.stateFile, this.state);
+    return null;
+  }
+
+  #recentCommandThreadId(nowMs = this.now()) {
+    const threadId = cleanString(this.state.lastUserThreadId, 200);
+    const updatedAt = Date.parse(this.state.lastUserThreadAt || "");
+    if (!threadId || !Number.isFinite(updatedAt)) return null;
+    return nowMs - updatedAt <= this.commandContextTtlMs ? threadId : null;
   }
 
   setActiveThread(threadId, updatedAt = new Date(this.now()).toISOString()) {
@@ -740,11 +886,61 @@ export class LocalConversationRouter {
     return true;
   }
 
+  setDefaultThread(threadId, updatedAt = new Date(this.now()).toISOString()) {
+    const cleanThread = cleanString(threadId, 200);
+    const cleanAt = isoString(updatedAt, new Date(this.now()).toISOString());
+    if (!cleanThread) return false;
+    this.state.lastUserThreadId = cleanThread;
+    this.state.lastUserThreadAt = cleanAt;
+    touchThreadState(this.state, cleanThread, cleanAt);
+    writeState(this.stateFile, this.state);
+    return true;
+  }
+
   clearAwaitingPrompt(threadId = null) {
     if (!this.#currentAwaitingPrompt()) return false;
     const cleanThread = cleanString(threadId, 200);
     if (cleanThread && this.state.awaitingPrompt.threadId !== cleanThread) return false;
     this.state.awaitingPrompt = null;
+    writeState(this.stateFile, this.state);
+    return true;
+  }
+
+  setAwaitingNewPrompt(flowId, selectedAt = new Date(this.now()).toISOString(), ttlMs = DEFAULT_AWAITING_PROMPT_TTL_MS) {
+    const cleanFlow = cleanString(flowId, 64);
+    const cleanAt = isoString(selectedAt, new Date(this.now()).toISOString());
+    if (!cleanFlow) return false;
+    this.state.awaitingNewPrompt = {
+      flowId: cleanFlow,
+      selectedAt: cleanAt,
+      expiresAt: new Date(this.now() + Math.max(1_000, Number(ttlMs) || DEFAULT_AWAITING_PROMPT_TTL_MS)).toISOString(),
+    };
+    writeState(this.stateFile, this.state);
+    return true;
+  }
+
+  clearAwaitingNewPrompt(flowId = null) {
+    if (!this.#currentAwaitingNewPrompt()) return false;
+    const cleanFlow = cleanString(flowId, 64);
+    if (cleanFlow && this.state.awaitingNewPrompt.flowId !== cleanFlow) return false;
+    this.state.awaitingNewPrompt = null;
+    writeState(this.stateFile, this.state);
+    return true;
+  }
+
+  setActiveNewFlow(flowId) {
+    const cleanFlow = cleanString(flowId, 64);
+    if (!cleanFlow) return false;
+    this.state.activeNewFlowId = cleanFlow;
+    writeState(this.stateFile, this.state);
+    return true;
+  }
+
+  clearActiveNewFlow(flowId = null) {
+    const active = cleanString(this.state.activeNewFlowId, 64);
+    const cleanFlow = cleanString(flowId, 64);
+    if (!active || (cleanFlow && cleanFlow !== active)) return false;
+    this.state.activeNewFlowId = null;
     writeState(this.stateFile, this.state);
     return true;
   }
@@ -829,6 +1025,7 @@ export class LocalConversationRouter {
       ...(addChoiceCommand ? { addChoiceCommand } : {}),
       ...(metadata.addChoiceArgument ? { addChoiceArgument: metadata.addChoiceArgument } : {}),
       ...(refreshAction ? { refreshAction } : {}),
+      ...(metadata.addedChoiceAction ? { addedChoiceAction: metadata.addedChoiceAction } : {}),
       knownOptionIds: [...new Set([...Object.keys(cleanOptions), ...metadata.knownOptionIds])].slice(-500),
       knownOptionLabels: metadata.knownOptionLabels,
     };
@@ -862,6 +1059,7 @@ export class LocalConversationRouter {
   }
 
   pendingActions() { return this.state.pending.map((action) => structuredClone(action)); }
+  pendingConfirmations() { return this.state.confirmationOutbox.map((item) => structuredClone(item)); }
 
   initializeConversation(latestMessage = null) {
     const advanced = latestMessage ? this.discard(latestMessage) : false;
@@ -965,10 +1163,6 @@ export class LocalConversationRouter {
   #ingest(rawMessage) {
     const message = normalizeMessage(rawMessage);
     if (!message) return null;
-    if (message.isReaction) {
-      this.#discard(rawMessage);
-      return null;
-    }
     const existing = this.state.pending.find((item) => item.messageKey === message.key);
     if (existing) return structuredClone(existing);
     if (this.state.seen.includes(message.key)) return null;
@@ -977,8 +1171,16 @@ export class LocalConversationRouter {
     const replyContext = resolveNativeReplyContext(message, this.state);
     const explicitThreadId = replyContext.threadId;
     const awaitingPrompt = this.#currentAwaitingPrompt();
+    const awaitingNewPrompt = this.#currentAwaitingNewPrompt();
     let targetThreadId = explicitThreadId || this.state.lastUserThreadId;
-    const pollResult = actionFromPoll(message, this.state, nowMs);
+    const reactionResult = actionFromReaction(message, this.state);
+    if (reactionResult.consumed && !reactionResult.action) {
+      this.#discard(rawMessage);
+      return null;
+    }
+    const pollResult = reactionResult.consumed
+      ? { action: null, consumed: false }
+      : actionFromPoll(message, this.state, nowMs);
     if (pollResult.consumed && !pollResult.action) {
       // Poll rows can carry a visible question/caption in `text`; never let
       // that transport metadata fall through and become a Codex prompt.
@@ -988,7 +1190,11 @@ export class LocalConversationRouter {
     // Poll registrations are the authoritative context for poll events. This
     // also prevents a foreign poll's native reply metadata from being treated
     // as a stale task reply before the poll can be silently discarded.
-    let action = pollResult.consumed ? pollResult.action : replyContext.error;
+    let action = reactionResult.consumed
+      ? reactionResult.action
+      : pollResult.consumed
+        ? pollResult.action
+        : replyContext.error;
     const slash = message.text ? parseSlashCommand(message.text) : null;
     const selection = message.text ? parseMenuSelection(message.text) : null;
     const menuValid = this.state.menu && Date.parse(this.state.menu.expiresAt) > nowMs;
@@ -997,17 +1203,33 @@ export class LocalConversationRouter {
     if (!action && slash) {
       const command = slash.command === "recent" ? "threads" : slash.command;
       if (THREAD_COMMANDS.has(command) && !explicitThreadId) {
-        if (command === "cancel" && awaitingPrompt?.threadId) {
+        if (command === "cancel" && (awaitingNewPrompt?.flowId || this.state.activeNewFlowId)) {
+          action = { kind: "new-cancel", flowId: awaitingNewPrompt?.flowId || this.state.activeNewFlowId };
+        } else if (command === "cancel" && awaitingPrompt?.threadId) {
           targetThreadId = awaitingPrompt.threadId;
           consumedAwaitingPrompt = true;
+          action = { kind: "control", command, argument: slash.argument, threadId: targetThreadId };
+        } else if (this.#recentCommandThreadId(nowMs)) {
+          targetThreadId = this.#recentCommandThreadId(nowMs);
           action = { kind: "control", command, argument: slash.argument, threadId: targetThreadId };
         } else {
           action = { kind: "thread-picker", command, argument: slash.argument };
         }
       } else {
-        const globalCommand = command === "help" || command === "projects" || command === "search" || command === "threads" || command === "refresh";
+        const globalCommand = command === "help"
+          || command === "new"
+          || command === "defaultreasoning"
+          || command === "projects"
+          || command === "search"
+          || command === "threads"
+          || command === "refresh";
         action = globalCommand
-          ? { kind: command, command, argument: slash.argument }
+          ? {
+            kind: command,
+            command,
+            argument: slash.argument,
+            ...(command === "new" && message.attachments.length ? { attachments: message.attachments } : {}),
+          }
           : { kind: "control", command, threadId: targetThreadId, argument: slash.argument };
       }
     } else if (!action && selection && this.state.menu && !explicitThreadId) {
@@ -1018,13 +1240,23 @@ export class LocalConversationRouter {
     } else if (!action && message.text.startsWith("/")) {
       action = { kind: "unknown-command", threadId: targetThreadId };
     } else if (!action && (message.text || message.attachments.length)) {
-      if (!explicitThreadId && awaitingPrompt?.threadId) {
+      if (!explicitThreadId && awaitingNewPrompt?.flowId) {
+        action = {
+          kind: "new-prompt",
+          flowId: awaitingNewPrompt.flowId,
+          body: message.text,
+          attachments: message.attachments,
+        };
+        this.state.awaitingNewPrompt = null;
+      } else if (!explicitThreadId && awaitingPrompt?.threadId) {
         targetThreadId = awaitingPrompt.threadId;
         consumedAwaitingPrompt = true;
       }
-      action = targetThreadId
-        ? { kind: "prompt", threadId: targetThreadId, body: message.text, attachments: message.attachments }
-        : { kind: "no-thread" };
+      if (!action) {
+        action = targetThreadId
+          ? { kind: "prompt", threadId: targetThreadId, body: message.text, attachments: message.attachments }
+          : { kind: "no-thread" };
+      }
     }
     if (!action) {
       if (pollResult.consumed) this.#discard(rawMessage);
@@ -1035,7 +1267,10 @@ export class LocalConversationRouter {
       consumedAwaitingPrompt = true;
     }
 
-    if (action.kind === "switch" && action.threadId) {
+    if (action.kind === "new-cancel") {
+      this.state.awaitingNewPrompt = null;
+      this.state.activeNewFlowId = null;
+    } else if (action.kind === "switch" && action.threadId) {
       if (action.prompt) {
         this.state.awaitingPrompt = null;
       } else {
@@ -1064,6 +1299,7 @@ export class LocalConversationRouter {
       this.state.lastUserThreadId = action.threadId;
       this.state.lastUserThreadAt = message.createdAt;
       const shouldRouteMessage = !message.poll
+        && !message.isReaction
         && (action.kind !== "switch" || Boolean(action.prompt) || Boolean(explicitThreadId));
       if (shouldRouteMessage && message.guid) {
         routeGuid(this.state, message.guid, action.threadId);
@@ -1087,15 +1323,64 @@ export class LocalConversationRouter {
     return structuredClone(action);
   }
 
-  acknowledge(messageKeyValue) {
+  acknowledgeWithConfirmation(messageKeyValue, confirmation = null, settlement = null) {
     const key = cleanString(messageKeyValue, 256);
     if (!key) return false;
     const before = this.state.pending.length;
-    this.state.pending = this.state.pending.filter((item) => item.messageKey !== key);
-    if (before === this.state.pending.length) return false;
-    this.state.seen.push(key);
-    this.state.seen = [...new Set(this.state.seen)].slice(-MAX_SEEN);
-    writeState(this.stateFile, this.state);
-    return true;
+    if (!this.state.pending.some((item) => item.messageKey === key)) return false;
+    const priorState = structuredClone(this.state);
+    try {
+      this.state.pending = this.state.pending.filter((item) => item.messageKey !== key);
+      if (before === this.state.pending.length) return false;
+      this.state.seen.push(key);
+      this.state.seen = [...new Set(this.state.seen)].slice(-MAX_SEEN);
+      const queued = newConfirmation(key, confirmation, this.now());
+      if (queued) {
+        this.state.confirmationOutbox = [
+          ...this.state.confirmationOutbox.filter((item) => item.operationId !== queued.operationId),
+          queued,
+        ].slice(-MAX_CONFIRMATIONS);
+      }
+      const completedFlowId = cleanString(settlement?.newThreadCompletion?.flowId, 64);
+      const completedThreadId = cleanString(settlement?.newThreadCompletion?.threadId, 200);
+      if (completedFlowId && completedThreadId) {
+        if (this.state.awaitingNewPrompt?.flowId === completedFlowId) this.state.awaitingNewPrompt = null;
+        if (this.state.activeNewFlowId === completedFlowId) this.state.activeNewFlowId = null;
+        const completedAt = isoString(
+          settlement?.newThreadCompletion?.updatedAt,
+          new Date(this.now()).toISOString(),
+        );
+        this.state.lastUserThreadId = completedThreadId;
+        this.state.lastUserThreadAt = completedAt;
+        touchThreadState(this.state, completedThreadId, completedAt);
+      }
+      writeState(this.stateFile, this.state);
+      return true;
+    } catch (error) {
+      this.state = priorState;
+      throw error;
+    }
+  }
+
+  acknowledge(messageKeyValue) {
+    return this.acknowledgeWithConfirmation(messageKeyValue);
+  }
+
+  completeConfirmation(operationIdValue) {
+    const operationId = cleanString(operationIdValue, 160);
+    if (!operationId) return false;
+    const before = this.state.confirmationOutbox.length;
+    if (!this.state.confirmationOutbox.some((item) => item.operationId === operationId)) return false;
+    const priorState = structuredClone(this.state);
+    try {
+      this.state.confirmationOutbox = this.state.confirmationOutbox
+        .filter((item) => item.operationId !== operationId);
+      if (before === this.state.confirmationOutbox.length) return false;
+      writeState(this.stateFile, this.state);
+      return true;
+    } catch (error) {
+      this.state = priorState;
+      throw error;
+    }
   }
 }

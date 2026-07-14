@@ -410,6 +410,38 @@ function syncDirectory(directory) {
   }
 }
 
+function safeExistingExchange(directory, { uid, gid } = {}) {
+  if (!existsSync(directory)) return false;
+  const metadata = lstatSync(directory);
+  if (!metadata.isDirectory() || metadata.isSymbolicLink()
+    || metadata.uid !== uid || metadata.gid !== gid || (metadata.mode & 0o007) !== 0) {
+    throw codedError(
+      "SPLIT_USER_EXCHANGE_UNSAFE",
+      "The existing helper exchange directory is unsafe.",
+    );
+  }
+  return true;
+}
+
+function parkExistingExchange(destination, parkedExchange, identity) {
+  const exchange = path.join(destination, "exchange");
+  if (!safeExistingExchange(exchange, identity)) return false;
+  renameSync(exchange, parkedExchange);
+  syncDirectory(destination);
+  syncDirectory(path.dirname(destination));
+  return true;
+}
+
+function restoreParkedExchange(destination, parkedExchange) {
+  if (!existsSync(parkedExchange)) return false;
+  const exchange = path.join(destination, "exchange");
+  if (existsSync(exchange)) rmSync(exchange, { recursive: true, force: true });
+  renameSync(parkedExchange, exchange);
+  syncDirectory(destination);
+  syncDirectory(path.dirname(destination));
+  return true;
+}
+
 function recoverQuarantinedBundle(destination, validation) {
   if (existsSync(destination)) return null;
   const parent = path.dirname(destination);
@@ -605,10 +637,16 @@ export function stageSplitUserHelperBundle(options = {}) {
       preparedAt: createdAt,
     };
     let quarantine = null;
+    let parkedExchange = null;
     let activated = false;
     try {
       if (existsSync(destination)) {
         verifyExistingStagedBundle(destination, existingValidation);
+        parkedExchange = `${destination}.exchange-${randomUUID()}`;
+        if (!parkExistingExchange(destination, parkedExchange, {
+          uid: controller.uid,
+          gid: sharedGroup.gid,
+        })) parkedExchange = null;
         quarantine = `${destination}.quarantine-${randomUUID()}`;
         renameSync(destination, quarantine);
         syncDirectory(path.dirname(destination));
@@ -616,13 +654,23 @@ export function stageSplitUserHelperBundle(options = {}) {
       renameSync(temporary, destination);
       activated = true;
       syncDirectory(path.dirname(destination));
+      if (parkedExchange) restoreParkedExchange(destination, parkedExchange);
       // Test-only fault injection exercises the rollback boundary without
       // requiring unsafe permission changes to the controller's real home.
       options.beforeControllerStateCommit?.({ destination, quarantine });
       writeAtomic(path.join(keyDirectory, "active-bundle.json"), `${JSON.stringify(controllerState, null, 2)}\n`, 0o600);
     } catch (error) {
-      if (activated) rmSync(destination, { recursive: true, force: true });
+      if (activated) {
+        if (parkedExchange && !existsSync(parkedExchange)) {
+          const activeExchange = path.join(destination, "exchange");
+          if (existsSync(activeExchange)) renameSync(activeExchange, parkedExchange);
+        }
+        rmSync(destination, { recursive: true, force: true });
+      }
       if (quarantine && existsSync(quarantine) && !existsSync(destination)) renameSync(quarantine, destination);
+      if (parkedExchange && existsSync(parkedExchange) && existsSync(destination)) {
+        restoreParkedExchange(destination, parkedExchange);
+      }
       try { syncDirectory(path.dirname(destination)); } catch {}
       throw error;
     }

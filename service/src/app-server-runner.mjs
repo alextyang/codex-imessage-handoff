@@ -8,6 +8,12 @@ const DEFAULT_REQUEST_TIMEOUT_MS = 15_000;
 const DEFAULT_TURN_TIMEOUT_MS = 30 * 60_000;
 const DEFAULT_INTERRUPT_GRACE_MS = 15_000;
 const MAX_PROTOCOL_BUFFER = 8 * 1024 * 1024;
+const UNCERTAIN_TURN_OUTCOME_CODES = new Set([
+  "CODEX_DISCONNECTED",
+  "CODEX_PROTOCOL_ERROR",
+  "CODEX_TIMEOUT",
+  "CODEX_UNAVAILABLE",
+]);
 
 const QUIET_NOTIFICATIONS = [
   "command/exec/outputDelta",
@@ -21,6 +27,43 @@ const QUIET_NOTIFICATIONS = [
 
 function codedError(code, message, cause) {
   return Object.assign(new Error(message, cause ? { cause } : undefined), { code });
+}
+
+function clientUserMessageId(value, required = false) {
+  const id = typeof value === "string" ? value.trim() : "";
+  if (!id) {
+    if (required) throw codedError("CODEX_CLIENT_MESSAGE_INVALID", "A client user-message id is required.");
+    return null;
+  }
+  if (id.length > 256 || /[\u0000-\u001f]/.test(id)) {
+    throw codedError("CODEX_CLIENT_MESSAGE_INVALID", "The client user-message id is invalid.");
+  }
+  return id;
+}
+
+function responseForClientUserMessageId(result, requestedId) {
+  const turns = Array.isArray(result?.thread?.turns) ? result.thread.turns : [];
+  const matches = turns.filter((turn) => Array.isArray(turn?.items) && turn.items.some((item) => (
+    item?.type === "userMessage" && item.clientId === requestedId
+  )));
+  if (matches.length > 1) {
+    throw codedError(
+      "CODEX_CLIENT_MESSAGE_DUPLICATE",
+      "Codex contains more than one turn for the same client message id.",
+    );
+  }
+  const turn = matches[0] || null;
+  if (!turn) return null;
+  const messages = turn.items.filter((item) => item?.type === "agentMessage" && typeof item.text === "string");
+  const finalMessages = messages.filter((item) => item.phase === "final_answer");
+  const finalResponse = (finalMessages.length ? finalMessages : messages).at(-1)?.text || null;
+  const status = String(turn.status || "");
+  return {
+    id: String(turn.id || ""),
+    state: status === "inProgress" ? "running" : status === "completed" ? "completed" : "aborted",
+    finalResponse,
+    status,
+  };
 }
 
 function samePath(left, right) {
@@ -247,6 +290,35 @@ export class AppServerRpcClient {
     return this.#requestWithoutConnect(method, params, options);
   }
 
+  async startThread({ cwd, threadSource } = {}) {
+    if (this.activeTurn) throw codedError("BUSY", "Another Codex run is active.");
+    const canonicalCwd = String(cwd || "").trim();
+    const canonicalSource = String(threadSource || "").trim();
+    if (!canonicalCwd) throw codedError("MISSING_CWD", "A thread working directory is required.");
+    if (!canonicalSource || canonicalSource.length > 512 || /[\u0000-\u001f]/.test(canonicalSource)) {
+      throw codedError("INVALID_THREAD_SOURCE", "A valid thread source is required.");
+    }
+    const result = await this.request("thread/start", {
+      cwd: canonicalCwd,
+      ephemeral: false,
+      threadSource: canonicalSource,
+    });
+    const threadId = typeof result?.thread?.id === "string" ? result.thread.id.trim() : "";
+    if (!threadId) {
+      throw codedError("CODEX_PROTOCOL_ERROR", "Codex did not return a valid thread identifier.");
+    }
+    return result;
+  }
+
+  async findTurnByClientUserMessageId(threadIdValue, clientUserMessageIdValue) {
+    if (this.activeTurn) throw codedError("BUSY", "Another Codex run is active.");
+    const threadId = String(threadIdValue || "").trim();
+    const requestedId = clientUserMessageId(clientUserMessageIdValue, true);
+    if (!threadId) throw codedError("CODEX_THREAD_INVALID", "A canonical thread id is required.");
+    const result = await this.request("thread/read", { threadId, includeTurns: true });
+    return responseForClientUserMessageId(result, requestedId);
+  }
+
   #requestWithoutConnect(method, params, options = {}) {
     const id = this.nextRequestId++;
     const timeoutMs = options.timeoutMs || this.requestTimeoutMs;
@@ -259,6 +331,7 @@ export class AppServerRpcClient {
       this.pending.set(String(id), { resolve, reject, timer });
       try {
         this.#send({ id, method, params });
+        options.onSent?.();
       } catch (error) {
         clearTimeout(timer);
         this.pending.delete(String(id));
@@ -439,6 +512,11 @@ export class AppServerRpcClient {
     clearTimeout(active.turnTimer);
     clearTimeout(active.interruptTimer);
     this.activeTurn = null;
+    if (active.turnStartSubmitted && UNCERTAIN_TURN_OUTCOME_CODES.has(error?.code)) {
+      error.turnOutcomeUnknown = true;
+      error.clientUserMessageId = active.clientUserMessageId;
+      error.turnId = active.turnId;
+    }
     active.reject(error);
   }
 
@@ -455,6 +533,8 @@ export class AppServerRpcClient {
     if (this.activeTurn) throw codedError("BUSY", "Another Codex run is active.");
     const active = {
       threadId: options.thread.id,
+      clientUserMessageId: clientUserMessageId(options.clientUserMessageId),
+      turnStartSubmitted: false,
       turnId: null,
       cancelled: false,
       timedOut: false,
@@ -515,10 +595,13 @@ export class AppServerRpcClient {
         ...(options.images || []).map((image) => ({ type: "localImage", path: String(image) })),
       ];
       const params = { threadId: options.thread.id, input };
+      if (active.clientUserMessageId) params.clientUserMessageId = active.clientUserMessageId;
       if (typeof options.reasoningEffort === "string" && /^[a-z][a-z0-9_-]{0,31}$/i.test(options.reasoningEffort)) {
         params.effort = options.reasoningEffort;
       }
-      const started = await this.request("turn/start", params);
+      const started = await this.request("turn/start", params, {
+        onSent: () => { active.turnStartSubmitted = true; },
+      });
       if (started?.turn?.id) active.turnId = started.turn.id;
       if (active.timedOut && active.turnId) this.#requestInterrupt(active);
       else if (active.cancelled && active.turnId) this.#interrupt(active);
@@ -624,10 +707,39 @@ export class AppServerCodexRunner {
     }
   }
 
+  async createThread({ cwd, threadSource } = {}) {
+    const canonicalCwd = String(cwd || "").trim();
+    if (!canonicalCwd || !existsSync(canonicalCwd)) {
+      throw codedError("MISSING_CWD", "Thread working directory no longer exists.");
+    }
+    try {
+      const result = await this.client.startThread({ cwd: canonicalCwd, threadSource });
+      return {
+        ...result.thread,
+        id: result.thread.id.trim(),
+        cwd: result.cwd || result.thread.cwd || canonicalCwd,
+        model: result.model || null,
+        reasoningEffort: result.reasoningEffort || null,
+        modelProvider: result.modelProvider || result.thread.modelProvider || null,
+      };
+    } finally {
+      if (this.ownsClient) this.client.close();
+    }
+  }
+
+  async findTurnByClientUserMessageId(threadId, clientMessageId) {
+    try {
+      return await this.client.findTurnByClientUserMessageId(threadId, clientMessageId);
+    } finally {
+      if (this.ownsClient) this.client.close();
+    }
+  }
+
   async run({
     thread,
     prompt,
     images = [],
+    clientUserMessageId,
     reasoningEffort,
     onPhase = () => {},
     onReasoningDelta = () => {},
@@ -643,6 +755,7 @@ export class AppServerCodexRunner {
         thread,
         prompt,
         images,
+        clientUserMessageId,
         reasoningEffort,
         onPhase,
         onReasoningDelta,

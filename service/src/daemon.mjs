@@ -3,13 +3,22 @@ import os from "node:os";
 import { existsSync } from "node:fs";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { readConfig } from "./config.mjs";
-import { listThreads } from "./thread-store.mjs";
+import { findThreadBySource, listThreads } from "./thread-store.mjs";
 import { assertThreadReadyForIMessageRun, getThreadDetail, getLatestRequest, getTurn, getHistory, readThreadHistory } from "./thread-history.mjs";
 import { buildThreadDirectory } from "./thread-directory.mjs";
-import { getReasoningOverride, setReasoningOverride, listReasoningOptions } from "./thread-settings.mjs";
+import {
+  getDefaultReasoning,
+  getReasoningOverride,
+  listDefaultReasoningOptions,
+  listReasoningOptions,
+  REASONING_PRESENTATION,
+  setDefaultReasoning,
+  setReasoningOverride,
+} from "./thread-settings.mjs";
 import { ImsgTransport } from "./imsg-transport.mjs";
 import { safeImsgFailureDetails } from "./imsg-rpc-diagnostics.mjs";
 import { AppServerCodexRunner } from "./app-server-runner.mjs";
+import { normalizeAppServerTimestamp } from "./app-server-timestamp.mjs";
 import { RunManager } from "./run-manager.mjs";
 import { FailureQueue } from "./failure-queue.mjs";
 import { isTerminalLocalActionFailure, LocalActionDispatch } from "./local-action-dispatch.mjs";
@@ -18,7 +27,6 @@ import { admitClaimedJob } from "./claimed-job-admission.mjs";
 import { unconfirmedRecoveryDisposition } from "./recovered-run-policy.mjs";
 import { CompletionMonitor } from "./completion-monitor.mjs";
 import { MultiLiveMirror } from "./multi-live-mirror.mjs";
-import { CodexFocusDetector } from "./codex-focus.mjs";
 import { LiveMirrorRetryBackoff } from "./live-mirror-backoff.mjs";
 import { servicePaths } from "./paths.mjs";
 import { SharedBackendTurnLease } from "./shared-backend-lease.mjs";
@@ -26,6 +34,16 @@ import { inspectDesktopSharedConnection } from "./desktop-connection.mjs";
 import { ServiceReadiness } from "./service-readiness.mjs";
 import { PresenceTracker } from "./presence-tracker.mjs";
 import { shouldSuppressSubmittedUserMirror, submittedUserMirrorMode } from "./submitted-user-mirror-policy.mjs";
+import { NewThreadFlowStore } from "./new-thread-flow.mjs";
+import {
+  resumeNewProjectSelection,
+  resumeNewPromptCollection,
+  resumeNewThreadCreation,
+} from "./new-thread-orchestration.mjs";
+import {
+  settleLocalActionOutcome,
+} from "./local-action-settlement.mjs";
+import { projectIdentityEmoji, statusGlyph } from "../../protocol/presentation.ts";
 import {
   manualSelectionCancellationNotice,
   manualSelectionLease,
@@ -63,9 +81,9 @@ imsgTransport.setHealthCallback((health) => {
 });
 const completions = new CompletionMonitor(paths.completionState);
 const multiLiveMirror = new MultiLiveMirror({ stateDirectory: paths.multiLiveMirrorState });
-const codexFocus = new CodexFocusDetector();
 const liveMirrorBackoff = new LiveMirrorRetryBackoff();
 const failedRuns = new FailureQueue();
+const newThreadFlows = new NewThreadFlowStore();
 const localActionContext = new AsyncLocalStorage();
 const codexBackend = String(process.env.IMESSAGE_HANDOFF_CODEX_BACKEND || "app-server").trim().toLowerCase();
 const sharedBackendTurnLease = new SharedBackendTurnLease(paths.sharedBackendTurnLease);
@@ -90,15 +108,6 @@ function createCodexRunner() {
 
 function shouldDeferCodexRun(error) {
   return error?.code === "BUSY" || retryableSharedBackendErrors.has(error?.code);
-}
-
-async function shouldSuppressFocusedResult(threadId) {
-  if (!codexFocus || !threadId) return false;
-  const status = await codexFocus.getStatus({ force: true });
-  return status.focusKnown === true
-    && status.appFocused === true
-    && status.routeKnown === true
-    && status.openThreadId === String(threadId);
 }
 
 const pendingNotices = new Set();
@@ -134,10 +143,6 @@ async function deliverLocalCompletion(completion) {
   if (thread && imsgTransport.router.shouldPauseIncoming(thread.id)) return { status: "AWAITING_PROMPT" };
   const listening = thread ? imsgTransport.router.nativeThread(thread.id)?.listen === true : false;
   if (thread && !listening && imsgTransport.router.isThreadMuted(thread.id)) {
-    imsgTransport.router.consumeThreadListen(thread.id);
-    return { status: "SUPPRESSED_INACTIVE" };
-  }
-  if (thread && !listening && await shouldSuppressFocusedResult(thread.id)) {
     imsgTransport.router.consumeThreadListen(thread.id);
     return { status: "SUPPRESSED_INACTIVE" };
   }
@@ -181,7 +186,9 @@ async function deliverLiveMessage(message) {
     // native typing within the live-mirror polling window.
     await imsgTransport.setThreadTyping(thread.id, true).catch(() => {});
     if (imsgTransport.router.isThreadMuted(thread.id)) return { status: "INACTIVE" };
-    if (await codexFocus.shouldSuppressUserMirror()) return { status: "INACTIVE" };
+    // A focused Codex window is not proof that it owns the app-server
+    // connection which started this turn. Fail open to Messages visibility so
+    // cross-connection work is never silent in both interfaces.
   } else if (!imsgTransport.router.nativeThread(thread.id)?.listen) {
     return { status: "INACTIVE" };
   }
@@ -293,6 +300,7 @@ async function updateThreadStatus(thread, status) {
 
 function threadLabel(thread) {
   const state = effectiveState(thread);
+  const reasoning = reasoningPolicy(thread);
   return {
     id: thread.id,
     title: thread.title,
@@ -303,7 +311,8 @@ function threadLabel(thread) {
     stateSince: state.stateSince,
     activityAt: thread.lastTurnAt || thread.activityAt || thread.updatedAt,
     pendingCount: state.pendingCount,
-    reasoningEffort: effectiveReasoning(thread),
+    reasoningEffort: reasoning.effort,
+    reasoningSource: reasoning.source,
     muted: imsgTransport.router.isThreadMuted(thread.id),
     listening: imsgTransport.router.nativeThread(thread.id)?.listen === true,
   };
@@ -311,8 +320,11 @@ function threadLabel(thread) {
 
 function outboundReasoningOptions(options) {
   return options.map((option) => option.value === "default"
-    ? { ...option, value: "none", label: "None (use task default)" }
-    : option);
+    ? { ...option, value: "none", label: "↩️ Use default" }
+    : {
+      ...option,
+      label: `${REASONING_PRESENTATION[option.value]?.emoji || "🧠"} ${REASONING_PRESENTATION[option.value]?.label || option.label}`,
+    });
 }
 
 function effectiveState(thread) {
@@ -345,16 +357,30 @@ function effectiveState(thread) {
   };
 }
 
-function effectiveReasoning(thread) {
+function reasoningPolicy(thread) {
   try {
-    return getReasoningOverride(thread.id) || thread.reasoningEffort || null;
+    const supported = new Set(listReasoningOptions(thread)
+      .map((option) => option.value)
+      .filter((value) => value !== "default"));
+    const override = getReasoningOverride(thread.id);
+    if (override && supported.has(override)) return { effort: override, source: "task-override" };
+    const serviceDefault = getDefaultReasoning();
+    if (serviceDefault && supported.has(serviceDefault)) return { effort: serviceDefault, source: "service-default" };
+    if (thread.reasoningEffort) return { effort: thread.reasoningEffort, source: "codex-task" };
+    return { effort: null, source: "codex-default" };
   } catch {
     if (!settingsWarningLogged) {
       settingsWarningLogged = true;
       log("Thread reasoning settings are invalid; using Codex task defaults.");
     }
-    return thread.reasoningEffort || null;
+    return thread.reasoningEffort
+      ? { effort: thread.reasoningEffort, source: "codex-task" }
+      : { effort: null, source: "codex-default" };
   }
+}
+
+function effectiveReasoning(thread) {
+  return reasoningPolicy(thread).effort;
 }
 
 async function synchronizeNow() {
@@ -407,15 +433,6 @@ async function discardReply(event) {
 
 async function deliverCompleted(event, thread) {
   const delivery = event.delivery;
-  const listening = imsgTransport.router.nativeThread(thread.id)?.listen === true;
-  if (!listening && await shouldSuppressFocusedResult(thread.id)) {
-    delivery.textDelivered = true;
-    await updateThreadStatus(thread, "idle");
-    imsgTransport.router.consumeThreadListen(thread.id);
-    failedRuns.remove(thread.id, event.replyId);
-    removeClaimedJob(event.replyId);
-    return;
-  }
   if (!delivery.textDelivered) {
     const result = await sendOutbound(
       { kind: "thread.output", deliveryId: `run:${event.replyId}:output`, thread: threadLabel(thread), body: delivery.body },
@@ -465,13 +482,32 @@ async function executeReply(event, context) {
     const prompt = String(event.claimed?.reply?.body || "");
     const history = readThreadHistory(thread);
     const candidates = [history.currentTurn, ...(history.completedTurns || [])].filter(Boolean);
-    const queuedAtMs = Date.parse(String(event.queuedAt || ""));
-    const matchingTurn = candidates.find((turn) => {
-      if (String(turn.request || "") !== prompt) return false;
-      const startedAtMs = Date.parse(String(turn.startedAt || ""));
-      return !Number.isFinite(queuedAtMs)
-        || (Number.isFinite(startedAtMs) && startedAtMs >= queuedAtMs - 5_000);
-    }) || null;
+    let matchingTurn = event.clientUserMessageId
+      ? candidates.find((turn) => turn.clientUserMessageId === event.clientUserMessageId) || null
+      : null;
+    if (!matchingTurn && event.clientUserMessageId) {
+      const recoveryReader = createCodexRunner();
+      try {
+        matchingTurn = await recoveryReader.findTurnByClientUserMessageId(
+          thread.id,
+          event.clientUserMessageId,
+        );
+      } catch (error) {
+        // The rollout may still materialize while the shared RPC connection is
+        // recovering. Continue the bounded observation window without ever
+        // resubmitting the ambiguous prompt automatically.
+        log(`Exact recovery lookup for ${thread.id} is not available (${error?.code || "UNKNOWN"}).`);
+      }
+    }
+    if (!matchingTurn && event.legacyClientUserMessageId) {
+      const queuedAtMs = Date.parse(String(event.queuedAt || ""));
+      matchingTurn = candidates.find((turn) => {
+        if (String(turn.request || "") !== prompt) return false;
+        const startedAtMs = Date.parse(String(turn.startedAt || ""));
+        return !Number.isFinite(queuedAtMs)
+          || (Number.isFinite(startedAtMs) && startedAtMs >= queuedAtMs - 5_000);
+      }) || null;
+    }
     if (matchingTurn?.state === "running") {
       event.recoveredTurnId = String(matchingTurn.id || "");
       event.recoveryMissingSince = null;
@@ -507,6 +543,8 @@ async function executeReply(event, context) {
         replyId: event.replyId,
         claimed: event.claimed,
         queuedAt: event.queuedAt,
+        clientUserMessageId: event.clientUserMessageId,
+        reasoningEffort: event.reasoningEffort || null,
       });
       await publishFailure(
         thread,
@@ -533,6 +571,8 @@ async function executeReply(event, context) {
         replyId: event.replyId,
         claimed: event.claimed,
         queuedAt: event.queuedAt,
+        clientUserMessageId: event.clientUserMessageId,
+        reasoningEffort: event.reasoningEffort || null,
       });
       await publishFailure(
         thread,
@@ -627,7 +667,9 @@ async function executeReply(event, context) {
     if (desktop.desktopRunning && desktop.privateAppServerChild) {
       throw Object.assign(new Error("Codex Desktop is currently using its private app server; shared iMessage work is paused until the next shared Desktop session."), { code: "CODEX_UNAVAILABLE" });
     }
-    markClaimedJobState(event.replyId, "running");
+    // Persist the stable app-server user-message id before turn/start can be
+    // written to the socket. This is the recovery key after any process loss.
+    saveClaimedJob(event, "running");
     if (shouldSuppressSubmittedUserMirror(claim) && !event.mirrorSuppressionToken) {
       event.mirrorSuppressionToken = multiLiveMirror.suppressUser(thread.id, String(reply.body || ""));
       if (event.mirrorSuppressionToken) saveClaimedJob(event, "running");
@@ -641,7 +683,8 @@ async function executeReply(event, context) {
       thread,
       prompt: String(reply.body || ""),
       images,
-      reasoningEffort: effectiveReasoning(thread),
+      clientUserMessageId: event.clientUserMessageId,
+      reasoningEffort: event.reasoningEffort || effectiveReasoning(thread),
       onPhase: (phase) => { pendingPhase = phase; },
     });
     if (result.status === "cancelled") {
@@ -669,6 +712,17 @@ async function executeReply(event, context) {
       deferred = true;
       context.defer(15000);
       log(`Completed output for ${thread.id} could not be delivered; will retry.`);
+    } else if (error?.turnOutcomeUnknown === true) {
+      // turn/start crossed the process boundary, but its result or completion
+      // was lost. Never put this back on the normal queue: exact-id recovery
+      // must first prove whether Codex accepted and/or completed the turn.
+      deferred = true;
+      event.reconcileRunning = true;
+      event.recoveredTurnId = typeof error.turnId === "string" ? error.turnId : null;
+      event.recoveryMissingSince = null;
+      saveClaimedJob(event, "running");
+      context.defer(1000);
+      log(`Codex turn outcome for ${thread.id} is ambiguous; reconciling ${event.clientUserMessageId}.`);
     } else if (shouldDeferCodexRun(error)) {
       deferred = true;
       context.defer(15000);
@@ -699,7 +753,16 @@ async function executeReply(event, context) {
       const code = typeof error?.code === "string" && /^[A-Z0-9_]{1,40}$/.test(error.code) ? error.code : "UNKNOWN";
       log(`Codex run for ${thread.id} failed (${code}).`);
       await settleLiveSuppression(event, thread, { forceClear: true });
-      failedRuns.record(thread.id, { body: String(reply.body || ""), images, replyId: event.replyId, claimed: event.claimed, queuedAt: event.queuedAt, mirrorSuppressionToken: null });
+      failedRuns.record(thread.id, {
+        body: String(reply.body || ""),
+        images,
+        replyId: event.replyId,
+        claimed: event.claimed,
+        queuedAt: event.queuedAt,
+        clientUserMessageId: event.clientUserMessageId,
+        reasoningEffort: event.reasoningEffort || null,
+        mirrorSuppressionToken: null,
+      });
       saveClaimedJob(event, "failed");
       await publishFailure(thread, error, `run:${event.replyId}:failure`);
       try { await updateThreadStatus(thread, "error"); } catch {}
@@ -836,6 +899,8 @@ async function restoreClaimedState(jobs) {
       replyId: job.replyId,
       claimed: job.claimed,
       queuedAt: job.queuedAt,
+      clientUserMessageId: job.clientUserMessageId,
+      reasoningEffort: job.reasoningEffort || null,
       mirrorSuppressionToken: null,
     });
   }
@@ -949,12 +1014,405 @@ async function publishThreadDirectory(activeThreadId) {
   return planned;
 }
 
+function reasoningReaction(level) {
+  return REASONING_PRESENTATION[level]?.emoji || REASONING_PRESENTATION.inherit.emoji;
+}
+
+async function handleDefaultReasoning(action) {
+  const requestedInput = String(action.argument || "").trim().toLowerCase();
+  const requested = ["none", "inherit"].includes(requestedInput) ? "default" : requestedInput;
+  const options = listDefaultReasoningOptions();
+  if (!requested) {
+    const result = await imsgTransport.sendActionPicker(
+      "Default reasoning",
+      options.map((option) => ({
+        label: `${option.label}${option.selected ? " · selected" : ""}`,
+        action: { kind: "default-reasoning", argument: option.value === "default" ? "none" : option.value },
+      })),
+      {
+        allowAddedChoiceSearch: false,
+        operationScope: `local-action:${action.messageKey}:default-reasoning`,
+      },
+    );
+    if (result?.terminal === false) {
+      throw Object.assign(new Error("The default-reasoning poll remains pending."), {
+        code: result.status || "IMSG_PICKER_PENDING",
+      });
+    }
+    return null;
+  }
+  const valid = new Set(options.map((option) => option.value));
+  if (!valid.has(requested)) {
+    await sendOutbound({
+      kind: "service.notice",
+      code: "needs-attention",
+      body: `“${requestedInput}” isn’t a reasoning level.\n\n/defaultreasoning (level/none)`,
+    });
+    return { reaction: "❌" };
+  }
+  const selected = setDefaultReasoning(requested);
+  scheduleSynchronize();
+  const display = REASONING_PRESENTATION[selected || "inherit"];
+  await sendOutbound({
+    kind: "service.notice",
+    code: "updated",
+    body: selected
+      ? `${display.emoji} Default reasoning set to **${display.label}**.`
+      : "↩️ Default reasoning now follows each Codex task.",
+  });
+  return { reaction: display.emoji };
+}
+
+function compactPickerText(value, limit = 48) {
+  const text = String(value || "").replace(/\s+/g, " ").trim();
+  const segments = typeof Intl.Segmenter === "function"
+    ? [...new Intl.Segmenter(undefined, { granularity: "grapheme" }).segment(text)].map((entry) => entry.segment)
+    : [...text];
+  return segments.length <= limit
+    ? text
+    : `${segments.slice(0, Math.max(1, limit - 1)).join("").trimEnd()}…`;
+}
+
+function projectGroupsForNewTask(queryValue = "") {
+  const query = String(queryValue || "").trim().toLowerCase();
+  const groups = new Map();
+  for (const thread of catalogById.values()) {
+    if (projectKeyFor(thread) === "other-tasks") continue;
+    const key = projectKeyFor(thread);
+    const group = groups.get(key) || {
+      projectKey: key,
+      projectLabel: projectLabelFor(thread),
+      startedAt: thread.projectStartedAt || thread.createdAt || null,
+      activityAt: null,
+      status: "idle",
+      representative: thread,
+    };
+    if (threadActivityMs(thread) > threadActivityMs(group.representative)) group.representative = thread;
+    const state = effectiveState(thread);
+    const activityAt = thread.lastTurnAt || thread.activityAt || thread.updatedAt;
+    if (!group.activityAt || Date.parse(activityAt || "") > Date.parse(group.activityAt || "")) group.activityAt = activityAt;
+    if (state.status === "working") group.status = "working";
+    else if (group.status !== "working" && (state.status === "pending" || state.pendingCount > 0)) group.status = "pending";
+    else if (group.status === "idle" && state.status === "error") group.status = "error";
+    groups.set(key, group);
+  }
+  const recencyCutoff = Date.now() - 30 * 24 * 60 * 60 * 1000;
+  return [...groups.values()]
+    .filter((group) => {
+      if (query) {
+        return `${group.projectLabel} ${group.representative?.workspaceRoot || group.representative?.cwd || ""}`
+          .toLowerCase().includes(query);
+      }
+      return ["working", "pending"].includes(group.status)
+        || Date.parse(group.activityAt || "") >= recencyCutoff;
+    })
+    .sort((left, right) => {
+      const priority = (group) => group.status === "working" ? 3 : group.status === "pending" ? 2 : group.status === "error" ? 1 : 0;
+      return priority(right) - priority(left)
+        || (Date.parse(right.activityAt || "") || 0) - (Date.parse(left.activityAt || "") || 0)
+        || left.projectLabel.localeCompare(right.projectLabel);
+    })
+    .slice(0, 42);
+}
+
+async function publishNewProjectPicker(flow, query = "") {
+  await synchronize();
+  const projects = projectGroupsForNewTask(query);
+  const choices = projects.map((project) => ({
+    label: `${statusGlyph(project.status)} ${projectIdentityEmoji(project)} ${compactPickerText(project.projectLabel, 58)}`,
+    action: { kind: "new-project", flowId: flow.id, projectKey: project.projectKey },
+  }));
+  if (!query || "other tasks".includes(String(query).toLowerCase())) {
+    choices.push({
+      label: `○ ${projectIdentityEmoji({ projectLabel: "Other task", startedAt: flow.createdAt })} Other task`,
+      action: { kind: "new-project", flowId: flow.id, projectKey: "other-tasks" },
+    });
+  }
+  if (!choices.length) {
+    await sendOutbound({
+      kind: "service.notice",
+      code: "needs-attention",
+      body: `No recent project matched “${compactPickerText(query, 80)}”.`,
+    });
+    return publishNewProjectPicker(flow, "");
+  }
+  if (choices.length === 1) {
+    await selectNewProject(flow, choices[0].action.projectKey);
+    return;
+  }
+  const result = await imsgTransport.sendActionPicker("New task · project", choices, {
+    allowAddedChoiceSearch: true,
+    addedChoiceAction: { kind: "new-project-search", flowId: flow.id },
+    refreshAction: { kind: "new-project-search", flowId: flow.id },
+    operationScope: `new-thread:${flow.id}:project:${String(query).toLowerCase()}`,
+  });
+  if (result?.terminal === false) {
+    throw Object.assign(new Error("The new-task project poll remains pending."), {
+      code: result.status || "IMSG_PICKER_PENDING",
+    });
+  }
+}
+
+async function selectNewProject(flow, projectKey) {
+  const result = await resumeNewProjectSelection({
+    flow,
+    projectKey,
+    store: newThreadFlows,
+    resolveProject: async (requestedKey) => {
+      await synchronize();
+      const otherTask = requestedKey === "other-tasks";
+      const project = otherTask ? null : projectGroupsForNewTask("").find((item) => item.projectKey === requestedKey)
+        || [...catalogById.values()].map((thread) => ({
+          projectKey: projectKeyFor(thread),
+          projectLabel: projectLabelFor(thread),
+          representative: thread,
+        })).find((item) => item.projectKey === requestedKey);
+      if (!otherTask && !project) return null;
+      const representative = project?.representative || null;
+      return {
+        projectKey: otherTask ? "other-tasks" : project.projectKey,
+        projectLabel: otherTask ? "Other tasks" : project.projectLabel,
+        cwd: otherTask ? os.homedir() : representative.workspaceRoot || representative.cwd,
+        otherTask,
+        threadSource: `imessage-handoff:new:${flow.id}:${otherTask ? "other" : "project"}`,
+      };
+    },
+    publishReasoning: publishNewReasoningPicker,
+  });
+  if (result.status === "missing") {
+    await sendOutbound({ kind: "service.notice", code: "needs-attention", body: "That project is no longer available. Choose another project." });
+    await publishNewProjectPicker(flow);
+    return null;
+  }
+  if (result.status === "stale") {
+    await sendOutbound({ kind: "service.notice", code: "needs-attention", body: "That project poll is no longer current. Continue with the latest new-task step or use /cancel." });
+    return null;
+  }
+  return result.flow;
+}
+
+async function publishNewReasoningPicker(flow) {
+  // thread/start determines the authoritative model only after creation, so
+  // the setup poll exposes the conservative cross-model reasoning levels.
+  const taskOptions = listReasoningOptions({ id: `new-${flow.id}`, model: null });
+  const serviceDefault = getDefaultReasoning();
+  const choices = taskOptions.map((option) => {
+    if (option.value === "default") {
+      const display = REASONING_PRESENTATION[serviceDefault || "inherit"];
+      return {
+        label: serviceDefault
+          ? `↩️ iMessage default · ${display.emoji} ${display.label} when supported`
+          : "↩️ Codex default",
+        action: { kind: "new-reasoning", flowId: flow.id, argument: "default" },
+      };
+    }
+    const display = REASONING_PRESENTATION[option.value];
+    return {
+      label: `${display.emoji} ${display.label}`,
+      action: { kind: "new-reasoning", flowId: flow.id, argument: option.value },
+    };
+  });
+  const result = await imsgTransport.sendActionPicker("New task · reasoning", choices, {
+    allowAddedChoiceSearch: false,
+    refreshAction: { kind: "new-reasoning-refresh", flowId: flow.id },
+    operationScope: `new-thread:${flow.id}:reasoning`,
+  });
+  if (result?.terminal === false) {
+    throw Object.assign(new Error("The new-task reasoning poll remains pending."), {
+      code: result.status || "IMSG_PICKER_PENDING",
+    });
+  }
+}
+
+function titleForNewThread(prompt) {
+  const text = String(prompt || "").replace(/\s+/g, " ").trim();
+  return compactPickerText(text || "New task", 120);
+}
+
+function normalizeCreatedThread(thread, flow, prompt) {
+  const fallback = new Date().toISOString();
+  const createdAt = normalizeAppServerTimestamp(thread.createdAt, fallback);
+  const updatedAt = normalizeAppServerTimestamp(thread.updatedAt, createdAt);
+  return {
+    ...thread,
+    id: String(thread.id),
+    title: thread.title && !/^untitled/i.test(thread.title) ? thread.title : titleForNewThread(prompt),
+    cwd: flow.cwd,
+    workspaceRoot: flow.otherTask ? null : flow.cwd,
+    groupKind: flow.otherTask ? "other" : "project",
+    projectKey: flow.otherTask ? null : flow.projectKey,
+    projectLabel: flow.otherTask ? null : flow.projectLabel,
+    projectStartedAt: createdAt,
+    createdAt,
+    updatedAt,
+    recencyAt: normalizeAppServerTimestamp(thread.recencyAt, updatedAt),
+    activityAt: normalizeAppServerTimestamp(thread.activityAt, updatedAt),
+    stateSince: normalizeAppServerTimestamp(thread.stateSince, updatedAt),
+    state: thread.state || "idle",
+    visible: true,
+    threadSource: flow.threadSource,
+  };
+}
+
+async function finishNewThreadFlow(flow, action, promptValue = flow.prompt, attachments = []) {
+  const prompt = String(promptValue || "").trim();
+  if (!prompt && !(attachments || []).length) {
+    await sendOutbound({ kind: "service.notice", code: "needs-attention", body: "Send text or an image to create the task." });
+    return { reaction: "❌" };
+  }
+  const result = await resumeNewThreadCreation({
+    flow,
+    action,
+    promptValue: prompt,
+    attachments,
+    store: newThreadFlows,
+    findThread: (current) => findThreadBySource(current.threadSource),
+    createThread: (current) => createCodexRunner().createThread({
+      cwd: current.cwd,
+      threadSource: current.threadSource,
+    }),
+    normalizeThread: normalizeCreatedThread,
+    prepareThread: async (thread, current) => {
+      catalogById.set(thread.id, thread);
+      if (current.reasoning && current.reasoning !== "default") setReasoningOverride(thread.id, current.reasoning);
+      else setReasoningOverride(thread.id, "default");
+      imsgTransport.router.setThreadListen(thread.id, true);
+    },
+    queuePrompt: ({ thread, prompt: queuedPrompt, attachments: queuedAttachments }) => (
+      queueLocalPrompt({ ...action, body: queuedPrompt }, thread.id, queuedPrompt, queuedAttachments)
+    ),
+  });
+  if (result.status === "stale") {
+    await sendOutbound({ kind: "service.notice", code: "needs-attention", body: "That new-task submission is no longer current. Continue with the latest setup step or use /cancel." });
+    return { reaction: "❌" };
+  }
+  if (result.status === "needs-prompt") {
+    imsgTransport.router.setAwaitingNewPrompt(result.flow.id, action.createdAt);
+    return { reaction: "❌" };
+  }
+  const threadId = String(result.flow.threadId || "").trim();
+  if (!threadId || !imsgTransport.router.setDefaultThread(threadId, action.createdAt)) {
+    throw Object.assign(new Error("The created task could not become the default iMessage context."), {
+      code: "NEW_THREAD_DEFAULT_CONTEXT_FAILED",
+    });
+  }
+  // Keep the queued flow as a replayable tombstone until acceptInbound has
+  // durably moved this exact user action from pending to seen.
+  return {
+    reaction: "✨",
+    newThreadCompletion: {
+      flowId: result.flow.id,
+      threadId,
+      updatedAt: action.createdAt,
+    },
+  };
+}
+
+async function handleNewThreadAction(action) {
+  if (action.kind === "new") {
+    const flow = newThreadFlows.begin(action);
+    const previousFlowId = imsgTransport.router.activeNewFlowId;
+    if (previousFlowId && previousFlowId !== flow.id) newThreadFlows.remove(previousFlowId);
+    imsgTransport.router.clearAwaitingNewPrompt();
+    imsgTransport.router.setActiveNewFlow(flow.id);
+    await publishNewProjectPicker(flow);
+    return null;
+  }
+  const flow = newThreadFlows.get(action.flowId);
+  if (!flow) {
+    imsgTransport.router.clearAwaitingNewPrompt(action.flowId);
+    imsgTransport.router.clearActiveNewFlow(action.flowId);
+    await sendOutbound({ kind: "service.notice", code: "needs-attention", body: "That new-task setup expired. Start again with /new." });
+    return { reaction: "❌" };
+  }
+  if (action.kind === "new-project-search" && flow.stage !== "project") {
+    await sendOutbound({ kind: "service.notice", code: "needs-attention", body: "That project poll is no longer current. Continue with the latest new-task step or use /cancel." });
+    return { reaction: "❌" };
+  }
+  if (action.kind === "new-reasoning-refresh" && flow.stage !== "reasoning") {
+    await sendOutbound({ kind: "service.notice", code: "needs-attention", body: "That reasoning poll is no longer current. Continue with the latest new-task step or use /cancel." });
+    return { reaction: "❌" };
+  }
+  if (action.kind === "new-prompt" && !["prompt", "creating", "queued"].includes(flow.stage)) {
+    await sendOutbound({ kind: "service.notice", code: "needs-attention", body: "That new-task setup is not waiting for a message yet." });
+    return { reaction: "❌" };
+  }
+  if (action.kind === "new-project-search") {
+    await publishNewProjectPicker(flow, action.argument);
+    return null;
+  }
+  if (action.kind === "new-project") return selectNewProject(flow, action.projectKey);
+  if (action.kind === "new-reasoning-refresh") {
+    await publishNewReasoningPicker(flow);
+    return null;
+  }
+  if (action.kind === "new-reasoning") {
+    if (["creating", "queued"].includes(flow.stage)) {
+      return finishNewThreadFlow(flow, action, flow.prompt, flow.attachments);
+    }
+    if (!["reasoning", "prompt"].includes(flow.stage)) {
+      await sendOutbound({ kind: "service.notice", code: "needs-attention", body: "That reasoning poll is no longer current. Continue with the latest new-task step or use /cancel." });
+      return { reaction: "❌" };
+    }
+    const available = new Set(["default", ...Object.keys(REASONING_PRESENTATION).filter((value) => value !== "inherit")]);
+    if (!available.has(action.argument)) {
+      await sendOutbound({ kind: "service.notice", code: "needs-attention", body: "That reasoning choice is no longer available. Choose again." });
+      await publishNewReasoningPicker(flow);
+      return { reaction: "❌" };
+    }
+    if (flow.stage === "prompt") {
+      const resumed = await resumeNewPromptCollection({
+        flow,
+        action,
+        reasoning: action.argument,
+        store: newThreadFlows,
+        activatePrompt: (waiting) => imsgTransport.router.setAwaitingNewPrompt(waiting.id, action.createdAt),
+        publishPrompt: () => sendOutbound({
+          kind: "service.notice",
+          code: "updated",
+          body: "Send the first message for this task. /cancel leaves setup.",
+        }),
+      });
+      if (resumed.status === "stale") {
+        await sendOutbound({ kind: "service.notice", code: "needs-attention", body: "That reasoning poll is no longer current. Continue with the latest new-task step or use /cancel." });
+        return { reaction: "❌" };
+      }
+      return { reaction: reasoningReaction(action.argument === "default" ? getDefaultReasoning() : action.argument) };
+    }
+    const updated = newThreadFlows.update(flow.id, { reasoning: action.argument });
+    if (updated.prompt || updated.attachments.length) {
+      return finishNewThreadFlow(updated, action, updated.prompt, updated.attachments);
+    }
+    await resumeNewPromptCollection({
+      flow: updated,
+      action,
+      reasoning: action.argument,
+      store: newThreadFlows,
+      activatePrompt: (waiting) => imsgTransport.router.setAwaitingNewPrompt(waiting.id, action.createdAt),
+      publishPrompt: () => sendOutbound({
+        kind: "service.notice",
+        code: "updated",
+        body: "Send the first message for this task. /cancel leaves setup.",
+      }),
+    });
+    return { reaction: reasoningReaction(action.argument === "default" ? getDefaultReasoning() : action.argument) };
+  }
+  if (action.kind === "new-prompt") return finishNewThreadFlow(flow, action, action.body, action.attachments);
+  if (action.kind === "new-cancel") {
+    imsgTransport.router.clearAwaitingNewPrompt(flow.id);
+    imsgTransport.router.clearActiveNewFlow(flow.id);
+    newThreadFlows.remove(flow.id);
+    return { reaction: "🛑" };
+  }
+  return null;
+}
+
 async function handleControl(event) {
   const command = String(event.command || "").toLowerCase();
   const thread = event.threadId ? catalogById.get(String(event.threadId)) : null;
   if (command === "threads" || command === "recent" || command === "refresh") {
     await publishThreadDirectory(event.threadId);
-    return;
+    return null;
   }
   if (command === "cancel") {
     const threadId = event.threadId ? String(event.threadId) : "";
@@ -984,11 +1442,11 @@ async function handleControl(event) {
         thread: thread ? threadLabel(thread) : undefined,
       });
     }
-    return;
+    return notice ? { reaction: "🛑" } : { reaction: "❌" };
   }
   if (!thread) {
     await sendOutbound({ kind: "service.notice", code: "needs-attention", body: "That task is no longer available.\n\n/threads" });
-    return;
+    return { reaction: "❌" };
   }
   if (command === "listen") {
     imsgTransport.router.setThreadListen(thread.id, true);
@@ -998,7 +1456,7 @@ async function handleControl(event) {
       thread: threadLabel(thread),
       body: "Listening for the next turn’s live updates.",
     });
-    return;
+    return { reaction: "👂" };
   }
   if (command === "link") {
     await sendOutbound({
@@ -1007,7 +1465,7 @@ async function handleControl(event) {
       thread: threadLabel(thread),
       body: `codex://threads/${encodeURIComponent(thread.id)}`,
     });
-    return;
+    return { reaction: "🔗" };
   }
   if (command === "mute" || command === "unmute") {
     const muted = command === "mute";
@@ -1022,13 +1480,13 @@ async function handleControl(event) {
       scheduleLiveMirrorScan();
       scheduleCompletionScan();
     }
-    return;
+    return { reaction: muted ? "🔕" : "🔔" };
   }
   if (command === "open" || command === "thread" || command === "status") {
     const detail = await buildThreadDetailEvent(thread);
     await publishThreadHeader(thread, detail);
     await sendOutbound(detail);
-    return;
+    return null;
   }
   if (command === "request" || command === "message") {
     const state = effectiveState(thread);
@@ -1039,7 +1497,7 @@ async function handleControl(event) {
       body: state.request ?? await getLatestRequest(thread),
       at: state.requestAt || turn?.startedAt || null,
     });
-    return;
+    return null;
   }
   if (command === "turn") {
     await sendOutbound({
@@ -1048,7 +1506,7 @@ async function handleControl(event) {
       turn: await currentThreadTurn(thread),
       reasoningEffort: effectiveReasoning(thread),
     });
-    return;
+    return null;
   }
   if (command === "history") {
     const requested = Number.parseInt(String(event.argument || "3"), 10);
@@ -1060,7 +1518,7 @@ async function handleControl(event) {
       turns: history.slice(0, limit).map(outboundTurn),
       hasMore: history.length > limit,
     });
-    return;
+    return null;
   }
   if (command === "reasoning") {
     let options = listReasoningOptions(thread);
@@ -1071,7 +1529,7 @@ async function handleControl(event) {
     if (requested) {
       if (!options.some((option) => option.value === requested)) {
         await sendOutbound({ kind: "service.reasoning", thread: threadLabel(thread), current, options: outboundReasoningOptions(options), invalid: requestedInput });
-        return;
+        return { reaction: "❌" };
       }
       setReasoningOverride(thread.id, requested);
       current = effectiveReasoning(thread);
@@ -1088,7 +1546,7 @@ async function handleControl(event) {
       changed,
       note: running ? "Applies to the next turn; the current turn is unchanged." : "Applies to the next iMessage-started turn.",
     });
-    return;
+    return changed ? { reaction: reasoningReaction(current) } : null;
   }
   if (command === "retry") {
     const failures = failedRuns.list(thread.id);
@@ -1098,29 +1556,31 @@ async function handleControl(event) {
         ? "The failed message is already pending or running.\n\n/thread · /cancel"
         : "There is no failed iMessage request to retry.\n\n/turn · /threads";
       await sendOutbound({ kind: "service.notice", code: "needs-attention", thread: threadLabel(thread), body });
-      return;
+      return { reaction: "❌" };
     }
     const retry = {
       threadId: thread.id,
       replyId: failed.replyId || `retry-${Date.now()}-${Math.random().toString(16).slice(2)}`,
       claimed: failed.claimed || { reply: { body: failed.body }, images: failed.images },
       queuedAt: failed.queuedAt || new Date().toISOString(),
+      clientUserMessageId: failed.clientUserMessageId || null,
+      reasoningEffort: failed.reasoningEffort || null,
       retryOf: failed.replyId,
     };
     saveClaimedJob(retry, "queued");
     if (enqueueReply(retry)) failedRuns.markRetrying(thread.id, failed.replyId);
     else markClaimedJobState(retry.replyId, "failed");
-    return;
+    return { reaction: "🔄" };
   }
   if (command === "dismiss") {
     const failed = failedRuns.list(thread.id)[0] || null;
     if (!failed) {
       await sendOutbound({ kind: "service.notice", code: "needs-attention", thread: threadLabel(thread), body: "There is no failed iMessage request to dismiss.\n\n/thread · /threads" });
-      return;
+      return { reaction: "❌" };
     }
     if (failed.retrying) {
       await sendOutbound({ kind: "service.notice", code: "needs-attention", thread: threadLabel(thread), body: "That failed request is already pending or running. Use /cancel before dismissing it." });
-      return;
+      return { reaction: "❌" };
     }
     await settleLiveSuppression(failed, thread, { forceClear: true });
     failedRuns.remove(thread.id, failed.replyId);
@@ -1136,7 +1596,9 @@ async function handleControl(event) {
         ? `Dismissed one failed request. ${remaining} still need${remaining === 1 ? "s" : ""} attention.\n\n/retry · /dismiss`
         : "Dismissed the failed request. This task is clear.",
     });
+    return { reaction: "🗑️" };
   }
+  return null;
 }
 
 function threadActivityMs(thread) {
@@ -1344,8 +1806,13 @@ async function queueLocalPrompt(action, threadId, bodyValue = action.body, attac
   const thread = catalogById.get(String(threadId || ""));
   if (!thread) {
     await sendOutbound({ kind: "service.notice", code: "needs-attention", body: "That task is no longer available.\n\n/threads" });
-    return;
+    return false;
   }
+  const replyId = `imsg:${action.messageKey}`;
+  // A crash can leave the durable run admitted while the separate new-task
+  // flow still says `creating`. Treat the exact claimed reply as success and
+  // never restage attachments or enqueue the turn a second time.
+  if (runs.has(replyId)) return true;
   const images = await imsgTransport.importInboundAttachments(attachments, {
     destinationRoot: `${paths.attachments}/imsg`,
     messageKey: action.messageKey,
@@ -1353,50 +1820,100 @@ async function queueLocalPrompt(action, threadId, bodyValue = action.body, attac
   const body = String(bodyValue || "").trim() || (images.length ? "Please review the attached image." : "");
   if (!body) {
     await sendOutbound({ kind: "service.notice", code: "needs-attention", thread: threadLabel(thread), body: "That message did not contain text or a supported image." });
-    return;
+    return false;
   }
+  const reasoningEffort = effectiveReasoning(thread);
   imsgTransport.rememberInbound(thread.id, action.guid);
-  await ingestReply({
+  const admission = await ingestReply({
     threadId: thread.id,
-    replyId: `imsg:${action.messageKey}`,
+    replyId,
     createdAt: action.createdAt || new Date().toISOString(),
     queuedAt: action.createdAt || new Date().toISOString(),
     imsgGuid: action.guid || null,
+    reasoningEffort,
     claimed: {
       reply: { id: `imsg:${action.messageKey}`, body, media: [] },
       images,
       userMirrorMode: submittedUserMirrorMode(action),
     },
   });
+  if (!["queued", "duplicate"].includes(admission) && !runs.has(replyId)) return false;
+  try {
+    const serviceDefault = getDefaultReasoning();
+    const effective = reasoningEffort;
+    if (serviceDefault && effective && effective !== serviceDefault && action.guid) {
+      await imsgTransport.reactInbound(action.guid, reasoningReaction(effective));
+    }
+  } catch {
+    // Reasoning awareness is a presentation aid; the durable prompt is already queued.
+  }
   scheduleLiveMirrorScan();
   scheduleCompletionScan();
+  return true;
 }
 
 async function handleLocalAction(action) {
+  if (["new", "new-project", "new-project-search", "new-reasoning", "new-reasoning-refresh", "new-prompt", "new-cancel"].includes(action.kind)) {
+    return handleNewThreadAction(action);
+  }
+  if (action.kind === "defaultreasoning" || action.kind === "default-reasoning") {
+    return handleDefaultReasoning(action);
+  }
+  if (action.kind === "reaction-control") {
+    const thread = catalogById.get(String(action.threadId || ""));
+    if (!thread) return null;
+    if (action.command === "listen") {
+      imsgTransport.router.setThreadListen(thread.id, action.enabled === true);
+      return null;
+    }
+    if (action.command === "mute" || action.command === "unmute") {
+      const muted = action.command === "mute";
+      imsgTransport.router.setThreadMuted(thread.id, muted);
+      if (!muted) {
+  scheduleLiveMirrorScan();
+  scheduleCompletionScan();
+  return true;
+}
+      return null;
+    }
+    if (action.command === "inspect") {
+      const detail = await buildThreadDetailEvent(thread);
+      await publishThreadHeader(thread, detail);
+      await sendOutbound(detail);
+      const history = await getHistory(thread, 4);
+      await sendOutbound({
+        kind: "thread.history",
+        thread: threadLabel(thread),
+        turns: history.slice(0, 3).map(outboundTurn),
+        hasMore: history.length > 3,
+      });
+      return null;
+    }
+  }
   if (action.kind === "threads" || action.kind === "refresh") {
     await publishThreadDirectory(imsgTransport.router.lastUserThreadId);
-    return;
+    return null;
   }
   if (action.kind === "help") {
     await sendOutbound({ kind: "service.menu", label: "COMMANDS" }, { replyToGuid: action.guid });
-    return;
+    return null;
   }
   if (action.kind === "projects") {
     await publishProjects();
-    return;
+    return null;
   }
   if (action.kind === "search") {
     await publishSearch(action.argument, action);
-    return;
+    return null;
   }
   if (action.kind === "project") {
     await publishProject(action.projectKey);
-    return;
+    return null;
   }
   if (action.kind === "stale-menu" || action.kind === "stale-poll") {
     await sendOutbound({ kind: "service.notice", code: "needs-attention", body: "That selection expired. Here is a fresh directory; choose a new option." });
     await publishThreadDirectory(imsgTransport.router.lastUserThreadId);
-    return;
+    return { reaction: "❌" };
   }
   if (action.kind === "stale-reply-context" || action.kind === "ambiguous-reply-context") {
     await sendOutbound({
@@ -1406,11 +1923,11 @@ async function handleLocalAction(action) {
         ? "That reply thread is no longer mapped to a Codex task. Choose the task again with /threads."
         : "That reply thread maps to more than one Codex task, so nothing was run. Choose the task again with /threads.",
     });
-    return;
+    return { reaction: "❌" };
   }
   if (action.kind === "no-thread") {
     await sendOutbound({ kind: "service.notice", code: "needs-attention", body: "No thread is selected.\nText /threads to choose one." });
-    return;
+    return { reaction: "❌" };
   }
   if (action.kind === "unknown-command") {
     const thread = action.threadId ? catalogById.get(String(action.threadId)) : null;
@@ -1420,17 +1937,17 @@ async function handleLocalAction(action) {
       ...(thread ? { thread: threadLabel(thread) } : {}),
       body: "That command is not available.\n\n/help · /thread · /turn · /history · /reasoning",
     });
-    return;
+    return { reaction: "❌" };
   }
   if (action.kind === "thread-picker") {
     await publishCommandThreadPicker(action.command, action);
-    return;
+    return null;
   }
   if (action.kind === "switch") {
     const thread = catalogById.get(String(action.threadId || ""));
     if (!thread) {
       await sendOutbound({ kind: "service.notice", code: "needs-attention", body: "That menu has changed.\nText /threads for a fresh list." });
-      return;
+      return { reaction: "❌" };
     }
     imsgTransport.router.touchThread(thread.id, action.createdAt);
     if (action.prompt) {
@@ -1440,7 +1957,7 @@ async function handleLocalAction(action) {
       // queued. If a later user message already consumed it, a retried menu
       // action must not reopen the pause or send a stale prompt.
       const lease = manualSelectionLease(action, imsgTransport.router.awaitingPrompt);
-      if (!lease) return;
+      if (!lease) return null;
       await presentManualSelection({
         lease,
         currentLease: () => imsgTransport.router.awaitingPrompt,
@@ -1461,15 +1978,14 @@ async function handleLocalAction(action) {
         }),
       });
     }
-    return;
+    return null;
   }
   if (action.kind === "prompt") {
     await queueLocalPrompt(action, action.threadId);
-    return;
+    return null;
   }
   if (action.kind === "control") {
-    await handleControl(action);
-    return;
+    return handleControl(action);
   }
   throw new Error(`Unsupported local action: ${action.kind}`);
 }
@@ -1495,11 +2011,11 @@ function scheduleLocalActionRetry(action) {
   return true;
 }
 
-function settleFailedLocalAction(action, code, detail = "") {
+async function settleFailedLocalAction(action, code, detail = "") {
   const key = String(action?.messageKey || "");
   if (!key) return;
   const preservePending = code === "CLAIMED_STORE_UNAVAILABLE";
-  if (!preservePending) imsgTransport.acknowledge(key);
+  if (!preservePending) await imsgTransport.quarantineInbound(action, { reaction: "❌" });
   localActionRetryAttempts.delete(key);
   const timer = localActionRetryTimers.get(key);
   if (timer) clearTimeout(timer);
@@ -1524,11 +2040,16 @@ async function processLocalAction(action) {
   if (!key || localActionsInFlight.has(key)) return;
   localActionsInFlight.add(key);
   try {
-    await localActionContext.run(
+    const outcome = await localActionContext.run(
       { messageKey: key, sequence: 0 },
       () => handleLocalAction(action),
     );
-    await imsgTransport.acceptInbound(action);
+    await settleLocalActionOutcome(action, outcome, {
+      acceptInbound: (pendingAction, options) => imsgTransport.acceptInbound(pendingAction, options),
+      newThreadFlows,
+      router: imsgTransport.router,
+      scheduleSynchronize,
+    });
     localActionRetryAttempts.delete(key);
     const retryTimer = localActionRetryTimers.get(key);
     if (retryTimer) clearTimeout(retryTimer);
@@ -1540,7 +2061,7 @@ async function processLocalAction(action) {
     if (stopped) {
       log(`Local iMessage action stopped during shutdown (${diagnostic}); it remains durable.`);
     } else if (isTerminalLocalActionFailure(code) || !scheduleLocalActionRetry(action)) {
-      settleFailedLocalAction(action, code, detail);
+      await settleFailedLocalAction(action, code, detail);
     } else {
       log(`Local iMessage action could not be completed (${diagnostic}); it will retry with a bounded backoff.`);
     }

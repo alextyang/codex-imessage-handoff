@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { createPrivateKey, createPublicKey } from "node:crypto";
 import {
@@ -30,6 +31,7 @@ import {
   verifyIpcTranscript,
 } from "../src/imsg-ipc-protocol.mjs";
 import { ImsgHelperServer, inspectLocalImsgIdentity } from "../src/imsg-helper-server.mjs";
+import { inspectLocalImsgMessage } from "../src/imsg-chat.mjs";
 import { ImsgIpcClient, createImsgIpcClientFromConfig } from "../src/imsg-ipc-client.mjs";
 import { REQUIRED_PINNED_IMSG_CAPABILITIES } from "../src/imsg-client.mjs";
 
@@ -59,6 +61,7 @@ class FakeImsgClient {
         pollCaptionControl: true,
         pollVoting: true,
         tapbacks: true,
+        customEmojiTapbacks: true,
         typing: true,
         readReceipts: true,
         attachments: true,
@@ -141,6 +144,7 @@ async function fixture(t, options = {}) {
     client: fake,
     inspectIdentity: () => ({ identities: accountIdentities, accountFingerprint: profile.accountFingerprint }),
     inspectChat: () => ({ chatId: 42, chatGuid: profile.chatGuid, service: "iMessage", isGroup: false, participants: [profile.expectedSender] }),
+    ...(options.inspectMessage ? { inspectMessage: options.inspectMessage } : {}),
     expectedUid: process.getuid(),
     expectedUsername: user.username,
     expectedHome: os.homedir(),
@@ -208,6 +212,48 @@ test("live account inspection uses the bridge account command and shared fingerp
   assert.equal(result.accountFingerprint, imsgAccountFingerprint(result.identities));
 });
 
+test("message lookup proves an exact GUID belongs to the pinned chat without reading content", () => {
+  const { root, cleanup } = temporary();
+  try {
+    const database = path.join(root, "chat.db");
+    execFileSync("/usr/bin/sqlite3", [database], {
+      input: `
+        CREATE TABLE message (ROWID INTEGER PRIMARY KEY, guid TEXT, is_from_me INTEGER, handle_id INTEGER);
+        CREATE TABLE chat_message_join (chat_id INTEGER, message_id INTEGER);
+        CREATE TABLE handle (ROWID INTEGER PRIMARY KEY, id TEXT);
+        INSERT INTO handle VALUES (1, '+12145550196');
+        INSERT INTO message VALUES (1, 'PINNED-GUID', 0, 1);
+        INSERT INTO chat_message_join VALUES (42, 1);
+        INSERT INTO message VALUES (2, 'FOREIGN-GUID', 0, 1);
+        INSERT INTO chat_message_join VALUES (99, 2);
+      `,
+    });
+
+    assert.deepEqual(inspectLocalImsgMessage({
+      chatId: 42,
+      messageGuid: "PINNED-GUID",
+      database,
+    }), {
+      guid: "PINNED-GUID",
+      chat_id: 42,
+      is_from_me: false,
+      sender: "+12145550196",
+    });
+    assert.equal(inspectLocalImsgMessage({
+      chatId: 42,
+      messageGuid: "FOREIGN-GUID",
+      database,
+    }), null);
+    assert.equal(inspectLocalImsgMessage({
+      chatId: 42,
+      messageGuid: "x' OR 1=1 --",
+      database,
+    }), null);
+  } finally {
+    cleanup();
+  }
+});
+
 test("mutually authenticated proxy exposes only the pinned profile and advanced bridge methods", async (t) => {
   const { client, fake, profile } = await fixture(t);
   const helper = await client.helperStatus();
@@ -238,6 +284,86 @@ test("mutually authenticated proxy exposes only the pinned profile and advanced 
   const rejected = await client.sendRich({ chat_id: 99, text: "wrong target", text_formatting: [] });
   assert.equal(rejected.classification, "ambiguous");
   assert.equal(fake.calls.length, calls);
+});
+
+test("a replacement controller connection can reauthorize only a GUID from the pinned chat", async (t) => {
+  let observedAvailable = true;
+  const inspectMessage = (_profile, guid) => {
+    if (guid === "OBSERVED-BEFORE-RECONNECT" && observedAvailable) {
+      return { guid, chat_id: 42, sender: "+12145550196", is_from_me: false };
+    }
+    if (guid === "FOREIGN-CHAT-GUID") {
+      return { guid, chat_id: 99, sender: "+12145550196", is_from_me: false };
+    }
+    return null;
+  };
+  const { client, fake } = await fixture(t, { inspectMessage });
+  await client.start();
+  await client.subscribeWatch({ chat_id: 42 }, { onMessage: () => {} });
+  fake.handlers.onMessage({
+    id: 501,
+    guid: "OBSERVED-BEFORE-RECONNECT",
+    chat_id: 42,
+    sender: "+12145550196",
+    is_from_me: false,
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+
+  await client.resetConnection();
+  const deniedBeforeLookup = await client.tapback({
+    chat_id: 42,
+    message_guid: "OBSERVED-BEFORE-RECONNECT",
+    reaction: "like",
+  }, { operationId: `confirmation:${"1".repeat(64)}` });
+  assert.equal(deniedBeforeLookup.classification, "ambiguous");
+  assert.equal(fake.calls.some(([kind]) => kind === "tapback"), false);
+
+  const authorized = await client.authorizeMessageGuid({
+    chat_id: 42,
+    message_guid: "OBSERVED-BEFORE-RECONNECT",
+  });
+  assert.deepEqual(authorized, {
+    classification: "accepted",
+    accepted: true,
+    authorized: true,
+    terminal: false,
+  });
+  const reaction = await client.tapback({
+    chat_id: 42,
+    message_guid: "OBSERVED-BEFORE-RECONNECT",
+    reaction: "like",
+  }, { operationId: `confirmation:${"2".repeat(64)}` });
+  assert.equal(reaction.classification, "accepted");
+
+  observedAvailable = false;
+  await client.resetConnection();
+  const recoveredAuthorization = await client.authorizeMessageGuid({
+    chat_id: 42,
+    message_guid: "OBSERVED-BEFORE-RECONNECT",
+    operation_id: `confirmation:${"2".repeat(64)}`,
+  });
+  assert.deepEqual(recoveredAuthorization, {
+    classification: "accepted",
+    accepted: true,
+    authorized: false,
+    recoveredOperation: true,
+    terminal: false,
+  });
+  const recoveredReaction = await client.tapback({
+    chat_id: 42,
+    message_guid: "OBSERVED-BEFORE-RECONNECT",
+    reaction: "like",
+  }, { operationId: `confirmation:${"2".repeat(64)}` });
+  assert.equal(recoveredReaction.guid, reaction.guid);
+  assert.equal(fake.calls.filter(([kind]) => kind === "tapback").length, 1);
+
+  const missing = await client.authorizeMessageGuid({ chat_id: 42, message_guid: "DELETED-GUID" });
+  assert.equal(missing.classification, "terminal");
+  assert.equal(missing.terminal, true);
+  await assert.rejects(
+    client.authorizeMessageGuid({ chat_id: 42, message_guid: "FOREIGN-CHAT-GUID" }),
+    (error) => error?.code === "IMSG_MESSAGE_NOT_ALLOWED",
+  );
 });
 
 test("helper IPC preserves safe RPC diagnostics while stripping raw remote error fields", async (t) => {

@@ -129,8 +129,14 @@ function launchctlGet() {
       stdio: ["ignore", "pipe", "ignore"],
       timeout: 3_000,
     }) || "").trim();
-  } catch {
-    return "";
+  } catch (error) {
+    // launchctl may use a normal status-1 exit for an unset variable. A
+    // timeout, signal, or any other execution failure is an unknown
+    // observation, not evidence that the variable is absent. Conflating the
+    // two can make the supervisor surrender ownership while future Desktop
+    // launches are still routed to its backend.
+    if (error?.status === 1 && !error?.signal && error?.code !== "ETIMEDOUT" && error?.killed !== true) return "";
+    return null;
   }
 }
 
@@ -248,6 +254,10 @@ rotateManagedLog(paths.sharedBackendSupervisorStdoutLog, 1);
 rotateManagedLog(paths.sharedBackendSupervisorStderrLog, 1);
 
 let previous = readOwnedState(stateFile);
+const previouslyOwnedActivation = previous?.instanceId === instanceId
+  && previous?.buildFingerprint === buildFingerprint
+  && previous?.activationOwned === true;
+const initialActivationObservation = launchctlGet();
 let state = {
   schemaVersion: SCHEMA_VERSION,
   owner: OWNER,
@@ -260,10 +270,10 @@ let state = {
   healthy: false,
   childPid: null,
   consecutiveFailures: 0,
-  activationOwned: previous?.instanceId === instanceId
-    && previous?.buildFingerprint === buildFingerprint
-    && previous?.activationOwned === true,
-  activationEnabled: launchctlGet() === ENVIRONMENT_VALUE,
+  activationOwned: previouslyOwnedActivation,
+  activationEnabled: initialActivationObservation === null
+    ? previouslyOwnedActivation && previous?.activationEnabled === true
+    : initialActivationObservation === ENVIRONMENT_VALUE,
   startedAt: nowIso(),
   lastHealthyAt: previous?.lastHealthyAt || null,
   lastFailureAt: previous?.lastFailureAt || null,
@@ -294,6 +304,13 @@ function enableActivation() {
   const config = readSupervisorConfig();
   if (!config?.activationRequested || config.failOpenLatched === true) return false;
   const current = launchctlGet();
+  if (current === null) {
+    // Preserve a known-owned activation during a transient observation
+    // failure. If ownership is unknown, wait for a conclusive read rather
+    // than overwriting another client's environment value.
+    saveState({ activationConflict: false });
+    return state.activationOwned === true && state.activationEnabled === true;
+  }
   if (current === ENVIRONMENT_VALUE && state.activationOwned !== true) {
     saveState({ activationEnabled: false, activationConflict: true, phase: "healthy-activation-conflict" });
     return false;
@@ -303,22 +320,50 @@ function enableActivation() {
     return false;
   }
   if (!current) {
-    launchctlSet(true);
+    try {
+      launchctlSet(true);
+    } catch (error) {
+      log(`Could not activate future Desktop routing: ${error.message}`);
+      saveState({ activationEnabled: false, activationConflict: false });
+      return false;
+    }
     state.activationOwned = true;
   }
-  const enabled = launchctlGet() === ENVIRONMENT_VALUE;
-  saveState({ activationEnabled: enabled, activationConflict: false });
+  const observation = launchctlGet();
+  const enabled = observation === null
+    ? state.activationOwned === true
+    : observation === ENVIRONMENT_VALUE;
+  if (observation !== null && !enabled) state.activationOwned = false;
+  saveState({
+    activationEnabled: enabled,
+    activationConflict: observation !== null && Boolean(observation) && !enabled,
+  });
   return enabled;
 }
 
 function protectDesktopRouting(reason) {
   const current = launchctlGet();
-  if (state.activationOwned && current === ENVIRONMENT_VALUE) {
-    try { launchctlSet(false); } catch (error) { log(`Could not protect future Desktop launches: ${error.message}`); }
+  let activationOwned = state.activationOwned === true;
+  let activationEnabled = current === null
+    ? state.activationEnabled === true
+    : current === ENVIRONMENT_VALUE;
+  if (activationOwned && (current === ENVIRONMENT_VALUE || current === null)) {
+    try {
+      launchctlSet(false);
+      activationOwned = false;
+      activationEnabled = false;
+    } catch (error) {
+      // Retain ownership so this supervisor (or its launchd replacement) can
+      // retry. Clearing it here would strand an untracked routing override.
+      log(`Could not protect future Desktop launches: ${error.message}`);
+    }
+  } else if (activationOwned && current !== ENVIRONMENT_VALUE) {
+    // A conclusive observation shows that our value is no longer installed.
+    activationOwned = false;
   }
   saveState({
-    activationOwned: false,
-    activationEnabled: launchctlGet() === ENVIRONMENT_VALUE,
+    activationOwned,
+    activationEnabled,
     routingProtectionReason: reason,
     routingProtectedAt: nowIso(),
   });
@@ -375,18 +420,37 @@ async function recordHealthy() {
     && config?.failOpenLatched !== true
     && healthyStreak >= HEALTHY_ACTIVATION_STREAK
     && Date.now() - healthySinceMs >= ACTIVATION_SOAK_MS;
-  let activated = false;
+  let activated = state.activationOwned === true && state.activationEnabled === true;
+  let activationOwned = state.activationOwned === true;
   let activationConflict = false;
   if (activationReady) {
     activated = enableActivation();
+    activationOwned = state.activationOwned === true;
   } else if (config?.activationRequested === true && state.activationOwned === true) {
-    activated = launchctlGet() === ENVIRONMENT_VALUE;
+    const current = launchctlGet();
+    if (current !== null) {
+      activated = current === ENVIRONMENT_VALUE;
+      if (!activated) activationOwned = false;
+      activationConflict = Boolean(current) && !activated;
+    }
   } else if (config?.activationRequested !== true) {
     const current = launchctlGet();
-    if (state.activationOwned === true && current === ENVIRONMENT_VALUE) {
-      try { launchctlSet(false); } catch {}
+    if (activationOwned && (current === ENVIRONMENT_VALUE || current === null)) {
+      try {
+        launchctlSet(false);
+        activated = false;
+        activationOwned = false;
+      } catch {
+        // Keep the last known state and ownership so a later probe can retry.
+      }
+    } else if (activationOwned) {
+      activated = false;
+      activationOwned = false;
     } else if (current === ENVIRONMENT_VALUE) {
+      activated = false;
       activationConflict = true;
+    } else if (current !== null) {
+      activated = false;
     }
   }
   saveState({
@@ -401,7 +465,7 @@ async function recordHealthy() {
     childPid: child?.pid || adoptedChildPid || null,
     consecutiveFailures: 0,
     activationEnabled: activated,
-    activationOwned: activated ? state.activationOwned === true : false,
+    activationOwned,
     activationConflict,
     lastHealthyAt: nowIso(),
     circuitOpenUntil: null,
@@ -690,7 +754,7 @@ healthTimer = setInterval(() => {
 }, HEALTH_INTERVAL_MS);
 healthTimer.unref?.();
 
-if (state.activationOwned && state.activationEnabled) protectDesktopRouting("supervisor-restarted");
+if (state.activationOwned) protectDesktopRouting("supervisor-restarted");
 else saveState();
 log(`Starting shared app-server supervisor with ${binary}.`);
 await spawnBackend();

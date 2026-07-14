@@ -33,14 +33,6 @@ const POLL_OPTION_IDENTIFIER = "00000000-0000-0000-0000-000000000000";
 // formatting and JSON framing never turn a valid transcript into a retry loop.
 const MAX_TEXT_BUBBLE_BYTES = 96 * 1024;
 const MULTIPART_PREFIX_RESERVE_BYTES = 32;
-const ACTION_CONFIRMATION_COMMANDS = new Set([
-  "cancel",
-  "dismiss",
-  "listen",
-  "mute",
-  "retry",
-  "unmute",
-]);
 
 function clean(value) {
   return typeof value === "string" ? value.trim() : "";
@@ -265,9 +257,22 @@ function pollChunks(items, question = "Choose") {
   return pollPlan(question, items).chunks;
 }
 
+function graphemeSegments(value) {
+  const text = String(value || "");
+  if (typeof Intl?.Segmenter === "function") {
+    try {
+      return Array.from(
+        new Intl.Segmenter(undefined, { granularity: "grapheme" }).segment(text),
+        (entry) => entry.segment,
+      );
+    } catch {}
+  }
+  return [...text];
+}
+
 function compact(value, limit = 72) {
   const text = clean(value).replace(/\s+/g, " ").toWellFormed();
-  const characters = [...text];
+  const characters = graphemeSegments(text);
   return characters.length <= limit
     ? text
     : `${characters.slice(0, Math.max(1, limit - 1)).join("").trimEnd()}…`;
@@ -277,24 +282,21 @@ function taskChoice(thread, action = null, now = Date.now()) {
   const id = clean(thread?.id);
   if (!id) return null;
   const status = clean(thread?.status).toLowerCase();
-  const pending = Math.max(0, Number(thread?.pendingCount) || 0);
-  const stateAt = thread?.stateSince || thread?.activityAt;
-  const age = stateAt ? relativeTime(stateAt, now) : "unknown";
-  const state = status === "working" || status === "running"
-    ? `Working ${age.replace(/ ago$/, "")}`
-    : status === "pending" || status === "queued"
-      ? `Pending ${age.replace(/ ago$/, "")}`
-      : status === "error" || status === "failed"
-        ? `Needs attention · ${age}`
-        : age;
-  const context = [
-    compact(thread?.projectLabel || (thread?.groupKind === "other" ? "Other tasks" : ""), 30),
-    state,
-    pending > 0 ? `${pending} queued` : "",
-    thread?.requestPreview ? `“${compact(thread.requestPreview, 54)}”` : "",
-  ].filter(Boolean).join(" · ");
+  const normalizedStatus = status === "running" ? "working" : status === "queued" ? "pending" : status;
+  const glyph = normalizedStatus === "working"
+    ? "◷"
+    : normalizedStatus === "pending"
+      ? "◶"
+      : normalizedStatus === "error" || normalizedStatus === "failed"
+        ? "▲"
+        : "○";
+  const title = compact(clean(thread?.title) || "Untitled task", 52);
+  const project = compact(thread?.projectLabel || (thread?.groupKind === "other" ? "Other tasks" : "Codex"), 34);
+  const idleRecency = glyph === "○"
+    ? relativeTime(thread?.activityAt || thread?.stateSince, now)
+    : "";
   return {
-    label: compact(`${statusGlyph(status)} ${threadIdentityEmoji(thread)} ${clean(thread?.title) || "Untitled task"}${context ? ` · ${context}` : ""}`, 160),
+    label: compact(`${glyph} ${threadIdentityEmoji(thread)} ${title} · ${project}${idleRecency ? ` · ${idleRecency}` : ""}`, 110),
     action: action || { kind: "switch", threadId: id, awaitingPrompt: true },
   };
 }
@@ -358,13 +360,6 @@ function exactURL(value) {
   return /^https?:\/\/[^\s]+$/i.test(text) ? text : null;
 }
 
-function shouldConfirmWithReaction(action) {
-  if (action?.kind !== "control") return false;
-  const command = clean(action.command).toLowerCase();
-  if (ACTION_CONFIRMATION_COMMANDS.has(command)) return true;
-  return command === "reasoning" && Boolean(clean(action.argument));
-}
-
 function pollOptionMap(result, commands) {
   const options = Array.isArray(result?.poll?.options) ? result.poll.options : [];
   const mapping = {};
@@ -394,6 +389,7 @@ export class ImsgTransport {
     logger = null,
     watchRetryBaseMs = 500,
     watchRetryMaxMs = 30_000,
+    commandContextTtlMs,
     onHealthChange = null,
   } = {}) {
     if (!profile || !Number.isSafeInteger(Number(profile.chatId)) || Number(profile.chatId) <= 0 || !clean(profile.chatGuid)) {
@@ -416,7 +412,12 @@ export class ImsgTransport {
     this.profile.polls = true;
     this.client = client || createImsgIpcClientFromConfig(profile.clientConfig);
     const conversationKey = createHash("sha256").update(`imsg-chat:${this.profile.chatGuid}`).digest("hex");
-    this.router = new LocalConversationRouter({ stateFile: path.resolve(stateFile), conversationKey, now });
+    this.router = new LocalConversationRouter({
+      stateFile: path.resolve(stateFile),
+      conversationKey,
+      now,
+      commandContextTtlMs,
+    });
     this.now = now;
     this.logger = logger;
     this.capabilityStatus = null;
@@ -426,6 +427,8 @@ export class ImsgTransport {
     this.typing = false;
     this.typingClearConfirmed = true;
     this.typingCleanupPromise = null;
+    this.typingExpiryTimer = null;
+    this.confirmationFlushPromise = null;
     this.typingThreads = new Set();
     this.readObservation = null;
     this.sendQueue = Promise.resolve();
@@ -539,6 +542,7 @@ export class ImsgTransport {
       typing: available && this.capabilityStatus?.capabilities?.typing === true,
       readReceipts: available && this.capabilityStatus?.capabilities?.readReceipts === true,
       tapbacks: available && this.capabilityStatus?.capabilities?.tapbacks === true,
+      customEmojiTapbacks: available && this.capabilityStatus?.capabilities?.customEmojiTapbacks === true,
       attachments: available && this.capabilityStatus?.capabilities?.attachments === true,
       sendStatus: this.capabilityStatus?.capabilities?.sendStatus === true,
       edits: available && this.capabilityStatus?.capabilities?.edits === true,
@@ -561,6 +565,7 @@ export class ImsgTransport {
     if (!this.stopped) {
       if (!this.watchHealthy) await this._recoverWatch();
       else await this._subscribeWatch();
+      await this._flushConfirmationOutboxAfterReconnect();
       return this;
     }
     const lifecycleGeneration = this.lifecycleGeneration;
@@ -578,6 +583,7 @@ export class ImsgTransport {
     this.stopped = false;
     this.watchCallbacks = { onAction, onError };
     await this._subscribeWatch();
+    await this._flushConfirmationOutboxAfterReconnect();
     return this;
   }
 
@@ -705,6 +711,7 @@ export class ImsgTransport {
       const subscribed = await this._subscribeWatch();
       if (!subscribed || this.stopped || lifecycleGeneration !== this.lifecycleGeneration) return false;
       const subscribedGeneration = this.watchGeneration;
+      await this._flushConfirmationOutboxAfterReconnect();
       try {
         for (const action of this.router.pendingActions()) {
           await this.watchCallbacks?.onAction?.(action, null);
@@ -745,6 +752,8 @@ export class ImsgTransport {
     if (this.watchRetryTimer) clearTimeout(this.watchRetryTimer);
     this.watchRetryTimer = null;
     this.typingThreads.clear();
+    if (this.typingExpiryTimer) clearTimeout(this.typingExpiryTimer);
+    this.typingExpiryTimer = null;
     try { await this.typingCleanupPromise; } catch {}
     await this._forceTypingOff();
     try { await this.subscription?.unsubscribe?.(); } catch {}
@@ -796,31 +805,146 @@ export class ImsgTransport {
     return readStatus === "accepted" && typingResult.status === "fulfilled";
   }
 
-  async acceptInbound(action, options = {}) {
+  async _settleInbound(action, options = {}, { routeAcceptedGuid = true } = {}) {
     const threadId = clean(action?.threadId);
     const guid = clean(action?.guid);
     const hasExplicitReplyContext = Boolean(clean(action?.threadOriginatorGuid));
     const shouldRouteGuid = action?.kind === "prompt"
       || (action?.kind === "control" && hasExplicitReplyContext)
       || (action?.kind === "switch" && (Boolean(clean(action?.prompt)) || hasExplicitReplyContext));
-    if (threadId && guid && shouldRouteGuid) {
+    if (routeAcceptedGuid && threadId && guid && shouldRouteGuid) {
       this.router.routeInboundGuid(guid, threadId, {
         replyToGuid: action?.replyToGuid,
         threadOriginatorGuid: action?.threadOriginatorGuid,
         createdAt: action?.createdAt,
       });
     }
-    // The Codex action is already accepted at this point. Make that durable
-    // before optional UI niceties so a transient bridge failure cannot replay it.
-    const acknowledged = this.acknowledge(action?.messageKey);
-    const capabilities = this.richCapabilities();
+    // Commit acceptance and its optional semantic confirmation together. The
+    // action can never be replayed just because the presentation-only tapback
+    // is temporarily unavailable; the outbox retries it with one stable id.
+    const reaction = clean(options.reaction);
+    const acknowledged = this.router.acknowledgeWithConfirmation(action?.messageKey, {
+      messageGuid: guid,
+      reaction,
+      remove: options.removeReaction === true,
+    }, {
+      newThreadCompletion: options.newThreadCompletion,
+    });
     await Promise.allSettled([
       this._syncDefaultTyping(),
-      ...(capabilities.tapbacks && action?.guid && (options.react === true || shouldConfirmWithReaction(action))
-        ? [this.client.tapback({ ...target(this.profile), message_guid: action.guid, reaction: "like" })]
-        : []),
+      this._flushConfirmationOutbox(),
     ]);
     return acknowledged;
+  }
+
+  acceptInbound(action, options = {}) {
+    return this._settleInbound(action, options);
+  }
+
+  quarantineInbound(action, options = {}) {
+    return this._settleInbound(action, {
+      ...options,
+      reaction: clean(options.reaction) || "❌",
+    }, { routeAcceptedGuid: false });
+  }
+
+  _flushConfirmationOutbox() {
+    if (this.confirmationFlushPromise) return this.confirmationFlushPromise;
+    const attempt = (async () => {
+      if (!this.richCapabilities().tapbacks) return 0;
+      let delivered = 0;
+      const visited = new Set();
+      let blocked = false;
+      while (!blocked) {
+        const pending = this.router.pendingConfirmations()
+          .filter((confirmation) => !visited.has(confirmation.operationId));
+        if (!pending.length) break;
+        for (const confirmation of pending) {
+          visited.add(confirmation.operationId);
+          if (typeof this.client.authorizeMessageGuid === "function") {
+            let authorization;
+            try {
+              authorization = await this.client.authorizeMessageGuid({
+                ...target(this.profile),
+                message_guid: confirmation.messageGuid,
+                operation_id: confirmation.operationId,
+              });
+            } catch {
+              // Lookup failures can be transient (database lock, helper reset).
+              // Preserve ordering and retry from this entry after reconnect.
+              blocked = true;
+              break;
+            }
+            const canAttempt = authorization?.classification === "accepted"
+              && (authorization?.authorized === true || authorization?.recoveredOperation === true);
+            if (!canAttempt) {
+              // A deleted or otherwise terminal item stays in the bounded durable
+              // outbox, but must not prevent independent later confirmations.
+              if (authorization?.terminal === true) continue;
+              blocked = true;
+              break;
+            }
+          }
+          let result;
+          try {
+            result = await this.client.tapback({
+              ...target(this.profile),
+              message_guid: confirmation.messageGuid,
+              reaction: confirmation.reaction,
+              ...(confirmation.remove ? { remove: true } : {}),
+            }, { operationId: confirmation.operationId });
+          } catch {
+            blocked = true;
+            break;
+          }
+          if (result?.classification !== "accepted") {
+            if (result?.terminal === true || result?.classification === "unsupported") continue;
+            blocked = true;
+            break;
+          }
+          try {
+            if (this.router.completeConfirmation(confirmation.operationId)) delivered += 1;
+          } catch {
+            blocked = true;
+            break;
+          }
+        }
+      }
+      return delivered;
+    })().catch(() => 0);
+    this.confirmationFlushPromise = attempt;
+    attempt.finally(() => {
+      if (this.confirmationFlushPromise === attempt) this.confirmationFlushPromise = null;
+    });
+    return attempt;
+  }
+
+  async _flushConfirmationOutboxAfterReconnect() {
+    // A confirmation attempt from the failed connection may still be settling
+    // while its replacement watch comes online. Let that attempt resolve, then
+    // always make a fresh pass on the authenticated replacement connection.
+    const previousAttempt = this.confirmationFlushPromise;
+    if (previousAttempt) {
+      try { await previousAttempt; } catch {}
+      if (this.confirmationFlushPromise === previousAttempt) {
+        this.confirmationFlushPromise = null;
+      }
+    }
+    return this._flushConfirmationOutbox();
+  }
+
+  async reactInbound(guid, reaction, { remove = false } = {}) {
+    const messageGuidValue = clean(guid);
+    const reactionValue = clean(reaction);
+    if (!messageGuidValue || !reactionValue || !this.richCapabilities().tapbacks) {
+      return { classification: "unsupported" };
+    }
+    return this.client.tapback({
+      ...target(this.profile),
+      message_guid: messageGuidValue,
+      reaction: reactionValue,
+      ...(remove ? { remove: true } : {}),
+    });
   }
 
   async _setTypingState(typing = true) {
@@ -873,8 +997,21 @@ export class ImsgTransport {
   }
 
   _syncDefaultTyping() {
-    const defaultThreadId = clean(this.router.lastUserThreadId);
-    return this._setTypingState(Boolean(defaultThreadId && this.typingThreads.has(defaultThreadId)));
+    const defaultThreadId = clean(this.router.recentDefaultThreadId);
+    const shouldType = Boolean(defaultThreadId && this.typingThreads.has(defaultThreadId));
+    if (this.typingExpiryTimer) clearTimeout(this.typingExpiryTimer);
+    this.typingExpiryTimer = null;
+    if (shouldType) {
+      const expiresAt = Date.parse(this.router.recentDefaultExpiresAt || "");
+      if (Number.isFinite(expiresAt)) {
+        this.typingExpiryTimer = setTimeout(() => {
+          this.typingExpiryTimer = null;
+          this._syncDefaultTyping().catch(() => {});
+        }, Math.max(1, expiresAt - this.now() + 1));
+        this.typingExpiryTimer.unref?.();
+      }
+    }
+    return this._setTypingState(shouldType);
   }
 
   _enqueue(operation) {
@@ -986,6 +1123,8 @@ export class ImsgTransport {
         allowAddedChoiceSearch: options.allowAddedChoiceSearch !== false,
         addChoiceCommand: clean(options.addChoiceCommand),
         addChoiceArgument: clean(options.addChoiceArgument),
+        addedChoiceAction: options.addedChoiceAction,
+        refreshAction: options.refreshAction,
         optionLabels: pollOptionLabels(sent),
       });
     }
@@ -1018,6 +1157,21 @@ export class ImsgTransport {
       allowAddedChoiceSearch: true,
       addChoiceCommand: normalizedCommand,
       addChoiceArgument: commandArgument,
+      operationScope: clean(options.operationScope),
+    }));
+  }
+
+  sendActionPicker(question, choices, options = {}) {
+    const normalized = (choices || []).flatMap((choice) => {
+      const label = clean(choice?.label);
+      return label && choice?.action ? [{ label, action: choice.action }] : [];
+    });
+    return this._enqueue(() => this._sendChoicePolls(clean(question) || "Choose", normalized, {
+      allowAddedChoiceSearch: options.allowAddedChoiceSearch !== false,
+      addChoiceCommand: clean(options.addChoiceCommand),
+      addChoiceArgument: clean(options.addChoiceArgument),
+      addedChoiceAction: options.addedChoiceAction,
+      refreshAction: options.refreshAction,
       operationScope: clean(options.operationScope),
     }));
   }
@@ -1236,4 +1390,5 @@ export const imsgTransportInternals = Object.freeze({
   exactURL,
   outboundOperationId,
   taskHeader,
+  compact,
 });

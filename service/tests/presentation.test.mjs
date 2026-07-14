@@ -30,26 +30,30 @@ const OTHER = {
 
 const activeOptions = { context: { activeThread: ACTIVE } };
 
-test("help is exactly the minimal two-section command reference", () => {
+test("help is the minimal task, tapback, and settings reference", () => {
   assert.equal(renderHelp(), [
     "**Browse**",
+    "/new (message) · Start a task",
     "/threads · Tasks by project",
     "/refresh · Refresh the task list",
     "/search (query) · Find a task",
     "/projects · Browse all projects",
     "",
-    "**Task commands**",
+    "**Task controls**",
+    "👍 add/remove · Listen for the next turn’s live updates",
+    "👎 add/remove · Mute or unmute automatic updates",
+    "❓ add · Show status, current turn, and recent history",
     "/thread · Status and latest response",
     "/turn · Show current or last turn",
     "/history (length) · Completed turn history",
     "/reasoning (level/none) · View or change reasoning",
-    "/listen · Stream the next turn’s live updates",
     "/link · Show the Codex task link",
-    "/mute · Pause automatic updates",
-    "/unmute · Resume automatic updates",
     "/cancel · Stop iMessage-started work in this task",
     "/retry · Retry failed iMessage-started work",
     "/dismiss · Remove failed work from the queue",
+    "",
+    "**Settings**",
+    "/defaultreasoning (level/none) · View or change default reasoning",
   ].join("\n"));
 });
 
@@ -193,12 +197,12 @@ test("thread header is a separate message with status, reasoning, link, and comm
     "🪁 **Polish message formatting**",
     "",
     "◷ Working for 4m · 2 queued",
-    "Reasoning: high",
+    "🔍 Reasoning: High",
     "",
     "codex://threads/active-thread",
     "",
-    "/listen · /link · /mute",
-    "/turn · /history · /reasoning · /cancel",
+    "👍 listen · 👎 mute · ❓ status + history",
+    "/link · /cancel",
   ].join("\n");
   assert.equal(renderThreadHeader(thread, "2026-07-12T08:00:00.000Z"), expected);
 
@@ -211,8 +215,7 @@ test("thread header is a separate message with status, reasoning, link, and comm
 
   const mutedListening = { ...thread, muted: true, listening: true };
   assert.equal(renderThreadHeader(mutedListening, "2026-07-12T08:00:00.000Z"), expected
-    .replace("Reasoning: high", "Reasoning: high\nUpdates: muted\nListening: next turn")
-    .replace("/mute", "/unmute"));
+    .replace("🔍 Reasoning: High", "🔍 Reasoning: High\nUpdates: muted\nListening: next turn"));
 });
 
 test("thread detail is split into semantic messages without repeated framing", () => {
@@ -370,7 +373,7 @@ test("reasoning view, changed, removed, and invalid states are minimal and exact
       { value: "high", selected: true },
       { value: "xhigh", selected: false },
     ],
-  }, activeOptions), "**Reasoning**\n○ none\n● high · selected\n○ xhigh\n\n/reasoning (level/none)");
+  }, activeOptions), "**Reasoning**\n○ ↩️ Inherit\n● 🔍 High · selected\n○ 🔬 Extra high\n\n/reasoning (level/none)");
 
   assert.equal(renderOutboundEvent({
     kind: "service.reasoning",
@@ -378,7 +381,7 @@ test("reasoning view, changed, removed, and invalid states are minimal and exact
     current: "xhigh",
     options: [{ value: "xhigh", selected: true }],
     changed: true,
-  }, activeOptions), "Reasoning set to **xhigh**.");
+  }, activeOptions), "Reasoning set to 🔬 **Extra high**.");
 
   assert.equal(renderOutboundEvent({
     kind: "service.reasoning",

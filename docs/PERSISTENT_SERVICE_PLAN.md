@@ -77,6 +77,11 @@ time. Restart reconciliation compares a persisted running request with the live
 rollout before deciding whether to wait, deliver an already completed result,
 or submit work.
 
+The client message id is persisted before `turn/start` crosses the app-server
+boundary. A timeout or disconnect after that write enters exact-id
+reconciliation and can never return to ordinary submission. This prevents a
+lost response from becoming an invisible duplicate run.
+
 Every semantic outbound operation uses a stable delivery identity. Completed
 text is checkpointed independently from generated images; images are accepted
 and checkpointed one at a time. A crash may delay a result but must not replay
@@ -121,6 +126,11 @@ pnpm test
 pnpm typecheck
 git diff --check
 ```
+
+Preparing an upgrade must preserve the existing shared exchange directory and
+its live Unix socket. The running service is stopped only after the new helper
+installer succeeds, immediately before the single-controller verification and
+service deployment steps.
 
 A release also requires a live test from the dedicated Messages identity:
 directory poll, task selection, native reply routing, unthreaded routing,

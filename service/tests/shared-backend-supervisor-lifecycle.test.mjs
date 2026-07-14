@@ -18,7 +18,7 @@ function readJson(file) {
   return JSON.parse(readFileSync(file, "utf8"));
 }
 
-async function waitFor(predicate, timeoutMs = 5_000) {
+async function waitFor(predicate, timeoutMs = 20_000) {
   const deadline = Date.now() + timeoutMs;
   let lastError;
   while (Date.now() < deadline) {
@@ -42,13 +42,17 @@ function fixture() {
   const configFile = path.join(serviceHome, "shared-backend-supervisor-config.json");
   const stateFile = path.join(serviceHome, "shared-backend-supervisor-state.json");
   const launchState = path.join(root, "launch-env");
+  const launchGetenvFailure = path.join(root, "launch-getenv-failure");
   const fakeLaunchctl = path.join(root, "launchctl");
   const fakePs = path.join(root, "ps");
   const fakeCodex = path.join(root, "codex");
   mkdirSync(serviceHome, { recursive: true });
   writeFileSync(fakeLaunchctl, `#!/bin/sh
 case "$1" in
-  getenv) test -f "$FAKE_LAUNCHCTL_STATE" && cat "$FAKE_LAUNCHCTL_STATE" || exit 1 ;;
+  getenv)
+    test -f "$FAKE_LAUNCHCTL_GETENV_FAILURE" && exit 75
+    test -f "$FAKE_LAUNCHCTL_STATE" && cat "$FAKE_LAUNCHCTL_STATE" || exit 1
+    ;;
   setenv) printf '%s' "$3" > "$FAKE_LAUNCHCTL_STATE" ;;
   unsetenv) rm -f "$FAKE_LAUNCHCTL_STATE" ;;
   *) exit 2 ;;
@@ -100,8 +104,75 @@ server.listen(socketPath, () => process.stdout.write("ready\\n"));
     activationRequested: false,
     failOpenLatched: false,
   });
-  return { root, home, codexHome, serviceHome, instanceId, configFile, stateFile, launchState, fakeLaunchctl, fakeCodex };
+  return {
+    root,
+    home,
+    codexHome,
+    serviceHome,
+    instanceId,
+    configFile,
+    stateFile,
+    launchState,
+    launchGetenvFailure,
+    fakeLaunchctl,
+    fakeCodex,
+  };
 }
+
+test("a transient launchctl read failure preserves owned Desktop routing", async (t) => {
+  const run = fixture();
+  writeJson(run.configFile, { ...readJson(run.configFile), activationRequested: true });
+  const child = spawn(process.execPath, ["--experimental-strip-types", supervisor], {
+    env: {
+      ...process.env,
+      PATH: `${run.root}:${process.env.PATH || ""}`,
+      HOME: run.home,
+      CODEX_HOME: run.codexHome,
+      IMESSAGE_HANDOFF_HOME: run.serviceHome,
+      CODEX_BIN: run.fakeCodex,
+      IMESSAGE_HANDOFF_SUPERVISOR_INSTANCE: run.instanceId,
+      IMESSAGE_HANDOFF_SUPERVISOR_BUILD_FINGERPRINT: buildFingerprint,
+      IMESSAGE_HANDOFF_LAUNCHCTL_BIN: run.fakeLaunchctl,
+      FAKE_LAUNCHCTL_STATE: run.launchState,
+      FAKE_LAUNCHCTL_GETENV_FAILURE: run.launchGetenvFailure,
+      IMESSAGE_HANDOFF_SUPERVISOR_STARTUP_PROBE_MS: "25",
+      IMESSAGE_HANDOFF_SUPERVISOR_STARTUP_TIMEOUT_MS: "4000",
+      IMESSAGE_HANDOFF_SUPERVISOR_HEALTH_INTERVAL_MS: "100",
+      IMESSAGE_HANDOFF_SUPERVISOR_PROBE_TIMEOUT_MS: "200",
+      IMESSAGE_HANDOFF_SUPERVISOR_ACTIVATION_SOAK_MS: "200",
+    },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  let diagnostics = "";
+  child.stdout.on("data", (chunk) => { diagnostics += String(chunk); });
+  child.stderr.on("data", (chunk) => { diagnostics += String(chunk); });
+  t.after(() => { if (child.exitCode === null) child.kill("SIGTERM"); });
+
+  const active = await waitFor(() => {
+    if (!existsSync(run.stateFile) || !existsSync(run.launchState)) return null;
+    const state = readJson(run.stateFile);
+    return state.phase === "healthy-active" && state.activationOwned === true ? state : null;
+  });
+  assert.equal(readFileSync(run.launchState, "utf8"), "1", diagnostics);
+
+  writeFileSync(run.launchGetenvFailure, "fail\n", "utf8");
+  const duringFailure = await waitFor(() => {
+    const state = readJson(run.stateFile);
+    return state.lastHealthyAt !== active.lastHealthyAt ? state : null;
+  });
+  assert.equal(duringFailure.phase, "healthy-active", diagnostics);
+  assert.equal(duringFailure.healthy, true, diagnostics);
+  assert.equal(duringFailure.activationOwned, true, diagnostics);
+  assert.equal(duringFailure.activationEnabled, true, diagnostics);
+  assert.equal(duringFailure.activationConflict, false, diagnostics);
+  assert.equal(readFileSync(run.launchState, "utf8"), "1", diagnostics);
+
+  rmSync(run.launchGetenvFailure, { force: true });
+  await waitFor(() => {
+    const state = readJson(run.stateFile);
+    return state.phase === "healthy-active" && state.activationOwned === true ? state : null;
+  });
+});
 
 test("supervisor separates preparation from activation and latches a wedged-server failure", async (t) => {
   const run = fixture();

@@ -71,6 +71,7 @@ const THREAD_COLUMNS = `
   t.recency_at,
   t.recency_at_ms,
   t.preview,
+  t.thread_source,
   t.model,
   t.reasoning_effort,
   t.model_provider,
@@ -120,7 +121,8 @@ async function query(sql) {
 function threadFromRow(row, workspaceState = readWorkspaceState()) {
   const id = String(row.id);
   const cwd = normalizedCwd(row.cwd);
-  const projectless = workspaceState.projectlessThreadIds.has(id);
+  const serviceProjectless = /^imessage-handoff:new:[a-f0-9]{32}:other$/i.test(String(row.thread_source || ""));
+  const projectless = workspaceState.projectlessThreadIds.has(id) || serviceProjectless;
   const hintedRoot = workspaceState.workspaceRootHints.get(id);
   const workspaceRoot = projectless ? null : normalizedCwd(hintedRoot || cwd);
   const updatedAt = iso(row.updated_at_ms, row.updated_at);
@@ -154,6 +156,7 @@ function threadFromRow(row, workspaceState = readWorkspaceState()) {
     model: typeof row.model === "string" && row.model ? row.model : null,
     reasoningEffort: typeof row.reasoning_effort === "string" && row.reasoning_effort ? row.reasoning_effort : null,
     modelProvider: typeof row.model_provider === "string" && row.model_provider ? row.model_provider : null,
+    threadSource: typeof row.thread_source === "string" && row.thread_source ? row.thread_source : null,
     gitOriginUrl: typeof row.git_origin_url === "string" && row.git_origin_url ? row.git_origin_url : null,
     gitBranch: typeof row.git_branch === "string" && row.git_branch ? row.git_branch : null,
     archived: Boolean(row.archived),
@@ -351,6 +354,20 @@ export async function findThread(id) {
     FROM threads t
     WHERE t.id = ${sqlString(canonicalId)}
       AND ${ROOT_THREAD_PREDICATE}
+    LIMIT 1`);
+  return rows[0] ? threadFromRow(rows[0], readWorkspaceState()) : null;
+}
+
+export async function findThreadBySource(source) {
+  const canonicalSource = String(source || "").trim();
+  if (!canonicalSource) return null;
+  const rows = await query(`
+    SELECT ${THREAD_COLUMNS}
+    FROM threads t
+    WHERE COALESCE(t.thread_source, '') = ${sqlString(canonicalSource)}
+      AND t.archived = 0
+      AND ${USER_THREAD_PREDICATE}
+    ORDER BY t.created_at_ms ASC, t.created_at ASC, t.id ASC
     LIMIT 1`);
   return rows[0] ? threadFromRow(rows[0], readWorkspaceState()) : null;
 }

@@ -9,6 +9,7 @@ const fullStatus = {
   basic_features: true,
   advanced_features: true,
   poll_caption_control: true,
+  custom_emoji_tapbacks: true,
   typing_indicators: true,
   read_receipts: true,
   sip: "disabled",
@@ -143,6 +144,7 @@ test("locates imsg and reports normalized basic and bridge capabilities", async 
   assert.equal(status.capabilities.polls, true);
   assert.equal(status.capabilities.pollCaptionControl, true);
   assert.equal(status.capabilities.pollVoting, true);
+  assert.equal(status.capabilities.customEmojiTapbacks, true);
   assert.equal(status.capabilities.typing, true);
   assert.equal(status.capabilities.readReceipts, true);
   assert.equal(status.capabilities.edits, true);
@@ -245,16 +247,17 @@ test("sends rich text, native polls, votes, tapbacks, typing, read receipts, and
   const poll = await client.sendPoll({ chat_id: 42, question: "Dinner?", options: ["Pizza", "Sushi"], sendCaption: false });
   const vote = await client.votePoll({ chat_id: 42, poll_guid: "POLL", option_id: "PIZZA" });
   const reaction = await client.tapback({ chat_id: 42, message_guid: "MESSAGE", reaction: "love" });
+  const customReaction = await client.tapback({ chat_id: 42, message_guid: "MESSAGE", reaction: "🔕", remove: true });
   const typing = await client.setTyping({ chat_id: 42 }, true);
   const read = await client.markRead({ chat_id: 42 });
   const status = await client.sendStatus("MESSAGE");
   const edit = await client.editMessage({ chat_id: 42, message_guid: "MESSAGE", text: "Revised", part_index: 0 });
   const unsend = await client.unsendMessage({ chat_id: 42, message_guid: "MESSAGE", part_index: 0 });
 
-  assert.ok([rich, reply, attachment, link, poll, vote, reaction, typing, read, status, edit, unsend].every((result) => result.classification === "accepted"));
+  assert.ok([rich, reply, attachment, link, poll, vote, reaction, customReaction, typing, read, status, edit, unsend].every((result) => result.classification === "accepted"));
   assert.deepEqual(
     child.requests.map((request) => request.method),
-    ["chats.list", "send.rich", "send.rich", "send.attachment", "send.rich", "poll.send", "poll.vote", "tapback", "typing", "read", "message.send_status", "message.edit", "message.unsend"],
+    ["chats.list", "send.rich", "send.rich", "send.attachment", "send.rich", "poll.send", "poll.vote", "tapback", "tapback", "typing", "read", "message.send_status", "message.edit", "message.unsend"],
   );
   assert.deepEqual(child.requests[1].params.text_formatting, [{ start: 0, length: 5, styles: ["bold"] }]);
   assert.equal(child.requests[2].params.reply_to, "PARENT");
@@ -266,8 +269,9 @@ test("sends rich text, native polls, votes, tapbacks, typing, read receipts, and
     options: ["Pizza", "Sushi"],
     send_caption: false,
   });
-  assert.deepEqual(child.requests[11].params, { chat_id: 42, message_guid: "MESSAGE", text: "Revised", part_index: 0 });
-  assert.deepEqual(child.requests[12].params, { chat_id: 42, message_guid: "MESSAGE", part_index: 0 });
+  assert.deepEqual(child.requests[8].params, { chat_id: 42, message_guid: "MESSAGE", reaction: "🔕", remove: true });
+  assert.deepEqual(child.requests[12].params, { chat_id: 42, message_guid: "MESSAGE", text: "Revised", part_index: 0 });
+  assert.deepEqual(child.requests[13].params, { chat_id: 42, message_guid: "MESSAGE", part_index: 0 });
   await client.stop();
 });
 

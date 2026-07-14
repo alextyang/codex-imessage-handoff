@@ -10,6 +10,7 @@ export interface ThreadLabel {
   activityAt?: string | null;
   stateSince?: string | null;
   reasoningEffort?: string | null;
+  reasoningSource?: "task-override" | "service-default" | "codex-task" | "codex-default" | string | null;
   pendingCount?: number;
   turnCount?: number;
   turnCountLowerBound?: boolean;
@@ -398,30 +399,49 @@ export function renderThreadMenu(items: MenuItem[], options: { label?: "THREADS"
 
 export function renderHelp(_options: PresentationOptions = {}) {
   return [
-    "**Browse**\n/threads · Tasks by project\n/refresh · Refresh the task list\n/search (query) · Find a task\n/projects · Browse all projects",
-    "**Task commands**\n/thread · Status and latest response\n/turn · Show current or last turn\n/history (length) · Completed turn history\n/reasoning (level/none) · View or change reasoning\n/listen · Stream the next turn’s live updates\n/link · Show the Codex task link\n/mute · Pause automatic updates\n/unmute · Resume automatic updates\n/cancel · Stop iMessage-started work in this task\n/retry · Retry failed iMessage-started work\n/dismiss · Remove failed work from the queue",
+    "**Browse**\n/new (message) · Start a task\n/threads · Tasks by project\n/refresh · Refresh the task list\n/search (query) · Find a task\n/projects · Browse all projects",
+    "**Task controls**\n👍 add/remove · Listen for the next turn’s live updates\n👎 add/remove · Mute or unmute automatic updates\n❓ add · Show status, current turn, and recent history\n/thread · Status and latest response\n/turn · Show current or last turn\n/history (length) · Completed turn history\n/reasoning (level/none) · View or change reasoning\n/link · Show the Codex task link\n/cancel · Stop iMessage-started work in this task\n/retry · Retry failed iMessage-started work\n/dismiss · Remove failed work from the queue",
+    "**Settings**\n/defaultreasoning (level/none) · View or change default reasoning",
   ].join("\n\n");
 }
 
-function reasoningName(value: unknown) {
+const REASONING_DISPLAY: Record<string, { emoji: string; label: string }> = {
+  low: { emoji: "🪶", label: "Low" },
+  medium: { emoji: "⚙️", label: "Medium" },
+  high: { emoji: "🔍", label: "High" },
+  xhigh: { emoji: "🔬", label: "Extra high" },
+  max: { emoji: "🧠", label: "Max" },
+  ultra: { emoji: "🚀", label: "Ultra" },
+};
+
+export function reasoningDisplay(value: unknown) {
   const text = cleanLine(value, "").toLowerCase();
-  if (!text || text === "default") return "none";
-  if (text === "xhigh") return "xhigh";
-  return text;
+  if (!text || text === "default" || text === "none") return { value: "none", emoji: "↩️", label: "Inherit" };
+  return { value: text, ...(REASONING_DISPLAY[text] || { emoji: "🧠", label: text }) };
 }
 
 export function renderThreadHeader(thread: ThreadLabel, now: string | Date | number = new Date()) {
   const status = directoryStatus(thread, now);
-  const reasoning = thread.reasoningEffort ? `Reasoning: ${reasoningName(thread.reasoningEffort)}` : null;
+  const reasoningValue = reasoningDisplay(thread.reasoningEffort);
+  const sourceLabels: Record<string, string> = {
+    "task-override": "task override",
+    "service-default": "service default",
+    "codex-task": "Codex task",
+    "codex-default": "Codex default",
+  };
+  const reasoningSource = sourceLabels[String(thread.reasoningSource || "")]
+    || (thread.reasoningEffort ? "" : "Codex default");
+  const reasoning = thread.reasoningEffort
+    ? `${reasoningValue.emoji} Reasoning: ${reasoningValue.label}${reasoningSource ? ` · ${reasoningSource}` : ""}`
+    : `↩️ Reasoning: Codex default`;
   const updates = thread.muted ? "Updates: muted" : null;
   const listening = thread.listening ? "Listening: next turn" : null;
   const link = thread.id ? `codex://threads/${encodeURIComponent(thread.id)}` : null;
-  const updateCommand = thread.muted ? "/unmute" : "/mute";
   return [
     styledThreadTitle(thread, true),
     [status, reasoning, updates, listening].filter(Boolean).join("\n"),
     link,
-    `/listen · /link · ${updateCommand}\n/turn · /history · /reasoning · /cancel`,
+    `👍 listen · 👎 mute · ❓ status + history\n/link · /cancel`,
   ].filter(Boolean).join("\n\n");
 }
 
@@ -511,15 +531,17 @@ export function renderOutboundEvent(event: OutboundEvent, options: PresentationO
     }
     const optionsList = event.options.map((option) => typeof option === "string" ? { value: option } : option);
     const selected = optionsList.find((option) => option.selected);
-    const selectedName = reasoningName(selected?.value || event.current);
+    const selectedDisplay = reasoningDisplay(selected?.value || event.current);
     if (event.changed) {
-      const message = selectedName === "none" ? "Reasoning override removed." : `Reasoning set to ${bold(selectedName, "none")}.`;
+      const message = selectedDisplay.value === "none"
+        ? "Reasoning override removed."
+        : `Reasoning set to ${selectedDisplay.emoji} ${bold(selectedDisplay.label, "Inherit")}.`;
       body = `${message}${event.note ? `\n\n${safeBody(event.note)}` : ""}`;
       return `${part}${scopedBody(event.thread, body, activeThread)}`;
     }
     const rows = optionsList.map((option) => {
-      const name = reasoningName(option.value);
-      return `${option.selected ? "●" : "○"} ${name}${option.selected ? " · selected" : ""}`;
+      const display = reasoningDisplay(option.value);
+      return `${option.selected ? "●" : "○"} ${display.emoji} ${display.label}${option.selected ? " · selected" : ""}`;
     });
     body = `**Reasoning**\n${rows.join("\n")}\n\n/reasoning (level/none)`;
     return `${part}${scopedBody(event.thread, body, activeThread)}`;
@@ -549,6 +571,6 @@ export function parseMenuSelection(value: string) {
 
 export function parseSlashCommand(value: string) {
   const text = value.trim();
-  const match = text.match(/^\/(threads|recent|refresh|projects|search|thread|request|message|turn|history|reasoning|listen|link|mute|unmute|status|retry|dismiss|cancel|help)(?:\s+([\s\S]+))?$/i);
+  const match = text.match(/^\/(new|threads|recent|refresh|projects|search|thread|request|message|turn|history|reasoning|defaultreasoning|listen|link|mute|unmute|status|retry|dismiss|cancel|help)(?:\s+([\s\S]+))?$/i);
   return match ? { command: match[1].toLowerCase(), argument: match[2]?.trim() || null } : null;
 }

@@ -24,7 +24,7 @@ import os from "node:os";
 import path from "node:path";
 import { ImsgClient, REQUIRED_PINNED_IMSG_CAPABILITIES } from "./imsg-client.mjs";
 import { safeImsgFailureDetails } from "./imsg-rpc-diagnostics.mjs";
-import { inspectLocalImsgChat } from "./imsg-chat.mjs";
+import { inspectLocalImsgChat, inspectLocalImsgMessage } from "./imsg-chat.mjs";
 import {
   IMSG_IPC_ATTACHMENT_CHUNK_BYTES,
   IMSG_IPC_MAX_FRAME_BYTES,
@@ -84,6 +84,7 @@ class SupervisedImsgClient extends ImsgClient {
 
 const TARGET_METHODS = new Set([
   "latestMessage",
+  "message.authorize",
   "sendRich",
   "sendPoll",
   "sendPollVote",
@@ -311,6 +312,11 @@ export class ImsgHelperServer {
     }
     this.client = options.client || new SupervisedImsgClient({ binary: this.profile.binary, logger: options.logger });
     this.inspectChat = options.inspectChat || ((profile) => inspectLocalImsgChat({ binary: profile.binary, chatId: profile.chatId }));
+    this.inspectMessage = options.inspectMessage || ((profile, messageGuidValue) => inspectLocalImsgMessage({
+      chatId: profile.chatId,
+      messageGuid: messageGuidValue,
+      ...(options.messagesDatabase ? { database: options.messagesDatabase } : {}),
+    }));
     this.inspectIdentity = options.inspectIdentity || ((profile) => inspectLocalImsgIdentity({ binary: profile.binary }));
     this.expectedControllerIdentityHash = clean(options.expectedControllerIdentityHash).toLowerCase();
     this.maxFrameBytes = options.maxFrameBytes || IMSG_IPC_MAX_FRAME_BYTES;
@@ -880,6 +886,7 @@ export class ImsgHelperServer {
         this.#registerAllowedAttachments(state, message);
         return message;
       }
+      case "message.authorize": return this.#authorizeMessageGuid(state, params);
       case "client.start": return this.#startClient();
       case "client.stop": return this.#stopClient(state);
       case "watch.subscribe": return this.#subscribeWatch(state, params);
@@ -903,6 +910,51 @@ export class ImsgHelperServer {
       case "upload.release": return { released: this.#releaseUpload(state, clean(params.handle)) };
       default: throw codedError("IMSG_IPC_METHOD_NOT_ALLOWED", "The requested Messages helper method is not allowed.");
     }
+  }
+
+  async #authorizeMessageGuid(state, params) {
+    const guid = referencedGuid("tapback", params);
+    if (!guid || Buffer.byteLength(guid, "utf8") > 4096) {
+      throw codedError("IMSG_MESSAGE_INVALID", "A valid Messages item is required.");
+    }
+    if (state.allowedMessageGuids.has(guid)) {
+      return { classification: "accepted", accepted: true, authorized: true, terminal: false };
+    }
+    const operationId = clean(params?.operation_id ?? params?.operationId);
+    if (operationId) {
+      if (!validOperationId(operationId)) {
+        throw codedError("IMSG_IPC_OPERATION_INVALID", "The Messages operation id is invalid.");
+      }
+      // An accepted mutation is persisted before the controller sees it. If
+      // its response was lost, let the controller replay that same operation
+      // to recover the durable result without granting this connection a new
+      // message capability or requiring the now-deleted target to exist.
+      if (this.#readOperationResult(operationId)) {
+        return {
+          classification: "accepted",
+          accepted: true,
+          authorized: false,
+          recoveredOperation: true,
+          terminal: false,
+        };
+      }
+    }
+    const inspected = await this.inspectMessage(this.profile, guid);
+    if (!inspected) {
+      return {
+        classification: "terminal",
+        accepted: false,
+        authorized: false,
+        terminal: true,
+        retrySafe: false,
+        reason: "message-not-found",
+      };
+    }
+    if (messageGuid(inspected) !== guid || !validateWatchMessage(inspected, this.profile)) {
+      throw codedError("IMSG_MESSAGE_NOT_ALLOWED", "The message is not known to belong to the configured chat.");
+    }
+    this.#registerMessageGuid(state, inspected);
+    return { classification: "accepted", accepted: true, authorized: true, terminal: false };
   }
 
   async #subscribeWatch(state, params) {

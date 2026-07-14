@@ -5,11 +5,11 @@ import os from "node:os";
 import path from "node:path";
 import { LocalConversationRouter } from "../src/local-conversation-router.mjs";
 
-function fixture() {
+function fixture(options = {}) {
   const directory = mkdtempSync(path.join(os.tmpdir(), "imsg-router-"));
   const stateFile = path.join(directory, "state.json");
   let now = Date.parse("2026-07-12T12:00:00.000Z");
-  const router = new LocalConversationRouter({ stateFile, now: () => now });
+  const router = new LocalConversationRouter({ stateFile, now: () => now, ...options });
   return { router, stateFile, advance: (milliseconds) => { now += milliseconds; } };
 }
 
@@ -46,6 +46,65 @@ test("persists a prompt before acknowledgement and resumes it after restart", ()
   assert.equal(resumed.ingest(message(10, "Run the tests.")), null);
 });
 
+test("a newly created task can become the durable default without opening a selection pause", () => {
+  const { router, stateFile } = fixture();
+  router.setAwaitingPrompt("thread-old");
+  router.clearAwaitingPrompt("thread-old");
+
+  assert.equal(router.setDefaultThread("thread-new", "2026-07-12T12:00:01.000Z"), true);
+  assert.equal(router.awaitingPrompt, null);
+  assert.equal(router.lastUserThreadId, "thread-new");
+
+  const resumed = new LocalConversationRouter({
+    stateFile,
+    now: () => Date.parse("2026-07-12T12:00:01.000Z"),
+  });
+  assert.equal(resumed.lastUserThreadId, "thread-new");
+  assert.equal(resumed.recentDefaultThreadId, "thread-new");
+  const action = resumed.ingest(message(11, "Continue the new task.", {
+    createdAt: "2026-07-12T12:00:02.000Z",
+  }));
+  assert.equal(action.kind, "prompt");
+  assert.equal(action.threadId, "thread-new");
+});
+
+test("atomically acknowledges an action with a durable deterministic confirmation", () => {
+  const { router, stateFile } = fixture();
+  router.setActiveThread("thread-a");
+  const inbound = message(10_001, "/mute");
+  const action = router.ingest(inbound);
+
+  assert.equal(router.acknowledgeWithConfirmation(action.messageKey, {
+    messageGuid: action.guid,
+    reaction: "🔕",
+  }), true);
+  assert.deepEqual(router.pendingActions(), []);
+  const [confirmation] = router.pendingConfirmations();
+  assert.deepEqual({
+    messageKey: confirmation.messageKey,
+    messageGuid: confirmation.messageGuid,
+    reaction: confirmation.reaction,
+    remove: confirmation.remove,
+  }, {
+    messageKey: "guid-10001",
+    messageGuid: "guid-10001",
+    reaction: "🔕",
+    remove: false,
+  });
+  assert.match(confirmation.operationId, /^confirmation:[a-f0-9]{64}$/);
+
+  const resumed = new LocalConversationRouter({
+    stateFile,
+    now: () => Date.parse("2026-07-12T12:00:00.000Z"),
+  });
+  assert.deepEqual(resumed.pendingActions(), []);
+  assert.deepEqual(resumed.pendingConfirmations(), [confirmation]);
+  assert.equal(resumed.ingest(inbound), null, "the accepted command must never replay while confirmation is pending");
+  assert.equal(resumed.completeConfirmation("confirmation:missing"), false);
+  assert.equal(resumed.completeConfirmation(confirmation.operationId), true);
+  assert.deepEqual(new LocalConversationRouter({ stateFile }).pendingConfirmations(), []);
+});
+
 test("routes slash commands, numeric selections, project selections, and direct prompts", () => {
   const { router } = fixture();
   router.setMenu(["thread:thread-b", "project:project-c"]);
@@ -69,6 +128,9 @@ test("routes slash commands, numeric selections, project selections, and direct 
   assert.equal(router.ingest(message(3, "2")).projectKey, "project-c");
   assert.equal(router.ingest(message(4, "/projects")).kind, "projects");
   assert.equal(router.ingest(message(5, "/search formatting")).argument, "formatting");
+  const create = router.ingest(message(5_001, "/new Build this"));
+  assert.deepEqual({ kind: create.kind, argument: create.argument }, { kind: "new", argument: "Build this" });
+  assert.equal(router.ingest(message(5_002, "/defaultreasoning high")).kind, "defaultreasoning");
 });
 
 test("menu references remain selectable after service restart", () => {
@@ -734,19 +796,110 @@ test("expired and out-of-range snapshots fail closed", () => {
   assert.equal(router.ingest(message(41, "1")).kind, "stale-menu");
 });
 
-test("reaction rows are durably discarded without creating user activity or work", () => {
+test("reaction add/remove events become durable task controls and preserve the reply root", () => {
   const { router, stateFile } = fixture();
-  router.setActiveThread("thread-a");
-  assert.equal(router.ingest(message(50, "Liked", { is_reaction: true })), null);
-  assert.equal(router.lastRowId, 50);
+  router.routeOutboundGuid("root-a", "thread-a", { root: true });
+
+  const listenOn = router.ingest(message(50, "Liked", {
+    is_reaction: true,
+    reaction_type: "like",
+    is_reaction_add: true,
+    reacted_to_guid: "root-a",
+  }));
+  assert.deepEqual(listenOn, {
+    kind: "reaction-control",
+    messageKey: "guid-50",
+    threadId: "thread-a",
+    command: "listen",
+    guid: "guid-50",
+    createdAt: "2026-07-12T12:00:00.000Z",
+    enabled: true,
+  });
+  assert.equal(router.lastUserThreadId, "thread-a");
+  assert.equal(router.lastUserMessageAt, "2026-07-12T12:00:00.000Z");
+  assert.equal(router.nativeThread("thread-a").rootGuid, "root-a");
+  assert.equal(router.nativeThread("thread-a").latestGuid, "root-a");
+
+  const resumed = new LocalConversationRouter({ stateFile });
+  assert.deepEqual(resumed.pendingActions(), [listenOn]);
+  assert.equal(resumed.acknowledge(listenOn.messageKey), true);
+  const listenOff = resumed.ingest(message(51, "Removed a like", {
+    isReaction: true,
+    reactionType: "LIKE",
+    isReactionAdd: false,
+    reactedToGuid: "root-a",
+  }));
+  assert.equal(listenOff.kind, "reaction-control");
+  assert.equal(listenOff.command, "listen");
+  assert.equal(listenOff.enabled, false);
+  assert.equal(listenOff.threadId, "thread-a");
+  assert.equal(new LocalConversationRouter({ stateFile }).pendingActions()[0].enabled, false);
+});
+
+test("dislike and question reactions map to mute, unmute, and inspect", () => {
+  const { router } = fixture();
+  router.routeOutboundGuid("root-a", "thread-a", { root: true });
+  const reaction = (id, reactionType, isReactionAdd) => router.ingest(message(id, "reaction", {
+    is_reaction: true,
+    reaction_type: reactionType,
+    is_reaction_add: isReactionAdd,
+    reacted_to_guid: "root-a",
+  }));
+
+  const mute = reaction(52, "dislike", true);
+  assert.deepEqual({ kind: mute.kind, command: mute.command, threadId: mute.threadId }, {
+    kind: "reaction-control",
+    command: "mute",
+    threadId: "thread-a",
+  });
+  router.acknowledge(mute.messageKey);
+  const unmute = reaction(53, "dislike", false);
+  assert.equal(unmute.command, "unmute");
+  router.acknowledge(unmute.messageKey);
+  const inspect = reaction(54, "question", true);
+  assert.equal(inspect.command, "inspect");
+});
+
+test("question removal, unsupported, unmapped, malformed, and ambiguous reactions fail closed", () => {
+  const { router, stateFile } = fixture();
+  router.routeOutboundGuid("root-a", "thread-a", { root: true });
+  router.routeOutboundGuid("ambiguous-root", "thread-a", { root: true });
+  router.routeOutboundGuid("ambiguous-root", "thread-b", { root: true });
+  const reaction = (id, extras) => message(id, "reaction", { is_reaction: true, ...extras });
+
+  assert.equal(router.ingest(reaction(55, {
+    reaction_type: "question",
+    is_reaction_add: false,
+    reacted_to_guid: "root-a",
+  })), null);
+  assert.equal(router.ingest(reaction(56, {
+    reaction_type: "love",
+    is_reaction_add: true,
+    reacted_to_guid: "root-a",
+  })), null);
+  assert.equal(router.ingest(reaction(57, {
+    reaction_type: "like",
+    is_reaction_add: true,
+    reacted_to_guid: "unknown-root",
+  })), null);
+  assert.equal(router.ingest(reaction(58, {
+    reaction_type: "like",
+    reacted_to_guid: "root-a",
+  })), null);
+  assert.equal(router.ingest(reaction(59, {
+    reaction_type: "like",
+    is_reaction_add: true,
+    reacted_to_guid: "ambiguous-root",
+  })), null);
+  assert.equal(router.lastRowId, 59);
   assert.equal(router.lastUserMessageAt, null);
   assert.deepEqual(router.pendingActions(), []);
   const resumed = new LocalConversationRouter({ stateFile });
-  assert.equal(resumed.ingest(message(50, "Liked", { is_reaction: true })), null);
-  assert.equal(resumed.lastRowId, 50);
-  router.ingest(message(51, "Hello"));
-  assert.equal(router.lastRowId, 51);
-  assert.equal(router.lastUserMessageAt, "2026-07-12T12:00:00.000Z");
+  assert.equal(resumed.ingest(reaction(59, {
+    reaction_type: "like",
+    is_reaction_add: true,
+    reacted_to_guid: "ambiguous-root",
+  })), null);
 });
 
 test("discard persists a synthetic inbound cursor without creating activity or work", () => {
@@ -1019,8 +1172,8 @@ test("structured poll actions support projects, task selection, pages, and comma
   });
 });
 
-test("all task commands require native reply context or a picker", () => {
-  const { router } = fixture();
+test("task commands prefer native reply then recent default context before a picker", () => {
+  const { router, advance } = fixture();
   router.routeOutboundGuid("root-a", "thread-a");
 
   const listen = router.ingest(message(90, "/listen", {
@@ -1032,24 +1185,56 @@ test("all task commands require native reply context or a picker", () => {
   assert.equal(listen.threadId, "thread-a");
   router.acknowledge(listen.messageKey);
 
-  const mutePicker = router.ingest(message(91, "/mute"));
+  const mute = router.ingest(message(91, "/mute"));
+  assert.equal(mute.kind, "control");
+  assert.equal(mute.command, "mute");
+  assert.equal(mute.threadId, "thread-a");
+  router.acknowledge(mute.messageKey);
+
+  advance(5 * 60 * 1000 + 1);
+  const mutePicker = router.ingest(message(92, "/unmute"));
   assert.equal(mutePicker.kind, "thread-picker");
-  assert.equal(mutePicker.command, "mute");
+  assert.equal(mutePicker.command, "unmute");
   assert.equal(mutePicker.threadId, undefined);
   router.acknowledge(mutePicker.messageKey);
 
-  const unmute = router.ingest(message(92, "/unmute", { thread_originator_guid: "root-a" }));
+  const unmute = router.ingest(message(93, "/unmute", { thread_originator_guid: "root-a" }));
   assert.equal(unmute.kind, "control");
   assert.equal(unmute.command, "unmute");
   assert.equal(unmute.threadId, "thread-a");
+  router.acknowledge(unmute.messageKey);
 
-  let id = 93;
+  let id = 94;
   for (const command of ["thread", "request", "message", "turn", "history", "reasoning", "retry", "dismiss", "cancel", "link"]) {
     const action = router.ingest(message(id++, `/${command}`));
     assert.equal(action.kind, "thread-picker", command);
     assert.equal(action.command, command);
     router.acknowledge(action.messageKey);
   }
+});
+
+test("command default context has an inclusive configurable TTL while ordinary prompts remain indefinite", () => {
+  const { router, advance } = fixture({ commandContextTtlMs: 1_000 });
+  router.routeOutboundGuid("root-a", "thread-a", { root: true });
+  const seed = router.ingest(message(120, "Work here.", { thread_originator_guid: "root-a" }));
+  router.acknowledge(seed.messageKey);
+
+  advance(1_000);
+  const atBoundary = router.ingest(message(121, "/thread"));
+  assert.equal(atBoundary.kind, "control");
+  assert.equal(atBoundary.threadId, "thread-a");
+  router.acknowledge(atBoundary.messageKey);
+
+  advance(1);
+  const expired = router.ingest(message(122, "/history"));
+  assert.equal(expired.kind, "thread-picker");
+  assert.equal(expired.threadId, undefined);
+  router.acknowledge(expired.messageKey);
+
+  advance(60 * 60 * 1000);
+  const prompt = router.ingest(message(123, "Continue despite the old context."));
+  assert.equal(prompt.kind, "prompt");
+  assert.equal(prompt.threadId, "thread-a");
 });
 
 test("awaiting-prompt pause is task-local, expiring, and explicitly clearable", () => {
@@ -1131,4 +1316,87 @@ test("v5 state persists the last user task independently from background activit
   assert.equal(resumed.lastUserThreadId, "thread-a");
   assert.equal(resumed.mostRecentThreadId, "thread-b");
   assert.equal(JSON.parse(readFileSync(stateFile, "utf8")).version, 5);
+});
+
+test("new-task and default-reasoning commands stay global inside and outside native replies", () => {
+  const { router } = fixture();
+  router.routeOutboundGuid("root-a", "thread-a", { root: true });
+  const topLevel = router.ingest(message(9_000, "/new Build a new task."));
+  assert.equal(topLevel.kind, "new");
+  assert.equal(topLevel.argument, "Build a new task.");
+  assert.equal(topLevel.threadId, undefined);
+  router.acknowledge(topLevel.messageKey);
+
+  const replied = router.ingest(message(9_001, "/defaultreasoning high", {
+    thread_originator_guid: "root-a",
+  }));
+  assert.equal(replied.kind, "defaultreasoning");
+  assert.equal(replied.argument, "high");
+  assert.equal(replied.threadId, undefined);
+});
+
+test("new-task project and reasoning polls persist and Add Choice becomes project search", () => {
+  const { router, stateFile } = fixture();
+  router.registerPoll("project-poll", {
+    "project-option": { kind: "new-project", flowId: "flow-a", projectKey: "project-a" },
+  }, {
+    allowAddedChoiceSearch: true,
+    addedChoiceAction: { kind: "new-project-search", flowId: "flow-a" },
+    knownOptionIds: ["project-option"],
+    optionLabels: { "project-option": "Messaging" },
+  });
+  const resumed = new LocalConversationRouter({ stateFile, now: () => Date.parse("2026-07-12T12:00:00.000Z") });
+  const vote = resumed.ingest(message(9_010, "", {
+    poll: { kind: "vote", original_guid: "project-poll", vote: { option_id: "project-option" } },
+  }));
+  assert.deepEqual({ kind: vote.kind, flowId: vote.flowId, projectKey: vote.projectKey }, {
+    kind: "new-project",
+    flowId: "flow-a",
+    projectKey: "project-a",
+  });
+  resumed.acknowledge(vote.messageKey);
+
+  const added = resumed.ingest(message(9_011, "", {
+    poll: {
+      kind: "created",
+      original_guid: "project-poll",
+      options_diff: [{ id: "added-option", text: "Release tooling" }],
+    },
+  }));
+  assert.deepEqual({ kind: added.kind, flowId: added.flowId, argument: added.argument }, {
+    kind: "new-project-search",
+    flowId: "flow-a",
+    argument: "Release tooling",
+  });
+});
+
+test("new-task prompt lease lasts 120 seconds, yields to explicit replies, and cancels atomically", () => {
+  const { router, advance } = fixture();
+  router.routeOutboundGuid("root-a", "thread-a", { root: true });
+  assert.equal(router.setAwaitingNewPrompt("flow-a"), true);
+  const explicit = router.ingest(message(9_020, "Keep working in A.", { thread_originator_guid: "root-a" }));
+  assert.equal(explicit.kind, "prompt");
+  assert.equal(explicit.threadId, "thread-a");
+  assert.equal(router.awaitingNewPrompt.flowId, "flow-a");
+  router.acknowledge(explicit.messageKey);
+
+  const first = router.ingest(message(9_021, "Create the new task."));
+  assert.equal(first.kind, "new-prompt");
+  assert.equal(first.flowId, "flow-a");
+  assert.equal(router.awaitingNewPrompt, null);
+  router.acknowledge(first.messageKey);
+
+  router.setAwaitingNewPrompt("flow-b");
+  const cancel = router.ingest(message(9_022, "/cancel"));
+  assert.equal(cancel.kind, "new-cancel");
+  assert.equal(cancel.flowId, "flow-b");
+  assert.equal(router.awaitingNewPrompt, null);
+  router.acknowledge(cancel.messageKey);
+
+  router.setAwaitingNewPrompt("flow-c");
+  advance(120_001);
+  assert.equal(router.awaitingNewPrompt, null);
+  const afterExpiry = router.ingest(message(9_023, "Continue the old default."));
+  assert.equal(afterExpiry.kind, "prompt");
+  assert.equal(afterExpiry.threadId, "thread-a");
 });
