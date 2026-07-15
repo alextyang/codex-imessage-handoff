@@ -4,7 +4,9 @@ import { appendFileSync, mkdtempSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import {
+  assertClaimedThreadUnchanged,
   assertThreadReadyForIMessageRun,
+  captureThreadRunCheckpoint,
   getHistory,
   getLatestRequest,
   getThreadDetail,
@@ -127,6 +129,7 @@ test("automatic continuation starts retain the logical request and visible messa
   const lines = [
     record("2026-07-12T04:00:00.000Z", "event_msg", { type: "task_started", turn_id: "backend-1" }),
     message("2026-07-12T04:00:00.010Z", "user", "backend-1", "Complete the whole migration."),
+    record("2026-07-12T04:00:00.020Z", "event_msg", { type: "user_message", client_id: "logical-client", message: "Complete the whole migration." }),
     record("2026-07-12T04:00:01.000Z", "event_msg", { type: "agent_message", message: "Migration applied.", phase: "commentary" }),
     record("2026-07-12T04:01:00.000Z", "event_msg", { type: "task_started", turn_id: "backend-2" }),
     record("2026-07-12T04:01:01.000Z", "event_msg", { type: "agent_message", message: "Verifying the service.", phase: "commentary" }),
@@ -135,7 +138,59 @@ test("automatic continuation starts retain the logical request and visible messa
   const turn = getTurn(rollout);
   assert.equal(turn.id, "backend-2");
   assert.equal(turn.request, "Complete the whole migration.");
+  assert.equal(turn.clientUserMessageId, "logical-client");
   assert.deepEqual(turn.commentary, ["Migration applied.", "Verifying the service."]);
+});
+
+test("claimed task checkpoints allow service predecessors but reject intervening local turns", () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "imessage-thread-claim-checkpoint-"));
+  const rollout = path.join(directory, "rollout.jsonl");
+  const baseline = [
+    record("2026-07-12T04:30:00.000Z", "event_msg", { type: "task_started", turn_id: "baseline" }),
+    record("2026-07-12T04:30:01.000Z", "event_msg", { type: "task_complete", turn_id: "baseline" }),
+  ];
+  writeFileSync(rollout, `${baseline.join("\n")}\n`, "utf8");
+  const checkpoint = captureThreadRunCheckpoint(rollout, "2026-07-12T04:31:00.000Z");
+  assert.equal(checkpoint.turnId, "baseline");
+
+  const predecessor = [
+    record("2026-07-12T04:32:00.000Z", "event_msg", { type: "task_started", turn_id: "predecessor" }),
+    record("2026-07-12T04:32:00.010Z", "event_msg", { type: "user_message", client_id: "service-predecessor", message: "Earlier queued work" }),
+    record("2026-07-12T04:32:01.000Z", "event_msg", { type: "task_complete", turn_id: "predecessor" }),
+  ];
+  appendFileSync(rollout, `${predecessor.join("\n")}\n`, "utf8");
+  const event = {
+    queuedAt: "2026-07-12T04:31:00.000Z",
+    clientUserMessageId: "service-current",
+    predecessorClientUserMessageIds: ["service-predecessor"],
+    threadCheckpoint: checkpoint,
+  };
+  assert.doesNotThrow(() => assertClaimedThreadUnchanged(rollout, event));
+
+  const local = [
+    record("2026-07-12T04:33:00.000Z", "event_msg", { type: "task_started", turn_id: "local-newer" }),
+    record("2026-07-12T04:33:00.010Z", "event_msg", { type: "user_message", client_id: "desktop-local", message: "Newer local work" }),
+  ];
+  appendFileSync(rollout, `${local.join("\n")}\n`, "utf8");
+  assert.throws(
+    () => assertClaimedThreadUnchanged(rollout, event),
+    (error) => error?.code === "STALE_THREAD_ADVANCED" && error?.currentTurnId === "local-newer",
+  );
+});
+
+test("legacy queued jobs fail closed when a newer turn started after their queue timestamp", () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "imessage-thread-legacy-claim-"));
+  const rollout = path.join(directory, "rollout.jsonl");
+  writeFileSync(rollout, [
+    record("2026-07-12T04:40:00.000Z", "event_msg", { type: "task_started", turn_id: "old" }),
+    record("2026-07-12T04:40:01.000Z", "event_msg", { type: "task_complete", turn_id: "old" }),
+    record("2026-07-12T04:42:00.000Z", "event_msg", { type: "task_started", turn_id: "new-local" }),
+    record("2026-07-12T04:42:00.010Z", "event_msg", { type: "user_message", client_id: "desktop-local", message: "Continued locally" }),
+  ].join("\n") + "\n", "utf8");
+  assert.throws(
+    () => assertClaimedThreadUnchanged(rollout, { queuedAt: "2026-07-12T04:41:00.000Z" }),
+    (error) => error?.code === "STALE_THREAD_ADVANCED" && error?.currentTurnId === "new-local",
+  );
 });
 
 test("state lookup expands its tail until it finds a long-running turn boundary", () => {

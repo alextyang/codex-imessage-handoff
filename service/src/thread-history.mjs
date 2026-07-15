@@ -230,6 +230,7 @@ function parseTurns(records, metadata = {}) {
       if (!turn) continue;
       if (previous && previous !== turn && previous.state === "running" && !turn.request) {
         turn.request = previous.request;
+        turn.clientUserMessageId = previous.clientUserMessageId;
         turn.assistantMessages = previous.assistantMessages.map((message) => ({ ...message }));
         turn.commentary = [...previous.commentary];
         turn.finalResponse = previous.finalResponse;
@@ -419,6 +420,75 @@ export function getThreadState(threadOrPath) {
     stateCache.set(cacheKey, state);
   }
   return state;
+}
+
+export function captureThreadRunCheckpoint(threadOrPath, capturedAt = new Date().toISOString()) {
+  const history = readThreadHistory(threadOrPath);
+  const latest = history.currentTurn || history.latestTurn;
+  return {
+    turnId: latest?.id || null,
+    activityAt: latest?.activityAt || latest?.completedAt || latest?.startedAt || null,
+    capturedAt: isoFrom(capturedAt) || new Date().toISOString(),
+  };
+}
+
+/**
+ * Permit same-task predecessors already durably owned by this service, but
+ * refuse to submit a queued prompt after any unrelated Codex turn advanced
+ * the task. This prevents delayed iMessage work from inverting conversation
+ * order after the user continues the task locally.
+ */
+export function assertClaimedThreadUnchanged(threadOrPath, event = {}) {
+  const history = readThreadHistory(threadOrPath);
+  const turns = Array.isArray(history.turns) ? history.turns : [];
+  const checkpoint = event.threadCheckpoint && typeof event.threadCheckpoint === "object"
+    ? event.threadCheckpoint
+    : null;
+  let candidates;
+  if (checkpoint) {
+    const baselineTurnId = typeof checkpoint.turnId === "string" ? checkpoint.turnId : null;
+    if (baselineTurnId) {
+      const index = turns.findIndex((turn) => turn.id === baselineTurnId);
+      if (index < 0) {
+        throw Object.assign(new Error("The claimed task checkpoint is no longer observable."), {
+          code: "STALE_THREAD_CHECKPOINT",
+        });
+      }
+      candidates = turns.slice(index + 1);
+    } else {
+      // No visible turn at admission means every turn now present is newer.
+      candidates = turns;
+    }
+  } else {
+    // Backward-compatible protection for jobs admitted before checkpoints
+    // existed. The durable queue time is the only safe baseline available.
+    const queuedAtMs = dateMs(event.queuedAt);
+    if (!Number.isFinite(queuedAtMs)) {
+      throw Object.assign(new Error("The claimed task checkpoint is unavailable."), {
+        code: "STALE_THREAD_CHECKPOINT",
+      });
+    }
+    candidates = turns.filter((turn) => {
+      const startedAtMs = dateMs(turn.startedAt);
+      return Number.isFinite(startedAtMs) && startedAtMs >= queuedAtMs - 1_000;
+    });
+  }
+
+  const ownClientId = typeof event.clientUserMessageId === "string" ? event.clientUserMessageId : null;
+  const permitted = new Set(Array.isArray(event.predecessorClientUserMessageIds)
+    ? event.predecessorClientUserMessageIds.filter((value) => typeof value === "string")
+    : []);
+  const foreign = candidates.find((turn) => (
+    !turn.clientUserMessageId
+    || (turn.clientUserMessageId !== ownClientId && !permitted.has(turn.clientUserMessageId))
+  ));
+  if (foreign) {
+    throw Object.assign(new Error("The task changed after this iMessage prompt was claimed."), {
+      code: "STALE_THREAD_ADVANCED",
+      currentTurnId: foreign.id || null,
+    });
+  }
+  return history;
 }
 
 /**

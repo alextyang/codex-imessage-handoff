@@ -1301,6 +1301,42 @@ test("runner-owned remote streams close after a completed turn", async () => {
   fixture.client.close();
 });
 
+test("a runtime-owned injected client closes and releases tracking after each runner operation", async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "imessage-app-server-injected-owned-"));
+  let closeCount = 0;
+  let released = 0;
+  const client = {
+    async startThread({ cwd, threadSource }) {
+      return {
+        thread: { id: "thread-injected", cwd },
+        cwd,
+        threadSource,
+      };
+    },
+    close() { closeCount += 1; },
+  };
+  const runner = new AppServerCodexRunner({
+    client,
+    ownsClient: true,
+    onClientClose(closedClient) {
+      assert.equal(closedClient, client);
+      released += 1;
+    },
+  });
+
+  const created = await runner.createThread({ cwd: directory, threadSource: "imessage-handoff:test" });
+  assert.equal(created.id, "thread-injected");
+  assert.equal(closeCount, 1);
+  assert.equal(released, 1);
+
+  await assert.rejects(
+    runner.createThread({ cwd: path.join(directory, "missing"), threadSource: "imessage-handoff:test" }),
+    (error) => error.code === "MISSING_CWD",
+  );
+  assert.equal(closeCount, 1, "an owned client is released only once");
+  assert.equal(released, 1);
+});
+
 test("runner bounds Remote Control initialization waits", async (t) => {
   const directory = mkdtempSync(path.join(os.tmpdir(), "imessage-app-server-timeout-"));
   const { runner } = testRunner(directory, "timeout", { requestTimeoutMs: 40 });

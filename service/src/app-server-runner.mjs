@@ -1233,7 +1233,8 @@ export class AppServerRpcClient {
 export class AppServerCodexRunner {
   constructor(options = {}) {
     this.client = options.client || new AppServerRpcClient(options);
-    this.ownsClient = !options.client;
+    this.ownsClient = options.ownsClient == null ? !options.client : Boolean(options.ownsClient);
+    this.onClientClose = typeof options.onClientClose === "function" ? options.onClientClose : null;
   }
 
   isRunning() {
@@ -1248,16 +1249,16 @@ export class AppServerCodexRunner {
     try {
       return await this.client.interruptTurn(threadId, turnId);
     } finally {
-      if (this.ownsClient) this.client.close();
+      this.#closeOwnedClient();
     }
   }
 
   async createThread({ cwd, threadSource } = {}) {
     const canonicalCwd = String(cwd || "").trim();
-    if (!canonicalCwd || !existsSync(canonicalCwd)) {
-      throw codedError("MISSING_CWD", "Thread working directory no longer exists.");
-    }
     try {
+      if (!canonicalCwd || !existsSync(canonicalCwd)) {
+        throw codedError("MISSING_CWD", "Thread working directory no longer exists.");
+      }
       const result = await this.client.startThread({ cwd: canonicalCwd, threadSource });
       return {
         ...result.thread,
@@ -1268,7 +1269,7 @@ export class AppServerCodexRunner {
         modelProvider: result.modelProvider || result.thread.modelProvider || null,
       };
     } finally {
-      if (this.ownsClient) this.client.close();
+      this.#closeOwnedClient();
     }
   }
 
@@ -1276,7 +1277,7 @@ export class AppServerCodexRunner {
     try {
       return await this.client.findTurnByClientUserMessageId(threadId, clientMessageId);
     } finally {
-      if (this.ownsClient) this.client.close();
+      this.#closeOwnedClient();
     }
   }
 
@@ -1295,9 +1296,9 @@ export class AppServerCodexRunner {
     onServerRequest,
     turnTimeoutMs,
   }) {
-    if (!existsSync(thread.cwd)) throw codedError("MISSING_CWD", "Thread working directory no longer exists.");
-    if (this.client.isRunning()) throw codedError("BUSY", "Another Codex run is active.");
     try {
+      if (!existsSync(thread.cwd)) throw codedError("MISSING_CWD", "Thread working directory no longer exists.");
+      if (this.client.isRunning()) throw codedError("BUSY", "Another Codex run is active.");
       return await this.client.runTurn({
         thread,
         prompt,
@@ -1314,7 +1315,17 @@ export class AppServerCodexRunner {
         turnTimeoutMs,
       });
     } finally {
-      if (this.ownsClient) this.client.close();
+      this.#closeOwnedClient();
+    }
+  }
+
+  #closeOwnedClient() {
+    if (!this.ownsClient) return;
+    this.ownsClient = false;
+    try {
+      this.client.close();
+    } finally {
+      this.onClientClose?.(this.client);
     }
   }
 }

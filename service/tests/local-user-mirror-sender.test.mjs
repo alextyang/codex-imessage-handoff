@@ -318,7 +318,7 @@ test("uses known roots to disambiguate direct chats and retains the pinned bindi
   assert.equal(fake.sendCalls()[0].params.chat_guid, CHAT_GUID);
 });
 
-test("discovers a synced header root and sends one formatted outgoing reply with an invisible marker", async () => {
+test("discovers a synced header root and sends one clean formatted outgoing reply", async () => {
   const fake = fakeImsg({
     history: [],
     search: [rootRow({
@@ -345,7 +345,12 @@ test("discovers a synced header root and sends one formatted outgoing reply with
   const token = localUserMirrorInternals.markerToken("delivery-one", THREAD_ID, 0);
   assert.equal(sentText.startsWith("Review app.js and run tests."), true);
   assert.equal(sentText.includes("/Users/alex/project/app.js:12"), false);
-  assert.equal(localUserMirrorInternals.containsMarker(sentText, token), true);
+  assert.equal(localUserMirrorInternals.containsMarker(sentText, token), false);
+  assert.equal([...sentText].some((character) => {
+    const code = character.codePointAt(0);
+    return code >= 0xe0000 && code <= 0xe007f;
+  }), false);
+  assert.equal(send.params.dd_scan, false);
   const formatting = send.params.text_formatting;
   assert.deepEqual(formatting, [
     { start: 7, length: 6, styles: ["bold"] },
@@ -364,6 +369,7 @@ test("discovers a synced header root and sends one formatted outgoing reply with
   const persisted = readFileSync(item.senderFile, "utf8");
   assert.equal(persisted.includes(body), false);
   assert.equal(persisted.includes("/Users/alex/project/app.js:12"), false);
+  assert.equal(Object.values(JSON.parse(persisted).deliveries)[0].wireMode, "plain");
 });
 
 test("never substitutes a different locally visible root for the expected task root", async () => {
@@ -461,12 +467,11 @@ test("an accepted sender journal repairs a fresh router ledger and GUID route wi
   });
   repairRouter.routeOutboundGuid(ROOT_GUID, THREAD_ID, { root: true });
   const reservationId = localUserMirrorInternals.deliveryKey("delivery-one", THREAD_ID, 0);
-  const token = localUserMirrorInternals.markerToken("delivery-one", THREAD_ID, 0);
-  const tagged = localUserMirrorInternals.taggedText("Run the complete test suite.", token);
+  const plain = "Run the complete test suite.";
   repairRouter.reserveUserMirrorEcho({
     reservationId,
     threadId: THREAD_ID,
-    text: tagged,
+    text: plain,
     rootGuid: ROOT_GUID,
   });
 
@@ -484,13 +489,13 @@ test("an accepted sender journal repairs a fresh router ledger and GUID route wi
   assert.equal(repairRouter.consumeUserMirrorEcho({
     id: 700,
     guid: "WRONG-GUID",
-    text: tagged,
+    text: plain,
     thread_originator_guid: ROOT_GUID,
   }), null);
   assert.equal(repairRouter.consumeUserMirrorEcho({
     id: 701,
     guid: "MIRROR-GUID-1",
-    text: tagged,
+    text: plain,
     thread_originator_guid: ROOT_GUID,
   }).expectedGuid, "MIRROR-GUID-1");
 });
@@ -526,11 +531,11 @@ test("changing conversation scope clears the pinned chat and accepted delivery j
   assert.equal(secondFake.sendCalls().length, 0);
 });
 
-test("an untagged genuine same-body message remains actionable while only the tagged mirror is suppressed", async () => {
-  let taggedText = null;
+test("a genuine same-body message remains actionable while only the exact mirror GUID is suppressed", async () => {
+  let mirrorText = null;
   const fake = fakeImsg({
     onSendRich: ({ params }) => {
-      taggedText = params.text;
+      mirrorText = params.text;
       return { ok: true, guid: "MIRROR-GUID" };
     },
   });
@@ -554,7 +559,7 @@ test("an untagged genuine same-body message remains actionable while only the ta
   const echo = item.router.consumeUserMirrorEcho({
     id: 502,
     guid: "MIRROR-GUID",
-    text: taggedText,
+    text: mirrorText,
     created_at: "2026-07-14T12:00:02.000Z",
     thread_originator_guid: ROOT_GUID,
   });
@@ -564,18 +569,21 @@ test("an untagged genuine same-body message remains actionable while only the ta
   assert.equal(item.router.nativeThread(THREAD_ID).latestGuid, "MIRROR-GUID");
 });
 
-test("suppresses a tagged receiver echo that arrives before the local send result", async () => {
+test("holds a clean receiver echo until the local send GUID is confirmed", async () => {
   let item;
-  let consumed;
+  let candidate;
   const fake = fakeImsg({
     onSendRich: ({ params }) => {
-      consumed = item.router.consumeUserMirrorEcho({
+      candidate = {
         id: 601,
         guid: "EARLY-ECHO-GUID",
         text: params.text,
         created_at: "2026-07-14T12:00:01.000Z",
         thread_originator_guid: ROOT_GUID,
-      });
+      };
+      assert.equal(item.router.consumeUserMirrorEcho(candidate), null);
+      assert.equal(item.router.isReservedUserMirrorEcho(candidate), false);
+      assert.equal(item.router.provisionalUserMirrorEcho(candidate).threadId, THREAD_ID);
       return { ok: true, guid: "EARLY-ECHO-GUID" };
     },
   });
@@ -583,8 +591,9 @@ test("suppresses a tagged receiver echo that arrives before the local send resul
   await initialize(item.sender);
   const result = await item.sender.sendMirror(mirror({ body: "Race the result" }));
   assert.equal(result.classification, "accepted");
+  const consumed = item.router.consumeUserMirrorEcho(candidate);
   assert.equal(consumed.threadId, THREAD_ID);
-  assert.equal(consumed.expectedGuid, null);
+  assert.equal(consumed.expectedGuid, "EARLY-ECHO-GUID");
   assert.equal(item.router.lastRowId, 601);
   assert.deepEqual(item.router.pendingActions(), []);
 });
@@ -620,7 +629,7 @@ test("a marker-normalized no-GUID response remains ambiguous and cannot promote 
       assert.equal(item.router.quarantineProvisionalUserMirrorEcho(candidate).guid, "NORMALIZED-NO-GUID");
       delivered = true;
       assert.equal(localUserMirrorInternals.containsMarker(params.text,
-        localUserMirrorInternals.markerToken("normalized-no-guid", THREAD_ID, 0)), true);
+        localUserMirrorInternals.markerToken("normalized-no-guid", THREAD_ID, 0)), false);
       return { ok: true, queued: true };
     },
   });
@@ -672,14 +681,14 @@ test("a nominal bridge acceptance remains ambiguous without exact local GUID and
     });
   }
 
-  await t.test("accepted GUID remains verifiable when Messages normalizes the marker", async () => {
+  await t.test("accepted GUID is rejected when its clean body does not match", async () => {
     const fake = fakeImsg({ sentRow: { text: "Normalized by Messages" } });
     const item = fixture({ fake, reconcileTimeoutMs: 1 });
     await initialize(item.sender);
 
     const result = await item.sender.sendMirror(mirror({ deliveryId: "normalized-marker" }));
-    assert.equal(result.classification, "accepted");
-    assert.deepEqual(result.guids, ["MIRROR-GUID-1"]);
+    assert.equal(result.classification, "ambiguous");
+    assert.deepEqual(result.guids, []);
     assert.equal(fake.sendCalls().length, 1);
   });
 });
@@ -722,7 +731,64 @@ test("an ambiguous attempted send never retries or permits helper fallback, incl
   assert.equal(fake.sendCalls().length, 1);
 });
 
-test("an unverified accepted GUID is journaled and later reconciles by exact GUID and root after marker normalization", async () => {
+test("a pre-upgrade tagged journal still reconciles without resending", async () => {
+  let legacyCommitted = false;
+  const deliveryId = "legacy-tagged-journal";
+  const token = localUserMirrorInternals.markerToken(deliveryId, THREAD_ID, 0);
+  const tagged = localUserMirrorInternals.taggedText("Legacy mirror", token);
+  const fake = fakeImsg({
+    history: () => legacyCommitted
+      ? [rootRow(), {
+        id: 8_001,
+        guid: "LEGACY-MIRROR-GUID",
+        chat_id: 42,
+        chat_guid: CHAT_GUID,
+        is_from_me: true,
+        text: tagged,
+        thread_originator_guid: ROOT_GUID,
+      }]
+      : [rootRow()],
+    onSendRich: () => { throw Object.assign(new Error("lost after write"), { attempted: true }); },
+  });
+  const item = fixture({ fake, reconcileTimeoutMs: 1 });
+  await initialize(item.sender);
+  const request = mirror({ deliveryId, body: "Legacy mirror" });
+  assert.equal((await item.sender.sendMirror(request)).classification, "ambiguous");
+  assert.equal(fake.sendCalls().length, 1);
+
+  const journal = JSON.parse(readFileSync(item.senderFile, "utf8"));
+  const [key] = Object.keys(journal.deliveries);
+  delete journal.deliveries[key].wireMode;
+  journal.deliveries[key].status = "attempting";
+  writeFileSync(item.senderFile, `${JSON.stringify(journal, null, 2)}\n`, { mode: 0o600 });
+  legacyCommitted = true;
+
+  const legacyRouter = new LocalConversationRouter({
+    stateFile: path.join(item.directory, "legacy-router.json"),
+    now: item.clock.now,
+  });
+  legacyRouter.routeOutboundGuid(ROOT_GUID, THREAD_ID, { root: true });
+  legacyRouter.reserveUserMirrorEcho({
+    reservationId: key,
+    threadId: THREAD_ID,
+    text: tagged,
+    rootGuid: ROOT_GUID,
+  });
+  const resumed = createSender({
+    stateFile: item.senderFile,
+    router: legacyRouter,
+    fake,
+    clock: item.clock,
+    reconcileTimeoutMs: 1,
+  });
+  await initialize(resumed);
+  const recovered = await resumed.sendMirror(request);
+  assert.equal(recovered.classification, "duplicate");
+  assert.deepEqual(recovered.guids, ["LEGACY-MIRROR-GUID"]);
+  assert.equal(fake.sendCalls().length, 1);
+});
+
+test("an unverified accepted GUID is later reconciled by exact GUID, body, and root", async () => {
   const firstFake = fakeImsg({
     sentRow: { thread_originator_guid: "WRONG-ROOT", reply_to_guid: "WRONG-ROOT" },
   });
@@ -743,7 +809,7 @@ test("an unverified accepted GUID is journaled and later reconciles by exact GUI
         chat_id: 42,
         chat_guid: CHAT_GUID,
         is_from_me: true,
-        text: "Marker normalized away",
+        text: "Delayed normalized mirror",
         thread_originator_guid: ROOT_GUID,
         reply_to_guid: ROOT_GUID,
       },
@@ -805,16 +871,15 @@ test("a crash-bound attempting entry never resends and unresolved ambiguity dead
   assert.equal(deadLetter.fallbackSafe, false);
   assert.equal(fake.sendCalls().length, 1);
 
-  const tagged = localUserMirrorInternals.taggedText(
-    "Potentially committed once",
-    localUserMirrorInternals.markerToken("crash-bound", THREAD_ID, 0),
-  );
-  assert.equal(resumedRouter.isReservedUserMirrorEcho({
+  const late = {
     id: 77_001,
     guid: "VERY-LATE-ECHO",
-    text: tagged,
+    text: "Potentially committed once",
+    created_at: "2026-07-14T12:00:01.000Z",
     thread_originator_guid: ROOT_GUID,
-  }), true, "a late local commit remains quarantined after dead-lettering");
+  };
+  assert.equal(resumedRouter.provisionalUserMirrorEcho(late)?.threadId, THREAD_ID,
+    "a late-observed row created inside the send window remains quarantined after dead-lettering");
   assert.equal(readFileSync(item.senderFile, "utf8").includes("Potentially committed once"), false);
 });
 
@@ -831,7 +896,7 @@ test("a missing synced root is retryable but never sends or falls back unthreade
   assert.equal(fake.sendCalls().length, 0);
 });
 
-test("long Unicode mirrors use bounded native multipart replies with unique invisible markers", async () => {
+test("long Unicode mirrors use bounded clean native multipart replies", async () => {
   const fake = fakeImsg();
   const item = fixture({ fake });
   await initialize(item.sender);
@@ -849,8 +914,11 @@ test("long Unicode mirrors use bounded native multipart replies with unique invi
   ]);
   assert.ok(texts.every((text) => Buffer.byteLength(text, "utf8") < 100 * 1024));
   const tokens = texts.map((_, index) => localUserMirrorInternals.markerToken("long-delivery", THREAD_ID, index));
-  assert.ok(texts.every((text, index) => localUserMirrorInternals.containsMarker(text, tokens[index])));
-  assert.equal(new Set(tokens).size, 3);
+  assert.ok(texts.every((text, index) => !localUserMirrorInternals.containsMarker(text, tokens[index])));
+  assert.ok(texts.every((text) => ![...text].some((character) => {
+    const code = character.codePointAt(0);
+    return code >= 0xe0000 && code <= 0xe007f;
+  })));
   assert.ok(sends.every((call) => call.params.reply_to === ROOT_GUID));
 
   const duplicate = await item.sender.sendMirror(mirror({ deliveryId: "long-delivery", body }));

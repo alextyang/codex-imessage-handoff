@@ -1050,6 +1050,37 @@ test("a tagged user-mirror echo can settle before its send GUID is confirmed and
   })), null);
 });
 
+test("a clean user-mirror reservation requires exact GUID evidence before consumption", () => {
+  const { router, stateFile } = fixture();
+  router.routeOutboundGuid("root-a", "thread-a", { root: true });
+  const reservationId = "e".repeat(64);
+  router.reserveUserMirrorEcho({
+    reservationId,
+    threadId: "thread-a",
+    text: "Clean mirror body",
+    rootGuid: "root-a",
+  });
+  const early = message(58_120, "Clean mirror body", {
+    guid: "clean-mirror-guid",
+    createdAt: "2026-07-12T12:00:01.000Z",
+    thread_originator_guid: "root-a",
+  });
+  assert.equal(router.consumeUserMirrorEcho(early), null);
+  assert.equal(router.isReservedUserMirrorEcho(early), false);
+  assert.equal(router.provisionalUserMirrorEcho(early).reservationId, reservationId);
+
+  const resumed = new LocalConversationRouter({ stateFile });
+  assert.equal(resumed.consumeUserMirrorEcho(early), null, "plain markerEvidence=false survives restart");
+  assert.equal(resumed.confirmUserMirrorEcho(reservationId, "clean-mirror-guid"), true);
+  assert.equal(resumed.consumeUserMirrorEcho(message(58_121, "Different visible body", {
+    guid: "wrong-guid",
+    thread_originator_guid: "root-a",
+  })), null);
+  const consumed = resumed.consumeUserMirrorEcho(early);
+  assert.equal(consumed.reservationId, reservationId);
+  assert.equal(consumed.expectedGuid, "clean-mirror-guid");
+});
+
 test("an early marker-normalized echo can be quarantined without consuming its fail-closed reservation", () => {
   const { router, stateFile } = fixture();
   router.routeOutboundGuid("root-a", "thread-a", { root: true });

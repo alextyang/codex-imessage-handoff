@@ -5,7 +5,16 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { createHash } from "node:crypto";
 import { readConfig } from "./config.mjs";
 import { findThreadBySource, listThreads } from "./thread-store.mjs";
-import { assertThreadReadyForIMessageRun, getThreadDetail, getLatestRequest, getTurn, getHistory, readThreadHistory } from "./thread-history.mjs";
+import {
+  assertClaimedThreadUnchanged,
+  assertThreadReadyForIMessageRun,
+  captureThreadRunCheckpoint,
+  getThreadDetail,
+  getLatestRequest,
+  getTurn,
+  getHistory,
+  readThreadHistory,
+} from "./thread-history.mjs";
 import { buildThreadDirectory } from "./thread-directory.mjs";
 import {
   getDefaultReasoning,
@@ -292,7 +301,7 @@ async function deliverLiveMessage(message) {
     }
     // Ambiguous local sends deliberately hold the durable rollout cursor. A
     // repeat presents the same delivery id to the sender journal, which only
-    // reconciles the tagged row and never blindly sends again.
+    // reconciles exact GUID/root evidence and never blindly sends again.
     if (local.retryable === true) return local;
     if (local.fallbackSafe !== true) return local;
     // Rich mode is optional to core Codex/iMessage health. If it is unavailable
@@ -838,6 +847,33 @@ async function executeReply(event, context) {
     return;
   }
 
+  try {
+    assertClaimedThreadUnchanged(thread, event);
+  } catch (error) {
+    if (error?.code !== "STALE_THREAD_ADVANCED" && error?.code !== "STALE_THREAD_CHECKPOINT") throw error;
+    await settleLiveSuppression(event, thread, { forceClear: true });
+    failedRuns.record(thread.id, {
+      body: String(event.claimed?.reply?.body || ""),
+      images: event.claimed?.images || [],
+      replyId: event.replyId,
+      claimed: event.claimed,
+      queuedAt: event.queuedAt,
+      clientUserMessageId: event.clientUserMessageId,
+      reasoningEffort: event.reasoningEffort || null,
+      mirrorSuppressionToken: null,
+    });
+    saveClaimedJob(event, "failed");
+    await sendOutbound({
+      kind: "service.notice",
+      deliveryId: `run:${event.replyId}:stale`,
+      code: "needs-attention",
+      thread: threadLabel(thread),
+      body: "Not run: this task changed in Codex while the message was waiting. Reply again to run it against the current task state.\n\n/turn · /threads",
+    });
+    scheduleSynchronize();
+    return;
+  }
+
   let claim = event.claimed;
   if (!claim) {
     const error = Object.assign(new Error("The local iMessage request is missing its durable payload."), { code: "MISSING_LOCAL_PAYLOAD" });
@@ -1031,7 +1067,7 @@ async function executeReply(event, context) {
 }
 
 const runs = new RunManager({
-  maxConcurrent: 1,
+  maxConcurrent: 3,
   run: executeReply,
   discard: discardReply,
   onChange: () => scheduleSynchronize(),
@@ -1052,7 +1088,7 @@ function enqueueReply(event) {
         deliveryId: `run:${event.replyId}:queued`,
         code: "queued",
         thread: threadLabel(thread),
-        body: "Pending. Codex will start this message when a run slot is free.\n\n‼️ Emphasize to stop · /thread · /threads",
+        body: "Queued behind earlier iMessage work. Codex will start this message automatically.\n\n‼️ Emphasize to stop · /thread · /threads",
       });
     } catch {
       log("Could not publish pending state.");
@@ -1081,6 +1117,7 @@ async function ingestReply(event) {
   if (!event.claimed) {
     throw Object.assign(new Error("The local iMessage request is missing its durable payload."), { code: "MISSING_LOCAL_PAYLOAD" });
   }
+  event.threadCheckpoint ||= captureThreadRunCheckpoint(catalogById.get(threadId), event.queuedAt);
   claimingReplyIds.set(replyId, threadId);
   try {
     return await admitClaimedJob({
@@ -1785,11 +1822,14 @@ async function handleControl(event) {
       await sendOutbound({ kind: "service.notice", code: "needs-attention", thread: threadLabel(thread), body });
       return { reaction: "❌" };
     }
+    const retryAt = new Date().toISOString();
     const retry = {
       threadId: thread.id,
       replyId: failed.replyId || `retry-${Date.now()}-${Math.random().toString(16).slice(2)}`,
       claimed: failed.claimed || { reply: { body: failed.body }, images: failed.images },
-      queuedAt: failed.queuedAt || new Date().toISOString(),
+      queuedAt: retryAt,
+      receivedAtMs: Date.now(),
+      threadCheckpoint: captureThreadRunCheckpoint(thread, retryAt),
       clientUserMessageId: failed.clientUserMessageId || null,
       reasoningEffort: failed.reasoningEffort || null,
       retryOf: failed.replyId,

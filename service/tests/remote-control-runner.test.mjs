@@ -13,7 +13,8 @@ function fixture() {
     refresh: [],
     authorize: [],
     logicalStreams: 0,
-    close: 0,
+    clients: [],
+    close: [],
     terminate: 0,
   };
   const logicalStream = { kind: "logical-remote-control-stream" };
@@ -37,10 +38,6 @@ function fixture() {
       calls.terminate += 1;
     },
   };
-  const client = {
-    close() { calls.close += 1; },
-    isRunning() { return false; },
-  };
   const runtime = new RemoteControlCodexRuntime({
     codexHome: "/Users/test/.codex",
     controllerOptions: { appVersion: "test" },
@@ -56,6 +53,13 @@ function fixture() {
     },
     rpcClientFactory(options) {
       calls.client.push(options);
+      const ordinal = calls.clients.length + 1;
+      const client = {
+        ordinal,
+        close() { calls.close.push(ordinal); },
+        isRunning() { return false; },
+      };
+      calls.clients.push(client);
       return client;
     },
     runnerFactory(options) {
@@ -64,10 +68,10 @@ function fixture() {
       return runner;
     },
   });
-  return { runtime, calls, controller, connection, client, logicalStream };
+  return { runtime, calls, controller, connection, logicalStream };
 }
 
-test("runtime lazily creates one controller, connection, and shared RPC client", async () => {
+test("runtime shares one controller and connection but owns one RPC client per runner", async () => {
   const fx = fixture();
   assert.equal(fx.calls.controller.length, 0);
   assert.equal(fx.calls.connection.length, 0);
@@ -76,12 +80,16 @@ test("runtime lazily creates one controller, connection, and shared RPC client",
   const first = fx.runtime.createRunner();
   const second = fx.runtime.createRunner();
   assert.notEqual(first, second);
-  assert.equal(first.client, fx.client);
-  assert.equal(second.client, fx.client);
+  assert.notEqual(first.client, second.client);
+  assert.equal(first.client, fx.calls.clients[0]);
+  assert.equal(second.client, fx.calls.clients[1]);
   assert.equal(fx.calls.controller.length, 1);
   assert.equal(fx.calls.connection.length, 1);
-  assert.equal(fx.calls.client.length, 1);
+  assert.equal(fx.calls.client.length, 2);
   assert.equal(fx.calls.runner.length, 2);
+  assert.equal(fx.calls.runner[0].ownsClient, true);
+  assert.equal(fx.calls.runner[1].ownsClient, true);
+  assert.equal(typeof fx.calls.runner[0].onClientClose, "function");
   assert.deepEqual(fx.calls.controller[0], {
     appVersion: "test",
     codexHome: "/Users/test/.codex",
@@ -100,16 +108,17 @@ test("runtime lazily creates one controller, connection, and shared RPC client",
   );
   assert.deepEqual(fx.calls.authorize, [{ challenge, session: sessionMetadata }]);
 
-  const clientOptions = fx.calls.client[0];
-  assert.equal(clientOptions.codexHome, "/Users/test/.codex");
-  assert.equal(clientOptions.requestTimeoutMs, 123);
-  assert.equal("spawnImpl" in clientOptions, false);
-  assert.equal("socketPath" in clientOptions, false);
-  assert.equal("codexPath" in clientOptions, false);
-  assert.equal(clientOptions.webSocketFactory("ws://localhost/rpc", {
-    createConnection() { throw new Error("must not attach locally"); },
-  }), fx.logicalStream);
-  assert.equal(fx.calls.logicalStreams, 1);
+  for (const clientOptions of fx.calls.client) {
+    assert.equal(clientOptions.codexHome, "/Users/test/.codex");
+    assert.equal(clientOptions.requestTimeoutMs, 123);
+    assert.equal("spawnImpl" in clientOptions, false);
+    assert.equal("socketPath" in clientOptions, false);
+    assert.equal("codexPath" in clientOptions, false);
+    assert.equal(clientOptions.webSocketFactory("ws://localhost/rpc", {
+      createConnection() { throw new Error("must not attach locally"); },
+    }), fx.logicalStream);
+  }
+  assert.equal(fx.calls.logicalStreams, 2);
 });
 
 test("default RPC composition can only obtain a logical Remote Control stream", () => {
@@ -135,7 +144,10 @@ test("default RPC composition can only obtain a logical Remote Control stream", 
   const second = runtime.createRunner();
   assert.ok(first instanceof AppServerCodexRunner);
   assert.ok(first.client instanceof AppServerRpcClient);
-  assert.equal(first.client, second.client);
+  assert.ok(second.client instanceof AppServerRpcClient);
+  assert.notEqual(first.client, second.client);
+  assert.equal(first.ownsClient, true);
+  assert.equal(second.ownsClient, true);
   assert.equal("spawnImpl" in first.client, false);
   assert.equal("child" in first.client, false);
   assert.equal(first.client.webSocketFactory("ws://localhost/rpc", {
@@ -146,14 +158,26 @@ test("default RPC composition can only obtain a logical Remote Control stream", 
   assert.equal(terminated, 1);
 });
 
-test("close detaches the shared client, terminates the relay, and is idempotent", () => {
+test("close detaches every active client, terminates the relay, and is idempotent", () => {
   const fx = fixture();
+  fx.runtime.createRunner();
   fx.runtime.createRunner();
   fx.runtime.close();
   fx.runtime.close();
-  assert.equal(fx.calls.close, 1);
+  assert.deepEqual(fx.calls.close, [1, 2]);
   assert.equal(fx.calls.terminate, 1);
   assert.throws(() => fx.runtime.createRunner(), /closed/i);
+});
+
+test("a runner-owned client is removed from runtime shutdown tracking after it closes", () => {
+  const fx = fixture();
+  fx.runtime.createRunner();
+  fx.runtime.createRunner();
+  fx.calls.clients[0].close();
+  fx.calls.runner[0].onClientClose(fx.calls.clients[0]);
+  fx.runtime.close();
+  assert.deepEqual(fx.calls.close, [1, 2]);
+  assert.equal(fx.calls.terminate, 1);
 });
 
 test("runtime source has no local process or socket attachment implementation", () => {

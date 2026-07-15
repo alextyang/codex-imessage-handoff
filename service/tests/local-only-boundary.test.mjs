@@ -79,3 +79,10 @@ test("the main service can only reach Codex through an injected Remote Control s
   assert.match(protocolClient, /CODEX_REMOTE_TRANSPORT_REQUIRED/);
   assert.match(protocolClient, /this\.webSocketFactory\(\)/);
 });
+
+test("the daemon bounds concurrent Remote Control work without reporting missing slots", () => {
+  const daemon = readFileSync(path.join(repo, "service/src/daemon.mjs"), "utf8");
+  assert.match(daemon, /new RunManager\(\{\s*maxConcurrent: 3,/);
+  assert.match(daemon, /Queued behind earlier iMessage work\. Codex will start this message automatically\./);
+  assert.doesNotMatch(daemon, /(?:no|free) (?:run )?slots?|run slot is free/i);
+});

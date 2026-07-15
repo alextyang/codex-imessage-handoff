@@ -36,6 +36,11 @@ test("claimed prompts survive restart state privately until completion", () => {
       reconcileRunning: true,
       recoveredTurnId: "turn-recovered",
       recoveryMissingSince: "2026-07-12T00:00:10.000Z",
+      threadCheckpoint: {
+        turnId: "turn-before-claim",
+        activityAt: "2026-07-11T23:59:00.000Z",
+        capturedAt: "2026-07-12T00:00:00.000Z",
+      },
     }, "queued");
     const stableClientId = claimedClientUserMessageId("thread-a", "reply-a");
     assert.equal(statSync(path.join(home, "run-state.json")).mode & 0o777, 0o600);
@@ -50,6 +55,11 @@ test("claimed prompts survive restart state privately until completion", () => {
     assert.equal(loadClaimedJobs()[0].reconcileRunning, true);
     assert.equal(loadClaimedJobs()[0].recoveredTurnId, "turn-recovered");
     assert.equal(loadClaimedJobs()[0].recoveryMissingSince, "2026-07-12T00:00:10.000Z");
+    assert.deepEqual(loadClaimedJobs()[0].threadCheckpoint, {
+      turnId: "turn-before-claim",
+      activityAt: "2026-07-11T23:59:00.000Z",
+      capturedAt: "2026-07-12T00:00:00.000Z",
+    });
     assert.equal(markClaimedJobState("reply-a", "running").state, "running");
     assert.equal(loadClaimedJobs()[0].state, "running");
     assert.equal(loadClaimedJobs()[0].reasoningEffort, "high", "claiming the queued job must retain its reasoning snapshot");
@@ -59,6 +69,41 @@ test("claimed prompts survive restart state privately until completion", () => {
     assert.equal(loadClaimedJobs()[0].clientUserMessageId, stableClientId, "recovery and delivery reuse the original protocol id");
     assert.equal(removeClaimedJob("reply-a"), true);
     assert.deepEqual(loadClaimedJobs(), []);
+  } finally {
+    if (previous === undefined) delete process.env.IMESSAGE_HANDOFF_HOME;
+    else process.env.IMESSAGE_HANDOFF_HOME = previous;
+  }
+});
+
+test("later same-task claims retain durable predecessor client ids", () => {
+  const home = mkdtempSync(path.join(os.tmpdir(), "imessage-claimed-predecessors-"));
+  const previous = process.env.IMESSAGE_HANDOFF_HOME;
+  process.env.IMESSAGE_HANDOFF_HOME = home;
+  try {
+    const first = {
+      threadId: "thread-fifo",
+      replyId: "first",
+      queuedAt: "2026-07-12T00:00:00.000Z",
+      receivedAtMs: 100,
+      claimed: { reply: { body: "First", media: [] }, images: [] },
+    };
+    const second = {
+      threadId: "thread-fifo",
+      replyId: "second",
+      queuedAt: "2026-07-12T00:00:01.000Z",
+      receivedAtMs: 200,
+      claimed: { reply: { body: "Second", media: [] }, images: [] },
+    };
+    saveClaimedJob(first, "running");
+    saveClaimedJob(second, "queued");
+    assert.deepEqual(second.predecessorClientUserMessageIds, [first.clientUserMessageId]);
+
+    // Re-saving the earlier job after the later one exists must not reverse
+    // the predecessor relationship.
+    saveClaimedJob(first, "running");
+    assert.deepEqual(loadClaimedJobs().find((job) => job.replyId === "first").predecessorClientUserMessageIds, []);
+    assert.deepEqual(loadClaimedJobs().find((job) => job.replyId === "second").predecessorClientUserMessageIds,
+      [first.clientUserMessageId]);
   } finally {
     if (previous === undefined) delete process.env.IMESSAGE_HANDOFF_HOME;
     else process.env.IMESSAGE_HANDOFF_HOME = previous;

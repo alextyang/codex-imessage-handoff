@@ -15,7 +15,8 @@ Exactly one topology is supported:
    durable routing state, Codex credentials, controller enrollment, and
    nonextractable device key.
 4. That service creates one independent Remote Control controller and one
-   physical controller WebSocket to OpenAI's relay, lazily on first Codex use.
+   physical controller WebSocket to OpenAI's relay, lazily on first Codex use,
+   then multiplexes one owned logical app-server client per active task.
 5. The relay routes logical app-server JSON-RPC to the normal private
    app-server already created and owned by Codex Desktop.
 
@@ -125,15 +126,16 @@ rotation.
 
 ## Controller lifecycle contract
 
-- `RemoteControlController`, `RemoteControlConnection`, and the app-server RPC
-  client are each created lazily once per service process.
+- `RemoteControlController` and `RemoteControlConnection` are each created
+  lazily once per service process. Each runner gets one owned app-server RPC
+  client and logical stream on that shared physical connection.
 - Every physical WebSocket open/reopen obtains a freshly refreshed controller
   session and re-verifies the same pinned Desktop environment.
 - The physical WebSocket uses protocol v3 and completes a validated signed
   device challenge before any logical stream reports open.
-- The runtime uses one injected Remote Control RPC client. At most one
-  iMessage-submitted turn is active through it; competing work is retained and
-  deferred.
+- The runtime allows at most three active iMessage-submitted turns through
+  independent logical clients. A task remains serial, and excess work is
+  retained and deferred without creating another physical connection.
 - Client envelopes have per-stream sequence ids. Unacknowledged envelopes are
   replayed on reconnect; server delivery resumes from the last fully delivered
   cursor.

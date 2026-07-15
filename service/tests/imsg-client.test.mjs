@@ -273,7 +273,7 @@ test("advanced send capability failures fail closed before delivery", async () =
 test("sends rich text, native polls, votes, tapbacks, typing, read receipts, and status through documented RPC methods", async () => {
   const { client, child } = createClient();
   const rich = await client.sendRich({ chat_id: 42, text: "hello", effect: "confetti", formatting: [{ start: 0, length: 5, styles: ["bold"] }] });
-  const reply = await client.sendRich({ chat_id: 42, text: "threaded", reply_to: "PARENT" });
+  const reply = await client.sendRich({ chat_id: 42, text: "threaded", reply_to: "PARENT", dd_scan: false });
   const attachment = await client.sendRich({ chat_id: 42, file: "/tmp/image.png", reply_to: "PARENT" });
   const link = await client.sendRich({ chat_id: 42, url: "https://example.com/card" });
   const poll = await client.sendPoll({ chat_id: 42, question: "Dinner?", options: ["Pizza", "Sushi"], sendCaption: false });
@@ -293,6 +293,7 @@ test("sends rich text, native polls, votes, tapbacks, typing, read receipts, and
   );
   assert.deepEqual(child.requests[1].params.text_formatting, [{ start: 0, length: 5, styles: ["bold"] }]);
   assert.equal(child.requests[2].params.reply_to, "PARENT");
+  assert.equal(child.requests[2].params.dd_scan, false);
   assert.equal(child.requests[3].params.file, "/tmp/image.png");
   assert.equal(child.requests[4].params.url, "https://example.com/card");
   assert.deepEqual(child.requests[5].params, {

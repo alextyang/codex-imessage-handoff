@@ -12,9 +12,10 @@ function defaultCodexHome() {
 /**
  * Production composition root for independent Codex Remote Control access.
  *
- * The controller, relay connection, and app-server RPC client are created on
- * first use and then shared for the lifetime of the service. AppServerRpcClient
- * receives only logical Remote Control streams from this runtime.
+ * The controller and physical relay connection are created on first use and
+ * shared for the lifetime of the service. Each runner owns a separate
+ * AppServerRpcClient and logical Remote Control stream so unrelated tasks can
+ * progress concurrently without creating another physical relay connection.
  */
 export class RemoteControlCodexRuntime {
   constructor(options = {}) {
@@ -35,26 +36,38 @@ export class RemoteControlCodexRuntime {
 
     this.controller = null;
     this.connection = null;
-    this.rpcClient = null;
+    this.rpcClients = new Set();
     this.closed = false;
   }
 
   createRunner() {
     if (this.closed) throw new Error("Codex Remote Control runtime is closed.");
-    const client = this.#sharedRpcClient();
-    return this.runnerFactory({ client });
+    const client = this.#ownedRpcClient();
+    try {
+      return this.runnerFactory({
+        client,
+        ownsClient: true,
+        onClientClose: () => this.rpcClients.delete(client),
+      });
+    } catch (error) {
+      this.rpcClients.delete(client);
+      try { client.close?.(); } catch {}
+      throw error;
+    }
   }
 
   close() {
     if (this.closed) return;
     this.closed = true;
-    const client = this.rpcClient;
+    const clients = [...this.rpcClients];
     const connection = this.connection;
-    this.rpcClient = null;
+    this.rpcClients.clear();
     this.connection = null;
     this.controller = null;
     try {
-      client?.close?.();
+      for (const client of clients) {
+        try { client?.close?.(); } catch {}
+      }
     } finally {
       connection?.terminate?.();
     }
@@ -86,17 +99,16 @@ export class RemoteControlCodexRuntime {
     return this.connection;
   }
 
-  #sharedRpcClient() {
-    if (!this.rpcClient) {
-      const connection = this.#sharedConnection();
-      this.rpcClient = this.rpcClientFactory({
-        ...this.rpcClientOptions,
-        codexHome: this.codexHome,
-        // The shared manager owns the physical relay websocket and multiplexes
-        // one new logical stream whenever this RPC client reconnects.
-        webSocketFactory: () => connection.createStream(),
-      });
-    }
-    return this.rpcClient;
+  #ownedRpcClient() {
+    const connection = this.#sharedConnection();
+    const client = this.rpcClientFactory({
+      ...this.rpcClientOptions,
+      codexHome: this.codexHome,
+      // The shared manager owns the physical relay websocket and multiplexes
+      // one new logical stream for this runner's protocol client.
+      webSocketFactory: () => connection.createStream(),
+    });
+    this.rpcClients.add(client);
+    return client;
   }
 }

@@ -45,13 +45,13 @@ credentials, controller enrollment, and device key.
 Codex-authored user messages take one deliberately narrow reverse path: a
 normal-profile `imsg rpc` child sends only rich text to the root-proven direct
 service conversation. The body travels over the child's stdin, never process
-arguments. A durable invisible delivery marker and the shared message GUID
-suppress the dedicated-account echo without suppressing genuine same-text
-messages. A send is accepted only after the normal profile observes that exact
-GUID with the expected native `thread_originator_guid`. If Apple normalizes the
-invisible marker before the GUID returns, the receiver defers an exact-root,
-visible-body-hash candidate created inside that send's timestamp window until
-the complete bounded mutation window ends. Body/root correlation alone never
+arguments. The shared message GUID and exact native Reply root suppress the
+dedicated-account echo without adding hidden Unicode to the message body. A
+send is accepted only after the normal profile observes that exact GUID with
+the expected native `thread_originator_guid`. While the bridge returns the
+GUID, the receiver defers an exact-root, visible-body-hash candidate created
+inside that send's timestamp window until the complete bounded mutation window
+ends. Body/root correlation alone never
 creates a receipt or consumes the reservation; an unresolved row is
 quarantined while the guard remains active for any later echo. Ambiguous writes
 are reconciled without resending; after 15 minutes, a content-free task notice
@@ -256,8 +256,9 @@ Status output redacts the chat GUID, sender identity, and helper-client path.
 
 1. The active user's LaunchAgent starts the iMessage service and authenticates
    the dedicated user's helper/watch connection.
-2. The Remote Control controller, relay connection, and app-server RPC client
-   are created lazily when Codex work is first needed.
+2. The Remote Control controller and relay connection are created lazily when
+   Codex work is first needed. Each active iMessage task gets its own
+   app-server RPC client and logical stream on that shared connection.
 3. The controller reads the active user's current Codex authentication,
    refreshes its short-lived Remote Control session, and verifies the exact
    enrolled Desktop environment is online.
@@ -269,7 +270,7 @@ Status output redacts the chat GUID, sender identity, and helper-client path.
 6. Relay reconnects use acknowledgements, replay of unacknowledged client
    envelopes, and a server cursor. Protocol gaps and invalid challenges close
    the affected stream rather than guessing.
-7. Service stop closes its logical stream, relay connection, and helper IPC.
+7. Service stop closes every active logical stream, the relay connection, and helper IPC.
    It never stops, restarts, or signals Codex Desktop or its app-server.
 
 The LaunchAgent strips the retired local-daemon routing variable before the
@@ -361,9 +362,9 @@ Codex on the Mac.
   queued.
 - Every authorized inbound Messages event is marked read, including poll and
   tapback events that intentionally produce no Codex action.
-- The runtime uses one injected Remote Control RPC client, so only one
-  iMessage-submitted Codex turn is active at a time; competing work remains
-  queued rather than starting another backend.
+- The runtime multiplexes up to three independently owned Remote Control RPC
+  clients over one physical relay connection. A task still runs only one turn
+  at a time; excess or same-task work remains queued and starts automatically.
 - Every submitted turn has a durable client message id. If the relay or host
   disconnects after accepting `turn/start`, recovery looks up that exact id and
   never blindly submits a replacement turn.

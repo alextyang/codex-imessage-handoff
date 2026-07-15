@@ -433,10 +433,13 @@ function normalizeState(value, expectedConversationKey = null) {
       const createdAt = isoString(echo.createdAt);
       const earlyUntil = isoString(echo.earlyUntil);
       const expiresAt = isoString(echo.expiresAt);
+      // Missing means a pre-migration reservation, all of which used the
+      // legacy tagged wire format. New plain reservations persist false.
+      const markerEvidence = typeof echo.markerEvidence === "boolean" ? echo.markerEvidence : true;
       return reservationId && threadId && /^[a-f0-9]{64}$/u.test(fingerprint || "")
         && (!provisionalFingerprint || /^[a-f0-9]{64}$/u.test(provisionalFingerprint)) && rootGuid && createdAt
         && earlyUntil && expiresAt
-        ? [{ reservationId, threadId, fingerprint, provisionalFingerprint, rootGuid, expectedGuid, createdAt, earlyUntil, expiresAt }]
+        ? [{ reservationId, threadId, fingerprint, provisionalFingerprint, markerEvidence, rootGuid, expectedGuid, createdAt, earlyUntil, expiresAt }]
         : [];
     }).slice(-MAX_USER_MIRROR_ECHOES);
   }
@@ -573,6 +576,11 @@ function userMirrorProvisionalFingerprint(value) {
     ? value.replace(/\u{E0001}[\u{E0020}-\u{E007E}]*\u{E007F}$/u, "").trim()
     : "";
   return text ? createHash("sha256").update(`imsg-user-mirror-visible:${text}`).digest("hex") : null;
+}
+
+function hasUserMirrorMarker(value) {
+  return typeof value === "string"
+    && /\u{E0001}[\u{E0020}-\u{E007E}]+\u{E007F}$/u.test(value.trim());
 }
 
 function pruneOutboundEchoes(state, nowMs) {
@@ -1184,6 +1192,7 @@ export class LocalConversationRouter {
     const rootGuid = cleanString(rootGuidValue, 256);
     const fingerprint = userMirrorEchoFingerprint(text);
     const provisionalFingerprint = userMirrorProvisionalFingerprint(text);
+    const markerEvidence = hasUserMirrorMarker(text);
     if (!reservationId || !threadId || !rootGuid || !fingerprint || !provisionalFingerprint) {
       throw Object.assign(new TypeError("A complete user-mirror echo reservation is required."), {
         code: "IMSG_MIRROR_ECHO_INVALID",
@@ -1194,7 +1203,8 @@ export class LocalConversationRouter {
     const existing = this.state.userMirrorEchoes.find((echo) => echo.reservationId === reservationId);
     if (existing) {
       if (existing.threadId !== threadId || existing.rootGuid !== rootGuid || existing.fingerprint !== fingerprint
-        || (existing.provisionalFingerprint && existing.provisionalFingerprint !== provisionalFingerprint)) {
+        || (existing.provisionalFingerprint && existing.provisionalFingerprint !== provisionalFingerprint)
+        || existing.markerEvidence !== markerEvidence) {
         throw Object.assign(new Error("A user-mirror delivery id was reused with different content."), {
           code: "IMSG_MIRROR_ECHO_CONFLICT",
         });
@@ -1214,6 +1224,7 @@ export class LocalConversationRouter {
       threadId,
       fingerprint,
       provisionalFingerprint,
+      markerEvidence,
       rootGuid,
       expectedGuid: null,
       createdAt: new Date(nowMs).toISOString(),
@@ -1329,7 +1340,8 @@ export class LocalConversationRouter {
       ? this.state.userMirrorEchoes.findIndex((echo) => echo.expectedGuid === message.guid)
       : -1;
     if (index < 0 && fingerprint) index = this.state.userMirrorEchoes.findIndex((echo) => {
-      if (echo.expectedGuid || echo.fingerprint !== fingerprint || Date.parse(echo.earlyUntil) < nowMs) return false;
+      if (!echo.markerEvidence || echo.expectedGuid || echo.fingerprint !== fingerprint
+        || Date.parse(echo.earlyUntil) < nowMs) return false;
       const messageRoot = message.threadOriginatorGuid;
       return Boolean(messageRoot && messageRoot === echo.rootGuid);
     });
@@ -1390,7 +1402,9 @@ export class LocalConversationRouter {
     if (pruned) writeState(this.stateFile, this.state);
     if (message.guid && this.state.userMirrorEchoes.some((echo) => echo.expectedGuid === message.guid)) return true;
     const fingerprint = userMirrorEchoFingerprint(message.text);
-    return Boolean(fingerprint && this.state.userMirrorEchoes.some((echo) => echo.fingerprint === fingerprint));
+    return Boolean(fingerprint && this.state.userMirrorEchoes.some((echo) => (
+      echo.markerEvidence && echo.fingerprint === fingerprint
+    )));
   }
 
   releaseOutboundEcho(fingerprintValue) {

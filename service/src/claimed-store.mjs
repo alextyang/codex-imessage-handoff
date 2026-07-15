@@ -52,6 +52,25 @@ function validClientUserMessageId(value) {
   return id && id.length <= 256 && !/[\u0000-\u001f]/.test(id) ? id : null;
 }
 
+function validIso(value) {
+  const text = typeof value === "string" ? value.trim() : "";
+  return text && text.length <= 64 && Number.isFinite(Date.parse(text)) ? text : null;
+}
+
+function normalizedThreadCheckpoint(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const turnId = typeof value.turnId === "string" && value.turnId.length <= 256 ? value.turnId : null;
+  const activityAt = validIso(value.activityAt);
+  const capturedAt = validIso(value.capturedAt);
+  return capturedAt ? { turnId, activityAt, capturedAt } : null;
+}
+
+function validPredecessorIds(value) {
+  return Array.isArray(value)
+    ? [...new Set(value.map(validClientUserMessageId).filter(Boolean))].slice(-32)
+    : [];
+}
+
 // The app-server persists this value on the resulting userMessage item. A
 // deterministic UUID keeps a claimed Messages event identifiable even if the
 // daemon crashes between accepting the event and reloading its durable state.
@@ -92,15 +111,38 @@ export function saveClaimedJob(event, state = "queued") {
     || existing?.legacyClientUserMessageId
     || (existing && !existingClientUserMessageId),
   );
+  const queuedAt = event.queuedAt || existing?.queuedAt || new Date().toISOString();
+  const receivedAtMs = Number(event.receivedAtMs) || Number(existing?.receivedAtMs) || Date.now();
+  const predecessorClientUserMessageIds = [...new Set([
+    ...validPredecessorIds(existing?.predecessorClientUserMessageIds),
+    ...validPredecessorIds(event.predecessorClientUserMessageIds),
+    ...Object.entries(store.jobs).flatMap(([otherId, other]) => {
+      if (otherId === id || String(other?.threadId || "") !== String(event.threadId)
+        || !["queued", "running", "delivering"].includes(other?.state)
+        || !validClientUserMessageId(other?.clientUserMessageId)) return [];
+      const otherReceivedAtMs = Number(other.receivedAtMs) || 0;
+      const otherQueuedAt = String(other.queuedAt || "");
+      const isEarlier = otherReceivedAtMs && receivedAtMs
+        ? otherReceivedAtMs < receivedAtMs
+        : otherQueuedAt && otherQueuedAt.localeCompare(String(queuedAt)) <= 0;
+      return isEarlier ? [other.clientUserMessageId] : [];
+    }),
+  ])].filter((value) => value !== clientUserMessageId).slice(-32);
+  const threadCheckpoint = normalizedThreadCheckpoint(event.threadCheckpoint)
+    || normalizedThreadCheckpoint(existing?.threadCheckpoint);
   event.clientUserMessageId = clientUserMessageId;
   event.legacyClientUserMessageId = legacyClientUserMessageId;
+  event.predecessorClientUserMessageIds = predecessorClientUserMessageIds;
+  if (threadCheckpoint) event.threadCheckpoint = threadCheckpoint;
   store.jobs[id] = {
     threadId: String(event.threadId),
     replyId: id,
     clientUserMessageId,
     legacyClientUserMessageId,
-    queuedAt: event.queuedAt || new Date().toISOString(),
-    receivedAtMs: Number(event.receivedAtMs) || Date.now(),
+    predecessorClientUserMessageIds,
+    threadCheckpoint,
+    queuedAt,
+    receivedAtMs,
     reasoningEffort: typeof event.reasoningEffort === "string"
       && /^[a-z][a-z0-9_-]{0,31}$/i.test(event.reasoningEffort)
       ? event.reasoningEffort

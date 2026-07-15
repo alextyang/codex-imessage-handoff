@@ -34,6 +34,8 @@ const AMBIGUOUS_DEAD_LETTER_MS = 15 * 60 * 1000;
 const AMBIGUOUS_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
 const MARKER_START = "\u{E0001}";
 const MARKER_END = "\u{E007F}";
+const WIRE_MODE_PLAIN = "plain";
+const WIRE_MODE_TAGGED = "tagged";
 const BINARY_CANDIDATES = Object.freeze([
   "/opt/homebrew/bin/imsg",
   "/usr/local/bin/imsg",
@@ -127,8 +129,17 @@ function normalizedDelivery(value) {
   const rootGuid = clean(value.rootGuid);
   const status = clean(value.status);
   const preparedAt = clean(value.preparedAt);
+  // Journals written before wireMode existed always used the legacy Unicode
+  // Tags-block suffix. Preserve their crash reconciliation without putting
+  // that suffix on newly prepared mirrors.
+  const wireMode = value.wireMode === WIRE_MODE_PLAIN
+    ? WIRE_MODE_PLAIN
+    : value.wireMode === undefined || value.wireMode === WIRE_MODE_TAGGED
+      ? WIRE_MODE_TAGGED
+      : null;
   if (!/^[a-f0-9]{64}$/u.test(reservationId) || !threadId || !/^[a-f0-9]{64}$/u.test(bodyHash)
     || !/^codex-mirror-[a-f0-9]{32}$/u.test(token) || !rootGuid
+    || !wireMode
     || !["prepared", "attempting", "accepted", "ambiguous", "dead-letter"].includes(status)
     || !Number.isFinite(Date.parse(preparedAt))) return null;
   return {
@@ -136,6 +147,7 @@ function normalizedDelivery(value) {
     threadId,
     bodyHash,
     token,
+    wireMode,
     rootGuid,
     status,
     preparedAt,
@@ -584,8 +596,11 @@ export class LocalUserMirrorSender {
     const rows = await this.#history().catch(() => []);
     return rows.find((row) => {
       const contextRoot = clean(row?.thread_originator_guid ?? row?.threadOriginatorGuid);
+      const cleanBodyMatches = entry.wireMode !== WIRE_MODE_PLAIN
+        || hash("local-user-mirror-body-v1", typeof row?.text === "string" ? row.text : "") === entry.bodyHash;
       return row?.is_from_me === true
         && (requiredGuid ? messageGuid(row) === requiredGuid : containsMarker(row?.text, entry.token))
+        && cleanBodyMatches
         && contextRoot === entry.rootGuid;
     }) || null;
   }
@@ -645,7 +660,6 @@ export class LocalUserMirrorSender {
   async #sendPart({ deliveryId, threadId, rootGuid, intent, index }) {
     const key = deliveryKey(deliveryId, threadId, index);
     const token = markerToken(deliveryId, threadId, index);
-    const text = taggedText(intent.text, token);
     const bodyHash = hash("local-user-mirror-body-v1", intent.text);
     let entry = this.state.deliveries[key];
     if (entry && (entry.threadId !== threadId || entry.rootGuid !== rootGuid
@@ -658,6 +672,7 @@ export class LocalUserMirrorSender {
         threadId,
         bodyHash,
         token,
+        wireMode: WIRE_MODE_PLAIN,
         rootGuid,
         status: "prepared",
         preparedAt: new Date(this.now()).toISOString(),
@@ -668,6 +683,9 @@ export class LocalUserMirrorSender {
       };
       this.#saveDelivery(key, entry);
     }
+    const text = entry.wireMode === WIRE_MODE_TAGGED
+      ? taggedText(intent.text, token)
+      : String(intent.text);
     const receiverReceiptGuid = clean(this.router.userMirrorEchoReceipt?.(key)?.guid);
     if (!entry.guid && receiverReceiptGuid) entry.guid = receiverReceiptGuid;
     if (!receiverReceiptGuid && ["attempting", "ambiguous", "dead-letter"].includes(entry.status)) {
@@ -723,6 +741,11 @@ export class LocalUserMirrorSender {
         text,
         text_formatting: formatting,
         reply_to: rootGuid,
+        // The bridge can return the constructed message GUID immediately on
+        // this path. Its queued/text-search verifier required a hidden unique
+        // suffix and could associate simultaneous equal text with the wrong
+        // row. Exact GUID + exact Reply-root verification still follows.
+        dd_scan: false,
       });
     } catch (error) {
       if (error?.attempted === false) {
@@ -762,8 +785,9 @@ export class LocalUserMirrorSender {
     // ok/queued without a GUID, and its built-in verifier does not prove that
     // the row retained the requested native Reply root. Accept only after the
     // exact returned GUID is visible locally on the exact root. If the bridge
-    // returned no GUID, the invisible marker plus exact root must identify the
-    // row and supply its GUID.
+    // returned no GUID, only a legacy journal's marker plus exact root can
+    // identify the row and supply its GUID. New clean-text sends remain
+    // fail-closed when the bridge omits authoritative GUID evidence.
     const verified = await this.#reconcile(entry, guid);
     const verifiedGuid = messageGuid(verified);
     if (!verified || !verifiedGuid || (guid && verifiedGuid !== guid)) {

@@ -146,6 +146,10 @@ function normalizeRichSend(params) {
   const effect = requireBoundedString(params?.effect ?? params?.effect_id ?? params?.effectId, "effect", { optional: true, maxBytes: 256 });
   const subject = requireBoundedString(params?.subject, "subject", { optional: true, maxBytes: 4096 });
   const reply = requireBoundedString(params?.reply_to ?? params?.replyTo ?? params?.reply_to_guid, "reply_to", { optional: true, maxBytes: 4096 });
+  const ddScan = params?.dd_scan ?? params?.ddScan;
+  if (ddScan !== undefined && typeof ddScan !== "boolean") {
+    throw rpcFailure("IMSG_INVALID_INPUT", "dd_scan must be a boolean.");
+  }
 
   if (url) {
     if (!/^https?:\/\//i.test(url)) throw rpcFailure("IMSG_INVALID_INPUT", "url must use HTTP or HTTPS.");
@@ -173,6 +177,7 @@ function normalizeRichSend(params) {
       ...(effect ? { effect } : {}),
       ...(subject ? { subject } : {}),
       ...(reply ? { reply_to: reply } : {}),
+      ...(ddScan !== undefined ? { dd_scan: ddScan } : {}),
     },
   };
 }
