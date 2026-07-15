@@ -983,6 +983,43 @@ test("an early clean mirror is briefly held and suppressed when its exact GUID a
   await transport.stop();
 });
 
+test("an unverified bridge GUID neither releases nor disables quarantine for a later clean echo", async () => {
+  const { transport, client, stateFile } = fixture({ provisionalMirrorHoldMs: 5, provisionalMirrorPollMs: 1 });
+  const actions = [];
+  await transport.start({ onAction: (action) => actions.push(action) });
+  transport.router.routeOutboundGuid("unverified-root", THREAD.id, { root: true });
+  const reservationId = "b".repeat(64);
+  transport.router.reserveUserMirrorEcho({
+    reservationId,
+    threadId: THREAD.id,
+    text: "Clean body after a provisional acknowledgement",
+    rootGuid: "unverified-root",
+  });
+  transport.router.markUserMirrorEchoAttempted(reservationId);
+  transport.router.confirmUserMirrorEcho(reservationId, "bridge-proposal-guid", { verified: false });
+
+  client.watchHandlers.onMessage({
+    id: 20_409,
+    guid: "later-receiver-guid",
+    chat_id: 42,
+    chat_guid: "iMessage;-;+15550000000",
+    sender: "+15551111111",
+    is_from_me: false,
+    text: "Clean body after a provisional acknowledgement",
+    thread_originator_guid: "unverified-root",
+    created_at: "2026-07-12T12:00:04.000Z",
+  });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+
+  assert.deepEqual(actions, []);
+  assert.deepEqual(transport.router.pendingActions(), []);
+  const persisted = JSON.parse(readFileSync(stateFile, "utf8"));
+  const reservation = persisted.userMirrorEchoes.find((echo) => echo.reservationId === reservationId);
+  assert.equal(reservation.guidVerified, false);
+  assert.deepEqual(reservation.quarantinedCandidates.map((candidate) => candidate.guid), ["later-receiver-guid"]);
+  await transport.stop();
+});
+
 test("watch recovery routes an identical pre-reservation backlog row as genuine user input", async () => {
   const { transport, client } = fixture({ provisionalMirrorHoldMs: 5, provisionalMirrorPollMs: 1 });
   const actions = [];
@@ -1124,6 +1161,9 @@ test("a committed mirror with a lost GUID is quarantined across restart while fo
   assert.deepEqual(reservation.quarantinedCandidates.map((item) => item.guid), [candidate.guid]);
 
   assert.equal(transport.router.confirmUserMirrorEcho(reservationId, candidate.guid, { verified: false }), true);
+  assert.equal(transport.router.userMirrorEchoReceipt(reservationId), null,
+    "an unverified late bridge proposal keeps the candidate parked");
+  assert.equal(transport.router.confirmUserMirrorEcho(reservationId, candidate.guid), true);
   assert.equal(transport.router.userMirrorEchoReceipt(reservationId).guid, candidate.guid,
     "the later exact bridge GUID promotes only its matching quarantined row");
   await transport.stop();

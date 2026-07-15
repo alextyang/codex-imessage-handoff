@@ -28,6 +28,7 @@ import {
 } from "./thread-settings.mjs";
 import { ImsgTransport } from "./imsg-transport.mjs";
 import { LocalUserMirrorSender } from "./local-user-mirror-sender.mjs";
+import { ExclusiveProcessLease } from "./exclusive-process-lease.mjs";
 import { safeImsgFailureDetails } from "./imsg-rpc-diagnostics.mjs";
 import { RemoteControlCodexRuntime } from "./remote-control-runner.mjs";
 import {
@@ -70,8 +71,8 @@ import {
 } from "./manual-selection-flow.mjs";
 
 const paths = servicePaths();
+const daemonLease = new ExclusiveProcessLease({ lockPath: `${paths.home}/daemon.lease` });
 const serviceReadiness = new ServiceReadiness(paths.serviceReadinessState);
-serviceReadiness.markStarting();
 const config = readConfig();
 const imsgTransport = new ImsgTransport({ profile: config.imsg, stateFile: paths.imsgState, logger: log });
 const localUserMirrorSender = new LocalUserMirrorSender({
@@ -2449,6 +2450,11 @@ function queueLocalAction(action) {
 }
 
 async function main() {
+  // This lease is confined to the handoff service's private home. It prevents
+  // a manual `service run` or launchd restart overlap from sending the same
+  // deterministic mirror twice, without touching or locking Codex Desktop.
+  await daemonLease.acquire({ timeoutMs: 30_000 });
+  serviceReadiness.markStarting();
   const restoredJobs = loadClaimedJobs();
   for (const job of restoredJobs) {
     if (job.delivery?.body) completions.suppressNext(job.threadId, job.delivery.body, job.queuedAt);
@@ -2516,16 +2522,21 @@ async function stop() {
   ]);
   await localUserMirrorSender.stop().catch(() => {});
   await imsgTransport.stop().catch(() => {});
-  clearServiceReadiness();
+  if (daemonLease.acquired) clearServiceReadiness();
+  daemonLease.release();
   process.exit(0);
 }
 
 process.on("SIGTERM", () => { stop(); });
 process.on("SIGINT", () => { stop(); });
-process.on("exit", clearServiceReadiness);
+process.on("exit", () => {
+  if (daemonLease.acquired) clearServiceReadiness();
+  daemonLease.release();
+});
 
 main().catch((error) => {
-  clearServiceReadiness();
+  if (daemonLease.acquired) clearServiceReadiness();
+  daemonLease.release();
   process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
   process.exit(1);
 });

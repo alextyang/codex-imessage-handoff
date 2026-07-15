@@ -45,8 +45,17 @@ credentials, controller enrollment, and device key.
 Codex-authored user messages take one deliberately narrow reverse path: a
 normal-profile `imsg rpc` child sends only rich text to the root-proven direct
 service conversation. The body travels over the child's stdin, never process
-arguments. New mirrors use standard `send.rich`, so Messages assigns the native
-GUID and the outgoing bubble remains visible in the normal profile's transcript.
+arguments. New mirrors use the distinct synchronous
+`send.rich.transcript-visible` capability, so Messages assigns the native GUID
+and the sending `IMChat` inserts the outgoing bubble into the normal profile's
+live transcript. The service fails closed when that capability is absent; it
+never silently falls back to the background-oriented standard rich-send path.
+Reply messages are fully stamped on their message object before direct
+dispatch. This path never changes Messages' mutable per-chat
+inline-reply controller or thread map, so concurrent sends cannot steal or
+clear another conversation's reply context. A reply whose selected GUID,
+derived thread identifier, parent message, or parent item is missing is not
+sent.
 Before dispatch, the service persists a private delivery journal and reserves
 a fingerprint of the exact clean body plus native Reply root. The receiver may
 provisionally hold that candidate while the bridge returns its GUID. Before the
@@ -67,6 +76,12 @@ hidden Unicode. Ambiguous writes are reconciled without resending; after 15
 minutes, a content-free task notice unblocks later output. Historical
 caller-GUID and tagged journals remain reconciliation-only and are never
 resent.
+
+One process-owned lease under the handoff service's private state directory
+prevents overlapping daemon instances. A second, short-lived sender lease
+reloads the delivery journal after acquisition, so a restart or manual overlap
+cannot cross the native send boundary twice. Neither lease touches Codex,
+Codex task files, or the Desktop app server.
 
 This sender cannot select recipients, send files or URLs, watch Messages,
 launch/relaunch Messages, or control any Codex process.
@@ -92,17 +107,24 @@ start`, switch Desktop to another backend, or signal Desktop-owned processes.
 - An installed Codex build supported by this service. The app version,
   app-server version, signed native device-key module, and module digest are
   pinned and fail closed after an unsupported Codex update.
-- `imsg` 0.13.0 with the daemon-contacts, custom-emoji tapback, macOS 27 edit,
-  and runtime-hardening patches (`docs/imsg-*.patch`), plus the full IMCore
-  bridge enabled. The client-owned message-GUID patch may remain installed for
-  compatibility and diagnostics, but outgoing user mirrors do not require or
-  use it.
+- `imsg` 0.13.0 with the patches applied in this exact order:
+  `imsg-0.13.0-daemon-contacts.patch`,
+  `imsg-custom-emoji-tapbacks.patch`, `imsg-macos27-edit.patch`,
+  `imsg-runtime-hardening.patch`, `imsg-client-guid.patch`, then
+  `imsg-transcript-visible.patch`, plus the full IMCore bridge enabled. The
+  client-GUID patch is a source/build prerequisite for the transcript-visible
+  patch even though outgoing user mirrors do not use its RPC method or require
+  its runtime capability.
 - The active Codex profile also needs the local `imsg` full IMCore bridge active
-  for outgoing user mirrors. Its status must advertise standard `send.rich`.
-  `selectors.clientMessageGuid` and `send.rich.client-guid` are optional and
-  are not mirror-readiness requirements. The service probes the standard rich
-  bridge but never launches or relaunches Messages automatically; core helper
-  and Codex functions remain independent.
+  for outgoing user mirrors. Its status must advertise both the
+  `send.rich.transcript-visible` RPC method and
+  `selectors.transcriptVisibleSend: true`; the static method list alone cannot
+  prove that Messages loaded the patched helper. Advertising only standard
+  `send.rich` is not sufficient. `selectors.clientMessageGuid` and
+  `send.rich.client-guid` are optional and are not mirror-readiness
+  requirements. The service probes the transcript-visible bridge but never
+  launches or relaunches Messages automatically; core helper and Codex
+  functions remain independent.
 - Network access to OpenAI authentication and Remote Control endpoints.
 - Node.js 22.6 or newer and pnpm 10.26.
 
@@ -400,10 +422,10 @@ Codex on the Mac.
 - Native message GUID routing, poll state, mute/listen state, run state, and
   live-mirror offsets are private local files. The user-mirror journal stores
   hashes, markers, and routing metadata, never message bodies.
-- New user-mirror journals use clean standard rich sends and bridge-assigned
-  GUIDs. Definitely-unsent prepared legacy entries may migrate to that path;
-  any historical caller-GUID entry with attempt evidence remains immutable and
-  is reconciled by its persisted identity without another send.
+- New user-mirror journals use clean transcript-visible rich sends and
+  bridge-assigned GUIDs. Definitely-unsent prepared legacy entries may migrate
+  to that path; any historical caller-GUID entry with attempt evidence remains
+  immutable and is reconciled by its persisted identity without another send.
 - Helper/watch degradation changes local service readiness immediately and
   recovers without claiming a healthy state prematurely.
 - Periodic bridge/account checks run asynchronously and sequentially, tolerate

@@ -124,8 +124,8 @@ function fakeImsg(options = {}) {
   const status = options.status || {
     advanced_features: true,
     v2_ready: true,
-    selectors: { clientMessageGuid: true },
-    rpc_methods: ["send.rich", "send.rich.client-guid"],
+    selectors: { clientMessageGuid: true, transcriptVisibleSend: true },
+    rpc_methods: ["send.rich", "send.rich.transcript-visible", "send.rich.client-guid"],
   };
   const account = options.account || { account_login: USER_IDENTITY };
   const chats = options.chats || [directChat()];
@@ -184,6 +184,7 @@ function fakeImsg(options = {}) {
             text: params.text,
             thread_originator_guid: params.reply_to,
             reply_to_guid: params.reply_to,
+            created_at: "2026-07-14T12:00:00.000Z",
             ...(override && typeof override === "object" ? override : {}),
           });
         }
@@ -218,6 +219,7 @@ function createSender({
   conversationKey = null,
   discoveryTimeoutMs = 2,
   reconcileTimeoutMs = 2,
+  sendLeaseTimeoutMs = 2_000,
 } = {}) {
   return new LocalUserMirrorSender({
     stateFile,
@@ -232,6 +234,7 @@ function createSender({
     discoveryTimeoutMs,
     reconcileTimeoutMs,
     sendTimeoutMs: 50,
+    sendLeaseTimeoutMs,
     conversationKey,
   });
 }
@@ -309,13 +312,13 @@ test("pins only a root-proven direct external iMessage chat and rejects unrelate
   }
 });
 
-test("transcript-visible mirrors require standard send.rich, not the caller-GUID extension", async () => {
+test("transcript-visible mirrors require the dedicated transcript-visible RPC method", async () => {
   const fake = fakeImsg({
     status: {
       advanced_features: true,
       v2_ready: true,
-      selectors: { clientMessageGuid: true },
-      rpc_methods: ["send.rich"],
+      selectors: { clientMessageGuid: true, transcriptVisibleSend: true },
+      rpc_methods: ["send.rich", "send.rich.transcript-visible"],
     },
   });
   const item = fixture({ fake });
@@ -328,6 +331,39 @@ test("transcript-visible mirrors require standard send.rich, not the caller-GUID
   assert.equal(fake.sendCalls().length, 1);
   assert.equal("client_guid" in fake.sendCalls()[0].params, false,
     "new mirrors must use Messages' transcript-visible GUID allocation");
+  assert.equal(fake.sendCalls()[0].params.transcript_visible, true);
+});
+
+test("an older standard-rich bridge fails closed before a mirror send", async () => {
+  const fake = fakeImsg({
+    status: {
+      advanced_features: true,
+      v2_ready: true,
+      selectors: { clientMessageGuid: true },
+      rpc_methods: ["send.rich", "send.rich.client-guid"],
+    },
+  });
+  const item = fixture({ fake });
+  const status = await initialize(item.sender);
+  assert.equal(status.available, false);
+  assert.equal(status.status, "ACTIVATION_REQUIRED");
+  assert.equal(fake.sendCalls().length, 0);
+});
+
+test("a static transcript-visible method advertisement fails closed without the injected selector", async () => {
+  const fake = fakeImsg({
+    status: {
+      advanced_features: true,
+      v2_ready: true,
+      selectors: { clientMessageGuid: true, transcriptVisibleSend: false },
+      rpc_methods: ["send.rich", "send.rich.transcript-visible"],
+    },
+  });
+  const item = fixture({ fake });
+  const status = await initialize(item.sender);
+  assert.equal(status.available, false);
+  assert.equal(status.status, "ACTIVATION_REQUIRED");
+  assert.equal(fake.sendCalls().length, 0);
 });
 
 test("canonicalizes the expected local sender alias and fails closed on account or chat-sender mismatch", async (t) => {
@@ -638,6 +674,43 @@ test("accepted sends are delivery-idempotent across sender and router restart", 
   assert.deepEqual(duplicate.guids, [bridgeGuid(1)]);
   assert.equal(fake.sendCalls().length, 1);
   assert.equal(resumedRouter.nativeThread(THREAD_ID).latestGuid, bridgeGuid(1));
+});
+
+test("two sender instances racing one delivery cross the native send boundary only once", async () => {
+  let releaseFirst;
+  const firstBlocked = new Promise((resolve) => { releaseFirst = resolve; });
+  const fake = fakeImsg({
+    onSendRich: async () => {
+      await firstBlocked;
+      return { ok: true, guid: bridgeGuid(71) };
+    },
+  });
+  const item = fixture({ fake });
+  await initialize(item.sender);
+  const second = createSender({
+    stateFile: item.senderFile,
+    router: item.router,
+    fake,
+    clock: item.clock,
+    sendLeaseTimeoutMs: 5_000,
+  });
+  await initialize(second);
+
+  const firstAttempt = item.sender.sendMirror(mirror({ deliveryId: "two-instance-race" }));
+  for (let attempt = 0; attempt < 100 && fake.sendCalls().length === 0; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 1));
+  }
+  assert.equal(fake.sendCalls().length, 1);
+  const secondAttempt = second.sendMirror(mirror({ deliveryId: "two-instance-race" }));
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.equal(fake.sendCalls().length, 1, "the waiting instance cannot issue a second native send");
+
+  releaseFirst();
+  const [firstResult, secondResult] = await Promise.all([firstAttempt, secondAttempt]);
+  assert.equal(firstResult.classification, "accepted");
+  assert.equal(secondResult.classification, "duplicate");
+  assert.equal(fake.sendCalls().length, 1);
+  assert.deepEqual(item.router.pendingActions(), []);
 });
 
 test("a durable receiver receipt prevents stale reservation repair after seen-GUID eviction", async () => {
@@ -1071,6 +1144,120 @@ test("a nominal bridge acceptance remains ambiguous without exact local GUID and
     assert.deepEqual(result.guids, []);
     assert.equal(fake.sendCalls().length, 1);
   });
+});
+
+test("unique post-attempt sender history corrects a stale bridge GUID instead of losing parked input", async () => {
+  const body = "A repeated body with a stale last-sent GUID";
+  const fake = fakeImsg({
+    history: [
+      rootRow(),
+      {
+        id: 7_000,
+        guid: "STALE-OLDER-GUID",
+        chat_id: 42,
+        chat_guid: CHAT_GUID,
+        is_from_me: true,
+        text: body,
+        thread_originator_guid: ROOT_GUID,
+        reply_to_guid: ROOT_GUID,
+        created_at: "2026-07-14T11:59:59.000Z",
+      },
+    ],
+    onSendRich: () => ({ ok: true, guid: "STALE-OLDER-GUID" }),
+    sentRow: {
+      guid: "ACTUAL-POST-ATTEMPT-GUID",
+      created_at: "2026-07-14T12:00:00.000Z",
+    },
+  });
+  const item = fixture({ fake, reconcileTimeoutMs: 1 });
+  await initialize(item.sender);
+
+  const result = await item.sender.sendMirror(mirror({
+    deliveryId: "stale-returned-guid",
+    body,
+  }));
+  assert.equal(result.classification, "accepted");
+  assert.deepEqual(result.guids, ["ACTUAL-POST-ATTEMPT-GUID"]);
+  assert.equal(fake.sendCalls().length, 1);
+  const reservationId = localUserMirrorInternals.deliveryKey("stale-returned-guid", THREAD_ID, 0);
+  assert.equal(item.router.userMirrorEchoReceipt(reservationId)?.guid, undefined,
+    "the exact receiving row still supplies the eventual durable receipt");
+  const journal = JSON.parse(readFileSync(item.senderFile, "utf8"));
+  assert.equal(journal.deliveries[reservationId].guid, "ACTUAL-POST-ATTEMPT-GUID");
+});
+
+test("multiple post-attempt body-and-root matches remain quarantined instead of guessing a mirror GUID", async () => {
+  const body = "Two indistinguishable outgoing rows";
+  const fake = fakeImsg({
+    history: [
+      rootRow(),
+      {
+        id: 7_010,
+        guid: "COMPETING-POST-ATTEMPT-GUID",
+        chat_id: 42,
+        chat_guid: CHAT_GUID,
+        is_from_me: true,
+        text: body,
+        thread_originator_guid: ROOT_GUID,
+        reply_to_guid: ROOT_GUID,
+        created_at: "2026-07-14T12:00:00.000Z",
+      },
+    ],
+    onSendRich: () => ({ ok: true, guid: "STALE-PROPOSED-GUID" }),
+    sentRow: {
+      guid: "ACTUAL-BUT-AMBIGUOUS-GUID",
+      created_at: "2026-07-14T12:00:00.000Z",
+    },
+  });
+  const item = fixture({ fake, reconcileTimeoutMs: 1 });
+  await initialize(item.sender);
+
+  const result = await item.sender.sendMirror(mirror({
+    deliveryId: "ambiguous-history-guid",
+    body,
+  }));
+  assert.equal(result.classification, "ambiguous");
+  assert.deepEqual(result.guids, []);
+  assert.equal(fake.sendCalls().length, 1);
+  const reservationId = localUserMirrorInternals.deliveryKey("ambiguous-history-guid", THREAD_ID, 0);
+  const reservation = JSON.parse(readFileSync(item.routerFile, "utf8")).userMirrorEchoes
+    .find((echo) => echo.reservationId === reservationId);
+  assert.equal(reservation.expectedGuid, "STALE-PROPOSED-GUID");
+  assert.equal(reservation.guidVerified, false);
+});
+
+test("an exact returned GUID wins among multiple post-attempt matches only after time corroboration", async () => {
+  const body = "Two timely rows with an exact object GUID";
+  const fake = fakeImsg({
+    history: [
+      rootRow(),
+      {
+        id: 7_020,
+        guid: "OTHER-TIMELY-GUID",
+        chat_id: 42,
+        chat_guid: CHAT_GUID,
+        is_from_me: true,
+        text: body,
+        thread_originator_guid: ROOT_GUID,
+        reply_to_guid: ROOT_GUID,
+        created_at: "2026-07-14T12:00:00.000Z",
+      },
+    ],
+    onSendRich: () => ({ ok: true, guid: "EXACT-TIMELY-GUID" }),
+    sentRow: {
+      guid: "EXACT-TIMELY-GUID",
+      created_at: "2026-07-14T12:00:00.000Z",
+    },
+  });
+  const item = fixture({ fake, reconcileTimeoutMs: 1 });
+  await initialize(item.sender);
+
+  const result = await item.sender.sendMirror(mirror({
+    deliveryId: "exact-among-timely",
+    body,
+  }));
+  assert.equal(result.classification, "accepted");
+  assert.deepEqual(result.guids, ["EXACT-TIMELY-GUID"]);
 });
 
 test("an ambiguous attempted send never retries or permits helper fallback, including after restart", async () => {
@@ -1698,14 +1885,16 @@ test("long Unicode mirrors use bounded clean native multipart replies", async ()
 });
 
 test("multipart delivery continues after one part becomes ambiguous and never retries that part blindly", async () => {
+  let item;
   const fake = fakeImsg({
     onSendRich: ({ sendSequence, params }) => {
       if (sendSequence === 1) throw Object.assign(new Error("connection closed after write"), { attempted: true });
       assert.equal("client_guid" in params, false);
       return { ok: true, guid: bridgeGuid(sendSequence) };
     },
+    sentRow: () => ({ created_at: new Date(item.clock.now()).toISOString() }),
   });
-  const item = fixture({ fake, reconcileTimeoutMs: 1 });
+  item = fixture({ fake, reconcileTimeoutMs: 1 });
   await initialize(item.sender);
   const body = "🙂".repeat(60_000);
   const request = mirror({ deliveryId: "partially-ambiguous", body });

@@ -22,12 +22,14 @@ import {
 import { imsgTransportInternals } from "./imsg-transport.mjs";
 import { ImsgClient } from "./imsg-client.mjs";
 import { IMSG_RPC_SEND_TIMEOUT_MS } from "./imsg-timeouts.mjs";
+import { ExclusiveProcessLease } from "./exclusive-process-lease.mjs";
 import { richTextIntent } from "../../protocol/rich-presentation.ts";
 
 const STATE_VERSION = 1;
 const DEFAULT_DISCOVERY_TIMEOUT_MS = 10_000;
 const DEFAULT_RECONCILE_TIMEOUT_MS = 8_000;
 const DEFAULT_SEND_TIMEOUT_MS = IMSG_RPC_SEND_TIMEOUT_MS;
+const DEFAULT_SEND_LEASE_TIMEOUT_MS = 2 * 60 * 1000;
 const MAX_OUTPUT_BYTES = 8 * 1024 * 1024;
 const MAX_DELIVERIES = 4096;
 const AMBIGUOUS_DEAD_LETTER_MS = 15 * 60 * 1000;
@@ -237,6 +239,12 @@ function messageGuid(value) {
   return clean(value?.guid ?? value?.message_guid ?? value?.messageGuid);
 }
 
+function messageCreatedAtMs(value) {
+  const timestamp = clean(value?.created_at ?? value?.createdAt);
+  const milliseconds = Date.parse(timestamp);
+  return Number.isFinite(milliseconds) ? milliseconds : null;
+}
+
 function participantValues(chat) {
   return (Array.isArray(chat?.participants) ? chat.participants : [])
     .map((value) => typeof value === "string" ? value : value?.handle ?? value?.identifier ?? value?.address)
@@ -318,6 +326,8 @@ export class LocalUserMirrorSender {
     discoveryTimeoutMs = DEFAULT_DISCOVERY_TIMEOUT_MS,
     reconcileTimeoutMs = DEFAULT_RECONCILE_TIMEOUT_MS,
     sendTimeoutMs = DEFAULT_SEND_TIMEOUT_MS,
+    sendLeaseTimeoutMs = DEFAULT_SEND_LEASE_TIMEOUT_MS,
+    sendLeaseFactory = null,
     conversationKey = null,
     imsgClientFactory = null,
     allowUnsafeTestBinary = false,
@@ -332,6 +342,10 @@ export class LocalUserMirrorSender {
     this.discoveryTimeoutMs = discoveryTimeoutMs;
     this.reconcileTimeoutMs = reconcileTimeoutMs;
     this.sendTimeoutMs = sendTimeoutMs;
+    this.sendLeaseTimeoutMs = Math.max(1_000, Number(sendLeaseTimeoutMs) || DEFAULT_SEND_LEASE_TIMEOUT_MS);
+    this.sendLeaseFactory = sendLeaseFactory || (() => new ExclusiveProcessLease({
+      lockPath: `${this.stateFile}.send-lease`,
+    }));
     this.conversationKey = clean(conversationKey) || null;
     this.imsgClientFactory = imsgClientFactory || ((binary) => new ImsgClient({
       binary,
@@ -363,7 +377,7 @@ export class LocalUserMirrorSender {
   }
 
   sendMirror(message) {
-    return this.#enqueue(() => this.#sendMirror(message));
+    return this.#enqueue(() => this.#sendMirrorWithLease(message));
   }
 
   async stop() {
@@ -380,6 +394,31 @@ export class LocalUserMirrorSender {
     const result = this.chain.then(operation, operation);
     this.chain = result.then(() => undefined, () => undefined);
     return result;
+  }
+
+  async #sendMirrorWithLease(message) {
+    const lease = this.sendLeaseFactory();
+    try {
+      await lease.acquire({ timeoutMs: this.sendLeaseTimeoutMs });
+    } catch (error) {
+      if (error?.code !== "SERVICE_LEASE_BUSY") throw error;
+      return deliveryResult("unavailable", {
+        status: "MIRROR_BUSY",
+        attempted: false,
+        retryable: true,
+        fallbackSafe: false,
+      });
+    }
+    try {
+      // Another process may have completed this deterministic delivery while
+      // this instance waited. Refresh only the sender journal under the lease;
+      // an accepted or ambiguous attempt must never cross the native send
+      // boundary again.
+      this.state = readState(this.stateFile, this.conversationKey);
+      return await this.#sendMirror(message);
+    } finally {
+      lease.release();
+    }
   }
 
   async #run(args, { timeout = 10_000, maxBuffer = MAX_OUTPUT_BYTES } = {}) {
@@ -428,7 +467,9 @@ export class LocalUserMirrorSender {
       if (!this.binary) await this.#locateBinary();
       const status = (await this.#runJson(["status", "--json"], { timeout: 8_000, maxBuffer: 512 * 1024 }))[0];
       const methods = new Set(Array.isArray(status?.rpc_methods) ? status.rpc_methods : []);
-      if (status?.advanced_features !== true || status?.v2_ready !== true || !methods.has("send.rich")) {
+      if (status?.advanced_features !== true || status?.v2_ready !== true
+        || !methods.has("send.rich.transcript-visible")
+        || status?.selectors?.transcriptVisibleSend !== true) {
         return this.#unavailable("ACTIVATION_REQUIRED");
       }
       const account = (await this.#runJson(["account", "--json"], { timeout: 8_000, maxBuffer: 512 * 1024 }))[0];
@@ -569,7 +610,9 @@ export class LocalUserMirrorSender {
     try {
       const status = (await this.#runJson(["status", "--json"], { timeout: 8_000, maxBuffer: 512 * 1024 }))[0];
       const methods = new Set(Array.isArray(status?.rpc_methods) ? status.rpc_methods : []);
-      if (status?.advanced_features !== true || status?.v2_ready !== true || !methods.has("send.rich")) {
+      if (status?.advanced_features !== true || status?.v2_ready !== true
+        || !methods.has("send.rich.transcript-visible")
+        || status?.selectors?.transcriptVisibleSend !== true) {
         return this.#unavailable("ACTIVATION_REQUIRED");
       }
       const account = (await this.#runJson(["account", "--json"], { timeout: 8_000, maxBuffer: 512 * 1024 }))[0];
@@ -628,15 +671,36 @@ export class LocalUserMirrorSender {
   async #findTaggedMessage(entry, expectedGuid = "") {
     const requiredGuid = clean(expectedGuid);
     const rows = await this.#history().catch(() => []);
-    return rows.find((row) => {
+    const matches = rows.filter((row) => {
       const contextRoot = clean(row?.thread_originator_guid ?? row?.threadOriginatorGuid);
       const cleanBodyMatches = (!isClientGuidDelivery(entry) && entry.wireMode === WIRE_MODE_TAGGED)
         || hash("local-user-mirror-body-v1", typeof row?.text === "string" ? row.text : "") === entry.bodyHash;
       return row?.is_from_me === true
-        && (requiredGuid ? messageGuid(row) === requiredGuid : containsMarker(row?.text, entry.token))
         && cleanBodyMatches
-        && contextRoot === entry.rootGuid;
-    }) || null;
+        && contextRoot === entry.rootGuid
+        && Boolean(messageGuid(row));
+    });
+    if (isClientGuidDelivery(entry)) {
+      return requiredGuid ? matches.find((row) => messageGuid(row) === requiredGuid) || null : null;
+    }
+
+    // A bridge acknowledgement can name a stale adjacent send. Recover only
+    // from independently authoritative sender history: an exact outgoing body
+    // and Reply root, created after this delivery crossed its attempt boundary,
+    // with exactly one native GUID. Legacy tagged rows have their per-delivery
+    // high-entropy marker as stronger identity evidence and do not need time
+    // correlation. Any missing timestamp or second candidate remains
+    // ambiguous, preserving both genuine input and at-most-once mirror sends.
+    const attemptedAt = Date.parse(entry.attemptedAt || entry.preparedAt);
+    const candidates = matches.filter((row) => {
+      if (entry.wireMode === WIRE_MODE_TAGGED) return containsMarker(row?.text, entry.token);
+      const createdAt = messageCreatedAtMs(row);
+      return Number.isFinite(attemptedAt) && Number.isFinite(createdAt)
+        && createdAt >= attemptedAt && createdAt <= this.now();
+    });
+    const unique = new Map(candidates.map((row) => [messageGuid(row), row]));
+    if (requiredGuid && unique.has(requiredGuid)) return unique.get(requiredGuid);
+    return unique.size === 1 ? [...unique.values()][0] : null;
   }
 
   async #reconcile(entry, expectedGuid = "") {
@@ -745,7 +809,7 @@ export class LocalUserMirrorSender {
         // can be delivered to the recipient without appearing in the sending
         // profile's transcript, which defeats the purpose of a conversation
         // mirror. The receiver briefly holds the exact clean body + Reply root
-        // until this standard send returns its bridge-assigned GUID.
+        // until this transcript-visible send returns its bridge-assigned GUID.
         clientGuidMode: false,
         rootGuid,
         status: "prepared",
@@ -763,7 +827,7 @@ export class LocalUserMirrorSender {
         && !entry.deadLetteredAt && !receiverReceiptGuid;
       if (isClientGuidDelivery(entry) && noAttemptEvidence) {
         // A prepared caller-GUID journal has not crossed the send boundary.
-        // Convert it to the transcript-visible standard path before dispatch;
+        // Convert it to the transcript-visible path before dispatch;
         // attempted historical caller-GUID entries remain immutable and are
         // reconciled by their exact persisted identity below.
         // Release the old body/marker reservation first. If this process dies
@@ -777,7 +841,7 @@ export class LocalUserMirrorSender {
       } else if (!isClientGuidDelivery(entry) && noAttemptEvidence && !entry.guid) {
         // Current clean entries are already safe, while a definitely-unsent
         // legacy tagged entry can shed its obsolete Unicode correlation marker
-        // before using the same standard bridge-assigned GUID path.
+        // before using the same transcript-visible bridge-assigned GUID path.
         if (entry.wireMode !== WIRE_MODE_PLAIN || entry.clientGuidMode !== false) {
           this.router.releaseUserMirrorEcho(key);
           entry.wireMode = WIRE_MODE_PLAIN;
@@ -907,6 +971,7 @@ export class LocalUserMirrorSender {
         text,
         text_formatting: formatting,
         reply_to: rootGuid,
+        transcript_visible: true,
         // The bridge can return the constructed message GUID immediately on
         // this path. Its queued/text-search verifier required a hidden unique
         // suffix and could associate simultaneous equal text with the wrong
@@ -970,7 +1035,8 @@ export class LocalUserMirrorSender {
     }
     const guid = messageGuid(result) || this.#receiverReceiptGuid(key, entry);
     if (guid) entry.guid = guid;
-    // A bridge acknowledgement is only provisional. `send.rich` may return
+    // A bridge acknowledgement is only provisional. The transcript-visible
+    // rich method may return
     // ok/queued without a GUID, and its built-in verifier does not prove that
     // the row retained the requested native Reply root. Accept only after the
     // exact returned GUID is visible locally on the exact root. If the bridge
@@ -979,7 +1045,7 @@ export class LocalUserMirrorSender {
     // fail-closed when the bridge omits authoritative GUID evidence.
     const verified = await this.#reconcile(entry, guid);
     const verifiedGuid = messageGuid(verified);
-    if (!verified || !verifiedGuid || (guid && verifiedGuid !== guid)) {
+    if (!verified || !verifiedGuid) {
       return this.#unresolvedPart(key, entry);
     }
     this.#acceptPart(key, entry, threadId, verifiedGuid);

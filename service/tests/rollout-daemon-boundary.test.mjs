@@ -42,3 +42,12 @@ test("daemon immediately dispatches genuine actions released by mirror GUID reso
   const delivery = daemon.slice(start, end);
   assert.match(delivery, /try \{[\s\S]*localUserMirrorSender\.sendMirror\([\s\S]*\} finally \{[\s\S]*drainReleasedUserMirrorActions\(\)[\s\S]*queueLocalAction\(action\)/);
 });
+
+test("daemon holds one private service lease without locking Codex", () => {
+  const daemon = readFileSync(path.join(repo, "service/src/daemon.mjs"), "utf8");
+  assert.match(daemon, /new ExclusiveProcessLease\(\{ lockPath: `\$\{paths\.home\}\/daemon\.lease` \}\)/);
+  assert.match(daemon, /async function main\(\) \{\s*[\s\S]{0,500}await daemonLease\.acquire\(\{ timeoutMs: 30_000 \}\);\s*serviceReadiness\.markStarting\(\);/);
+  assert.match(daemon, /daemonLease\.release\(\);\s*process\.exit\(0\);/);
+  assert.doesNotMatch(daemon, /stateDb.*(?:lock|lease)|sessions.*(?:lock|lease)|codexRuntime.*(?:lock|lease)/i,
+    "the singleton boundary must remain confined to the handoff service home");
+});

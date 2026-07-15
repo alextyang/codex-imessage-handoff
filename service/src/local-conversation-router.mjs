@@ -662,12 +662,6 @@ function pruneOutboundEchoes(state, nowMs) {
   return state.outboundEchoes.length !== before;
 }
 
-function pruneUserMirrorEchoes(state, nowMs) {
-  const before = state.userMirrorEchoes.length;
-  state.userMirrorEchoes = state.userMirrorEchoes.filter((echo) => Date.parse(echo.expiresAt) > nowMs);
-  return state.userMirrorEchoes.length !== before;
-}
-
 function normalizeMessage(message) {
   const key = messageKey(message);
   if (!key) return null;
@@ -935,6 +929,57 @@ export class LocalConversationRouter {
     this.conversationReset = conversationNeedsReset(this.stateFile, conversationKey);
     this.state = readState(this.stateFile, conversationKey);
     this.releasedUserMirrorActions = [];
+  }
+
+  #ingestQuarantinedUserMirrorCandidates(echo, excludeGuidValue = null) {
+    const excludeGuid = cleanString(excludeGuidValue, 256);
+    const protectedPendingKeys = new Set(this.state.pending.map((action) => action.messageKey));
+    const released = [];
+    for (const parked of Array.isArray(echo?.quarantinedCandidates) ? echo.quarantinedCandidates : []) {
+      if (!parked?.message || (excludeGuid && parked.guid === excludeGuid)) continue;
+      const parkedMessageKey = messageKey(parked.message);
+      const wasPending = this.state.pending.some((action) => action.messageKey === parkedMessageKey);
+      const action = this.#ingest(parked.message, false);
+      if (action && !wasPending && !released.some((item) => item.messageKey === action.messageKey)) {
+        released.push(action);
+        protectedPendingKeys.add(action.messageKey);
+      }
+    }
+    // #ingest normally keeps the inbox bounded by evicting its oldest item.
+    // Releasing a private quarantine must be lossless instead: if there is no
+    // durable inbox capacity, leave the reservation and all parked rows intact
+    // so the caller can retry after pending work is acknowledged.
+    if ([...protectedPendingKeys].some((key) => !this.state.pending.some((action) => action.messageKey === key))) {
+      throw Object.assign(new Error("The user-mirror quarantine cannot be released while the inbox is full."), {
+        code: "IMSG_MIRROR_ECHO_RELEASE_BLOCKED",
+      });
+    }
+    return released;
+  }
+
+  #pruneUserMirrorEchoes(nowMs) {
+    const survivors = [];
+    let changed = false;
+    for (const echo of this.state.userMirrorEchoes) {
+      if (Date.parse(echo.expiresAt) > nowMs) {
+        survivors.push(echo);
+        continue;
+      }
+      const hasParkedCandidates = Array.isArray(echo.quarantinedCandidates)
+        && echo.quarantinedCandidates.length > 0;
+      if (hasParkedCandidates) {
+        // Expiry is not evidence that an attempted native send did or did not
+        // commit. Keep this recovery record until the sender supplies an
+        // authoritative GUID (or an authoritative definitely-unsent release),
+        // otherwise both a genuine same-body reply and the actual mirror can
+        // be silently discarded together.
+        survivors.push(echo);
+        continue;
+      }
+      changed = true;
+    }
+    if (changed) this.state.userMirrorEchoes = survivors;
+    return changed;
   }
 
   get activeThreadId() { return this.state.activeThreadId; }
@@ -1297,7 +1342,7 @@ export class LocalConversationRouter {
       });
     }
     const nowMs = this.now();
-    const pruned = pruneUserMirrorEchoes(this.state, nowMs);
+    const pruned = this.#pruneUserMirrorEchoes(nowMs);
     const settled = this.state.userMirrorReceipts[reservationId];
     if (settled) {
       const exact = settled.threadId === threadId
@@ -1360,7 +1405,7 @@ export class LocalConversationRouter {
     const reservationId = cleanString(reservationIdValue, 96);
     const bodyHash = cleanString(bodyHashValue, 64)?.toLowerCase();
     if (!reservationId || (bodyHash && !/^[a-f0-9]{64}$/u.test(bodyHash))) return false;
-    const pruned = pruneUserMirrorEchoes(this.state, this.now());
+    const pruned = this.#pruneUserMirrorEchoes(this.now());
     const echo = this.state.userMirrorEchoes.find((item) => item.reservationId === reservationId);
     if (!echo) {
       if (pruned) writeState(this.stateFile, this.state);
@@ -1381,22 +1426,30 @@ export class LocalConversationRouter {
     const guid = cleanString(guidValue, 256);
     if (!reservationId || !guid) return false;
     try {
-      const pruned = pruneUserMirrorEchoes(this.state, this.now());
+      const pruned = this.#pruneUserMirrorEchoes(this.now());
       const echo = this.state.userMirrorEchoes.find((item) => item.reservationId === reservationId);
       if (!echo && pruned) writeState(this.stateFile, this.state);
       if (!echo) return false;
-      if (echo.expectedGuid && echo.expectedGuid !== guid) return false;
+      const verified = options.verified !== false;
+      if (echo.expectedGuid && echo.expectedGuid !== guid) {
+        // A proposed bridge GUID is deliberately non-authoritative. Exact
+        // sender-history proof may later identify a different native row; let
+        // that proof correct the proposal while never allowing one proposal
+        // to replace another or a verified identity to be rewritten.
+        if (!verified || echo.guidVerified === true) return false;
+      }
       echo.expectedGuid = guid;
-      if (options.verified !== false) echo.guidVerified = true;
+      if (verified) echo.guidVerified = true;
       const candidates = Array.isArray(echo.quarantinedCandidates) ? echo.quarantinedCandidates : [];
       const candidate = candidates.find((item) => item.guid === guid);
-      const released = [];
-      for (const parked of candidates) {
-        if (parked.guid === guid || !parked.message) continue;
-        const action = this.#ingest(parked.message, false);
-        if (action && !released.some((item) => item.messageKey === action.messageKey)) released.push(action);
-      }
-      if (candidate) {
+      const released = verified ? this.#ingestQuarantinedUserMirrorCandidates(echo, guid) : [];
+      // A bridge acknowledgement is only a proposed identity. It may precede
+      // the sender profile's exact history proof, and some bridge versions can
+      // return an operation/provisional GUID. Never release a body-matched row
+      // into Codex merely because it differs from that unverified proposal.
+      // The receiver can still settle an exact proposed-GUID row through
+      // consumeUserMirrorEcho's independent body/root/time corroboration.
+      if (candidate && verified) {
         const index = this.state.userMirrorEchoes.indexOf(echo);
         this.state.userMirrorEchoes.splice(index, 1);
         this.state.seen.push(candidate.guid);
@@ -1408,7 +1461,7 @@ export class LocalConversationRouter {
         this.state.lastUserThreadAt = candidate.createdAt;
         this.state.lastUserMessageAt = candidate.createdAt;
         this.#recordUserMirrorReceipt(echo, guid);
-      } else {
+      } else if (verified) {
         // The authoritative GUID disproves every parked candidate. Their
         // ordinary actions are now durable, while this reservation remains to
         // suppress the actual mirror if its exact row arrives later.
@@ -1432,13 +1485,22 @@ export class LocalConversationRouter {
   releaseUserMirrorEcho(reservationIdValue) {
     const reservationId = cleanString(reservationIdValue, 96);
     if (!reservationId) return false;
-    const pruned = pruneUserMirrorEchoes(this.state, this.now());
-    const index = this.state.userMirrorEchoes.findIndex((echo) => echo.reservationId === reservationId);
-    if (index < 0 && pruned) writeState(this.stateFile, this.state);
-    if (index < 0) return false;
-    this.state.userMirrorEchoes.splice(index, 1);
-    writeState(this.stateFile, this.state);
-    return true;
+    const priorState = structuredClone(this.state);
+    try {
+      const pruned = this.#pruneUserMirrorEchoes(this.now());
+      const index = this.state.userMirrorEchoes.findIndex((echo) => echo.reservationId === reservationId);
+      if (index < 0 && pruned) writeState(this.stateFile, this.state);
+      if (index < 0) return false;
+      const echo = this.state.userMirrorEchoes[index];
+      const released = this.#ingestQuarantinedUserMirrorCandidates(echo);
+      this.state.userMirrorEchoes.splice(index, 1);
+      writeState(this.stateFile, this.state);
+      this.releasedUserMirrorActions.push(...released.map((action) => structuredClone(action)));
+      return true;
+    } catch (error) {
+      this.state = priorState;
+      throw error;
+    }
   }
 
   userMirrorEchoReceipt(reservationIdValue) {
@@ -1452,11 +1514,11 @@ export class LocalConversationRouter {
     if (!message || this.state.seen.includes(message.key)
       || this.state.pending.some((action) => action.messageKey === message.key)) return null;
     const nowMs = this.now();
-    const pruned = pruneUserMirrorEchoes(this.state, nowMs);
+    const pruned = this.#pruneUserMirrorEchoes(nowMs);
     const fingerprint = userMirrorProvisionalFingerprint(message.text);
     const messageCreatedAt = Date.parse(message.createdAt);
     const index = fingerprint && message.threadOriginatorGuid
-      ? this.state.userMirrorEchoes.findIndex((echo) => !echo.expectedGuid
+      ? this.state.userMirrorEchoes.findIndex((echo) => echo.guidVerified !== true
         // This match is only a bounded opportunity for the sender's exact
         // GUID to arrive. Visible body + Reply root are never sufficient to
         // consume or discard a message, whether the reservation is a new
@@ -1494,13 +1556,13 @@ export class LocalConversationRouter {
       if (!reservationId || !message?.guid || this.state.seen.includes(message.key)
         || this.state.pending.some((action) => action.messageKey === message.key)) return false;
       const nowMs = this.now();
-      pruneUserMirrorEchoes(this.state, nowMs);
+      this.#pruneUserMirrorEchoes(nowMs);
       const messageCreatedAt = Date.parse(message.createdAt);
       const fingerprint = userMirrorProvisionalFingerprint(message.text);
       const echo = this.state.userMirrorEchoes.find((item) => (
         item.reservationId === reservationId
         && item.dispatchMayHaveOccurred === true
-        && !item.expectedGuid
+        && item.guidVerified !== true
         && item.provisionalFingerprint === fingerprint
         && item.rootGuid === message.threadOriginatorGuid
         && message.hasReliableCreatedAt
@@ -1556,7 +1618,7 @@ export class LocalConversationRouter {
     if (!message || !message.guid || this.state.seen.includes(message.key)
       || this.state.pending.some((action) => action.messageKey === message.key)) return null;
     const nowMs = this.now();
-    const pruned = pruneUserMirrorEchoes(this.state, nowMs);
+    const pruned = this.#pruneUserMirrorEchoes(nowMs);
     let index = message.guid
       ? this.state.userMirrorEchoes.findIndex((echo) => echo.expectedGuid === message.guid)
       : -1;
@@ -1582,6 +1644,7 @@ export class LocalConversationRouter {
   }
 
   #settleUserMirrorEcho(message, echo, index) {
+    const released = this.#ingestQuarantinedUserMirrorCandidates(echo, message.guid);
     this.state.userMirrorEchoes.splice(index, 1);
     this.state.seen.push(message.key);
     this.state.seen = [...new Set(this.state.seen)].slice(-MAX_SEEN);
@@ -1596,6 +1659,7 @@ export class LocalConversationRouter {
     this.state.lastUserMessageAt = message.createdAt;
     if (message.guid) this.#recordUserMirrorReceipt(echo, message.guid);
     writeState(this.stateFile, this.state);
+    this.releasedUserMirrorActions.push(...released.map((action) => structuredClone(action)));
     return {
       reservationId: echo.reservationId,
       threadId: echo.threadId,
@@ -1623,7 +1687,7 @@ export class LocalConversationRouter {
   isReservedUserMirrorEcho(rawMessage) {
     const message = normalizeMessage(rawMessage);
     if (!message) return false;
-    const pruned = pruneUserMirrorEchoes(this.state, this.now());
+    const pruned = this.#pruneUserMirrorEchoes(this.now());
     if (pruned) writeState(this.stateFile, this.state);
     if (message.guid && this.state.userMirrorEchoes.some((echo) => (
       echo.expectedGuid === message.guid

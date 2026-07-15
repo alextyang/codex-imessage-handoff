@@ -239,10 +239,31 @@ The sole active-profile messaging exception is a target-locked `imsg rpc`
 child for mirroring Codex-authored user text as the outgoing half of the
 conversation. It may send only formatted text to the root-proven direct
 service chat and exact native task root. Prompt bodies cross stdin rather than
-argv. New mirrors use standard `send.rich` and the GUID assigned by Messages;
-the caller-GUID extension is optional and is not a readiness dependency. This
-standard path is required because caller-owned GUID messages can reach the
-recipient without rendering in the sending profile's transcript.
+argv. New mirrors use the distinct synchronous
+`send.rich.transcript-visible` capability and the GUID assigned by Messages;
+the caller-GUID extension is optional and is not a readiness dependency. The
+capability dispatches through the sending `IMChat`, which inserts the outgoing
+item into the live sender transcript. Readiness requires both the static
+`send.rich.transcript-visible` RPC method and the running helper's
+`selectors.transcriptVisibleSend: true` proof. Advertising only standard
+`send.rich`, or only the new method from an updated CLI with a stale injected
+helper, is insufficient: the service fails closed rather than use the
+registry-level background dispatch, which can persist and deliver a reply
+without refreshing the open sender transcript. The direct path carries all
+associated GUID/type/range and thread identifier/originator metadata on the
+new message object. It never mutates the chat's shared
+inline-reply controller or current-thread map. A reply fails before dispatch
+unless the selected GUID, derived thread identifier, parent message, and
+parent item are all available and the stamped metadata reads back exactly.
+
+The patched `imsg` 0.13.0 build has one canonical patch order:
+`imsg-0.13.0-daemon-contacts.patch`,
+`imsg-custom-emoji-tapbacks.patch`, `imsg-macos27-edit.patch`,
+`imsg-runtime-hardening.patch`, `imsg-client-guid.patch`, then
+`imsg-transcript-visible.patch`. The client-GUID patch is a source/build
+prerequisite for the transcript-visible patch. Its RPC method and runtime
+selector remain optional for service readiness because this send path never
+uses caller-owned GUIDs.
 
 A private delivery journal, exact native Reply-root reservation, confirmed
 bridge GUID, and dedicated-side echo ledger make the operation crash-idempotent
@@ -266,12 +287,18 @@ GUID, body, chat, and `thread_originator_guid`. Echo suppression then applies
 only to that GUID on that native Reply root, and a reused delivery ID cannot
 settle different content.
 
+The daemon owns one exclusive lease inside the handoff service's private home.
+Each normal-profile mirror send also takes a short-lived lease and reloads the
+delivery journal while holding it. This closes both launchd/manual process
+overlap and stale in-memory sender races without locking Codex, its task
+rollouts, its session database, or the Desktop app server.
+
 Outstanding tagged and caller-GUID journals remain readable only for migration
 and reconciliation. A definitely-unsent prepared entry may be converted to the
-clean standard path, but any entry with send-attempt evidence keeps its
-persisted identity and is never resent. Crash-bound or timed-out writes are
-reconciled without another send; after fifteen minutes, a body-free task notice
-advances the mirror.
+clean transcript-visible path, but any entry with send-attempt evidence keeps
+its persisted identity and is never resent. Crash-bound or timed-out writes
+are reconciled without another send; after fifteen minutes, a body-free task
+notice advances the mirror.
 It has no recipient, attachment, URL, watch, launch, or Messages lifecycle API;
 failure is a separate readiness capability and cannot degrade the helper or
 Codex Remote Control.

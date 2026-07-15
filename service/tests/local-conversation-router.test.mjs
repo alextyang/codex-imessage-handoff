@@ -1134,6 +1134,17 @@ test("an attempted clean mirror releases disproved candidates and fails closed o
   assert.equal(router.confirmUserMirrorEcho(reservationId, "unrelated-returned-guid", { verified: false }), true);
   assert.equal(router.userMirrorEchoReceipt(reservationId), null,
     "a bridge GUID that names no quarantined row cannot promote one");
+  assert.deepEqual(router.pendingActions(), [],
+    "an unverified bridge proposal cannot release a possible mirror into Codex");
+  assert.deepEqual(router.drainReleasedUserMirrorActions(), []);
+  assert.equal(router.provisionalUserMirrorEcho(message(58_200, body, {
+    guid: "quarantined-0",
+    createdAt: "2026-07-12T12:00:01.000Z",
+    thread_originator_guid: "root-a",
+  })).reservationId, reservationId,
+  "an unverified expected GUID must not disable clean-body quarantine");
+
+  assert.equal(router.confirmUserMirrorEcho(reservationId, "unrelated-returned-guid"), true);
   assert.deepEqual(
     router.pendingActions().map((action) => action.messageKey),
     Array.from({ length: 8 }, (_, index) => `quarantined-${index}`),
@@ -1169,6 +1180,10 @@ test("a late exact bridge GUID promotes its quarantined candidate into a body-bo
 
   const resumed = new LocalConversationRouter({ stateFile });
   assert.equal(resumed.confirmUserMirrorEcho(reservationId, "late-authoritative-guid", { verified: false }), true);
+  assert.equal(resumed.userMirrorEchoReceipt(reservationId), null,
+    "the bridge proposal alone cannot settle or release a parked row");
+  assert.deepEqual(resumed.pendingActions(), []);
+  assert.equal(resumed.confirmUserMirrorEcho(reservationId, "late-authoritative-guid"), true);
   const receipt = resumed.userMirrorEchoReceipt(reservationId);
   assert.equal(receipt.guid, "late-authoritative-guid");
   assert.equal(receipt.bodyHash, bodyHash);
@@ -1180,6 +1195,145 @@ test("a late exact bridge GUID promotes its quarantined candidate into a body-bo
     "restart recovery releases every nonmatching parked row before settling the exact mirror");
   assert.deepEqual(resumed.drainReleasedUserMirrorActions().map((action) => action.messageKey), ["genuine-same-body-guid"]);
   assert.equal(resumed.ingest(candidate), null, "the exact authoritative mirror remains suppressed");
+});
+
+test("receiver corroboration suppresses only the exact proposed mirror and releases every other parked row", () => {
+  const { router } = fixture();
+  router.routeOutboundGuid("root-a", "thread-a", { root: true });
+  const reservationId = "8".repeat(64);
+  const body = "Same body in two native rows";
+  const bodyHash = mirrorBodyHash(body);
+  router.reserveUserMirrorEcho({ reservationId, threadId: "thread-a", text: body, rootGuid: "root-a", bodyHash });
+  router.markUserMirrorEchoAttempted(reservationId, bodyHash);
+  const genuine = message(58_225, body, {
+    guid: "genuine-before-mirror",
+    createdAt: "2026-07-12T12:00:00.500Z",
+    thread_originator_guid: "root-a",
+  });
+  const mirror = message(58_226, body, {
+    guid: "proposed-exact-mirror",
+    createdAt: "2026-07-12T12:00:01.000Z",
+    thread_originator_guid: "root-a",
+  });
+  assert.equal(router.quarantineProvisionalUserMirrorEcho(genuine, reservationId), true);
+  assert.equal(router.quarantineProvisionalUserMirrorEcho(mirror, reservationId), true);
+  assert.equal(router.confirmUserMirrorEcho(reservationId, mirror.guid, { verified: false }), true);
+
+  const consumed = router.consumeUserMirrorEcho(mirror);
+  assert.equal(consumed.guid, mirror.guid);
+  assert.equal(router.userMirrorEchoReceipt(reservationId).guid, mirror.guid);
+  assert.deepEqual(router.pendingActions().map((action) => action.messageKey), [genuine.guid]);
+  assert.deepEqual(router.drainReleasedUserMirrorActions().map((action) => action.messageKey), [genuine.guid]);
+  assert.equal(router.ingest(mirror), null, "the exact mirror remains single-use after settlement");
+});
+
+test("authoritative sender history can correct a stale bridge proposal without losing parked input", () => {
+  const { router } = fixture();
+  router.routeOutboundGuid("root-a", "thread-a", { root: true });
+  const reservationId = "9".repeat(64);
+  const body = "Correct the stale native GUID";
+  const bodyHash = mirrorBodyHash(body);
+  router.reserveUserMirrorEcho({ reservationId, threadId: "thread-a", text: body, rootGuid: "root-a", bodyHash });
+  router.markUserMirrorEchoAttempted(reservationId, bodyHash);
+  const genuine = message(58_227, body, {
+    guid: "stale-proposed-guid",
+    createdAt: "2026-07-12T12:00:00.500Z",
+    thread_originator_guid: "root-a",
+  });
+  const authoritative = message(58_228, body, {
+    guid: "sender-history-guid",
+    createdAt: "2026-07-12T12:00:01.000Z",
+    thread_originator_guid: "root-a",
+  });
+  assert.equal(router.quarantineProvisionalUserMirrorEcho(genuine, reservationId), true);
+  assert.equal(router.quarantineProvisionalUserMirrorEcho(authoritative, reservationId), true);
+  assert.equal(router.confirmUserMirrorEcho(reservationId, genuine.guid, { verified: false }), true);
+  assert.equal(router.confirmUserMirrorEcho(reservationId, authoritative.guid), true,
+    "verified sender history may replace only an unverified proposal");
+  assert.equal(router.userMirrorEchoReceipt(reservationId).guid, authoritative.guid);
+  assert.deepEqual(router.pendingActions().map((action) => action.messageKey), [genuine.guid]);
+  assert.deepEqual(router.drainReleasedUserMirrorActions().map((action) => action.messageKey), [genuine.guid]);
+  assert.equal(router.confirmUserMirrorEcho(reservationId, "third-guid"), false,
+    "a settled authoritative identity is immutable");
+});
+
+test("expired attempted quarantines remain durable until an authoritative resolution releases them", () => {
+  const { router, stateFile, advance } = fixture();
+  router.routeOutboundGuid("root-a", "thread-a", { root: true });
+  const reservationId = "d".repeat(64);
+  const body = "Do not drop me at reservation expiry";
+  const bodyHash = mirrorBodyHash(body);
+  router.reserveUserMirrorEcho({ reservationId, threadId: "thread-a", text: body, rootGuid: "root-a", bodyHash });
+  router.markUserMirrorEchoAttempted(reservationId, bodyHash);
+  const parked = message(58_229, body, {
+    guid: "parked-genuine-guid",
+    createdAt: "2026-07-12T12:00:01.000Z",
+    thread_originator_guid: "root-a",
+  });
+  assert.equal(router.quarantineProvisionalUserMirrorEcho(parked, reservationId), true);
+
+  advance(31 * 24 * 60 * 60 * 1000);
+  assert.equal(router.markUserMirrorEchoAttempted(reservationId, bodyHash), true,
+    "expiry alone cannot discard an unresolved attempted quarantine");
+  let persisted = JSON.parse(readFileSync(stateFile, "utf8"));
+  assert.deepEqual(persisted.userMirrorEchoes[0].quarantinedCandidates.map((item) => item.guid), [parked.guid]);
+  assert.deepEqual(router.pendingActions(), []);
+
+  assert.equal(router.releaseUserMirrorEcho(reservationId), true,
+    "a definitely-unsent resolution atomically releases the parked message");
+  persisted = JSON.parse(readFileSync(stateFile, "utf8"));
+  assert.deepEqual(persisted.userMirrorEchoes, []);
+  assert.deepEqual(router.pendingActions().map((action) => action.messageKey), [parked.guid]);
+  assert.deepEqual(router.drainReleasedUserMirrorActions().map((action) => action.messageKey), [parked.guid]);
+  assert.equal(router.ingest(parked)?.messageKey, parked.guid,
+    "re-observation returns the same durable action instead of queueing a duplicate");
+  assert.equal(router.pendingActions().length, 1);
+});
+
+test("quarantine release rolls back before any original or newly released inbox action can be evicted", () => {
+  const { router, stateFile } = fixture();
+  router.routeOutboundGuid("root-a", "thread-a", { root: true });
+  router.setDefaultThread("thread-a");
+  const reservationId = "f".repeat(64);
+  const body = "Capacity-bound same-body reply";
+  const bodyHash = mirrorBodyHash(body);
+  router.reserveUserMirrorEcho({ reservationId, threadId: "thread-a", text: body, rootGuid: "root-a", bodyHash });
+  router.markUserMirrorEchoAttempted(reservationId, bodyHash);
+  for (const [offset, guid] of ["parked-capacity-one", "parked-capacity-two"].entries()) {
+    assert.equal(router.quarantineProvisionalUserMirrorEcho(message(58_240 + offset, body, {
+      guid,
+      createdAt: `2026-07-12T12:00:0${offset + 1}.000Z`,
+      thread_originator_guid: "root-a",
+    }), reservationId), true);
+  }
+  for (let index = 0; index < 127; index += 1) {
+    router.ingest(message(60_000 + index, `Existing pending prompt ${index}`, {
+      guid: `existing-pending-${index}`,
+      createdAt: "2026-07-12T12:00:05.000Z",
+      thread_originator_guid: "root-a",
+    }));
+  }
+  assert.equal(router.pendingActions().length, 127);
+
+  assert.throws(
+    () => router.releaseUserMirrorEcho(reservationId),
+    { code: "IMSG_MIRROR_ECHO_RELEASE_BLOCKED" },
+  );
+  assert.equal(router.pendingActions().length, 127);
+  assert.deepEqual(router.pendingActions().map((action) => action.messageKey),
+    Array.from({ length: 127 }, (_, index) => `existing-pending-${index}`));
+  assert.deepEqual(router.drainReleasedUserMirrorActions(), []);
+  let persisted = JSON.parse(readFileSync(stateFile, "utf8"));
+  assert.deepEqual(persisted.userMirrorEchoes[0].quarantinedCandidates.map((item) => item.guid),
+    ["parked-capacity-one", "parked-capacity-two"]);
+
+  assert.equal(router.acknowledge("existing-pending-0"), true);
+  assert.equal(router.releaseUserMirrorEcho(reservationId), true);
+  assert.equal(router.pendingActions().length, 128);
+  assert.deepEqual(router.drainReleasedUserMirrorActions().map((action) => action.messageKey),
+    ["parked-capacity-one", "parked-capacity-two"]);
+  persisted = JSON.parse(readFileSync(stateFile, "utf8"));
+  assert.deepEqual(persisted.userMirrorEchoes, []);
 });
 
 test("settled mirror ids are body-bound and legacy unbound receipts fail closed", () => {

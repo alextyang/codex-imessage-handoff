@@ -20,6 +20,7 @@ const fullStatus = {
   bridge_version: 2,
   v2_ready: true,
   selectors: {
+    transcriptVisibleSend: true,
     clientMessageGuid: true,
     urlPreviewMessage: true,
     sendRichLinkAction: true,
@@ -33,6 +34,7 @@ const fullStatus = {
     "watch.subscribe",
     "watch.unsubscribe",
     "send.rich",
+    "send.rich.transcript-visible",
     "send.rich.client-guid",
     "send.attachment",
     "poll.send",
@@ -153,6 +155,7 @@ test("locates imsg and reports normalized basic and bridge capabilities", async 
   assert.equal(status.available, true);
   assert.equal(status.version, "0.13.0");
   assert.equal(status.capabilities.richText, true);
+  assert.equal(status.capabilities.transcriptVisibleSend, true);
   assert.equal(status.capabilities.clientMessageGuid, true);
   assert.equal(status.capabilities.urlPreviews, true);
   assert.equal(status.capabilities.polls, true);
@@ -307,6 +310,46 @@ test("caller-owned message GUIDs are canonical, capability-gated, and forwarded 
   })).classification, "unsupported");
   assert.equal(mixedVersion.child.requests.length, 0,
     "a newer helper cannot make an older RPC binary safe to send through");
+});
+
+test("transcript-visible rich sends use a distinct capability-gated RPC method", async () => {
+  const available = createClient();
+  const sent = await available.client.sendRich({
+    chat_id: 42,
+    text: "visible mirror",
+    reply_to: "PARENT",
+    dd_scan: false,
+    transcript_visible: true,
+  });
+  assert.equal(sent.classification, "accepted");
+  const request = available.child.requests.find((item) => item.method === "send.rich.transcript-visible");
+  assert.equal(request.params.text, "visible mirror");
+  assert.equal(request.params.reply_to, "PARENT");
+  assert.equal("transcript_visible" in request.params, false,
+    "the dedicated method is the capability boundary; the marker is not silently passed to older RPC methods");
+  await available.client.stop();
+
+  const missingStatus = structuredClone(fullStatus);
+  missingStatus.rpc_methods = missingStatus.rpc_methods.filter((method) => method !== "send.rich.transcript-visible");
+  const missing = createClient({ status: missingStatus });
+  assert.equal((await missing.client.sendRich({
+    chat_id: 42,
+    text: "blocked",
+    transcript_visible: true,
+  })).classification, "unsupported");
+  assert.equal(missing.child.requests.length, 0,
+    "an older RPC binary must fail before any send request is written");
+
+  const staleHelperStatus = structuredClone(fullStatus);
+  delete staleHelperStatus.selectors.transcriptVisibleSend;
+  const staleHelper = createClient({ status: staleHelperStatus });
+  assert.equal((await staleHelper.client.sendRich({
+    chat_id: 42,
+    text: "blocked despite the static method list",
+    transcript_visible: true,
+  })).classification, "unsupported");
+  assert.equal(staleHelper.child.requests.length, 0,
+    "a new CLI with an old injected helper must fail before any send request is written");
 });
 
 test("an RPC binary swapped after capability probing rejects the distinct GUID method without legacy fallback", async () => {

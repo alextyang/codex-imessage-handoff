@@ -29,6 +29,7 @@ export const REQUIRED_PINNED_IMSG_CAPABILITIES = Object.freeze([
 
 const SEND_METHODS = new Set([
   "send.rich",
+  "send.rich.transcript-visible",
   "send.attachment",
   "poll.send",
   "poll.vote",
@@ -148,8 +149,18 @@ function normalizeRichSend(params) {
   const reply = requireBoundedString(params?.reply_to ?? params?.replyTo ?? params?.reply_to_guid, "reply_to", { optional: true, maxBytes: 4096 });
   const ddScan = params?.dd_scan ?? params?.ddScan;
   const clientGuid = requireBoundedString(params?.client_guid, "client_guid", { optional: true, maxBytes: 36 });
+  const transcriptVisible = params?.transcript_visible ?? params?.transcriptVisible;
   if (ddScan !== undefined && typeof ddScan !== "boolean") {
     throw rpcFailure("IMSG_INVALID_INPUT", "dd_scan must be a boolean.");
+  }
+  if (transcriptVisible !== undefined && typeof transcriptVisible !== "boolean") {
+    throw rpcFailure("IMSG_INVALID_INPUT", "transcript_visible must be a boolean.");
+  }
+  if (transcriptVisible === true && clientGuid) {
+    throw rpcFailure("IMSG_INVALID_INPUT", "transcript_visible cannot be combined with client_guid.");
+  }
+  if (transcriptVisible === true && ddScan === true) {
+    throw rpcFailure("IMSG_INVALID_INPUT", "transcript-visible sends must disable dd_scan.");
   }
   if (clientGuid && !/^[A-F0-9]{8}-[A-F0-9]{4}-4[A-F0-9]{3}-[89AB][A-F0-9]{3}-[A-F0-9]{12}$/u.test(clientGuid)) {
     throw rpcFailure("IMSG_INVALID_INPUT", "client_guid must be a canonical uppercase UUIDv4.");
@@ -157,11 +168,15 @@ function normalizeRichSend(params) {
 
   if (url) {
     if (!/^https?:\/\//i.test(url)) throw rpcFailure("IMSG_INVALID_INPUT", "url must use HTTP or HTTPS.");
-    if (file || text || formatting || effect || subject || reply || clientGuid) throw rpcFailure("IMSG_INVALID_INPUT", "A rich link cannot be combined with other send options.");
+    if (file || text || formatting || effect || subject || reply || clientGuid || transcriptVisible === true) {
+      throw rpcFailure("IMSG_INVALID_INPUT", "A rich link cannot be combined with other send options.");
+    }
     return { method: "send.rich", params: { ...target, url } };
   }
   if (file) {
-    if (text || formatting || effect || subject || clientGuid) throw rpcFailure("IMSG_INVALID_INPUT", "A rich attachment cannot be combined with rich text options.");
+    if (text || formatting || effect || subject || clientGuid || transcriptVisible === true) {
+      throw rpcFailure("IMSG_INVALID_INPUT", "A rich attachment cannot be combined with rich text options.");
+    }
     const audio = params?.audio ?? params?.is_audio ?? params?.as_voice;
     return {
       method: "send.attachment",
@@ -177,7 +192,11 @@ function normalizeRichSend(params) {
     // on the legacy send method. An older imsg RPC binary must reject the
     // method before it can silently discard client_guid and send a message the
     // caller cannot correlate.
-    method: clientGuid ? "send.rich.client-guid" : "send.rich",
+    method: clientGuid
+      ? "send.rich.client-guid"
+      : transcriptVisible === true
+        ? "send.rich.transcript-visible"
+        : "send.rich",
     params: {
       ...target,
       text,
@@ -278,6 +297,9 @@ function normalizedCapabilities(path, raw) {
       rpc: methods.length > 0,
       watch: has("watch.subscribe") && has("watch.unsubscribe"),
       richText: advanced && has("send.rich"),
+      transcriptVisibleSend: advanced
+        && has("send.rich.transcript-visible")
+        && selectors.transcriptVisibleSend === true,
       clientMessageGuid: advanced && has("send.rich.client-guid") && selectors.clientMessageGuid === true,
       effects: advanced && has("send.rich"),
       replies: advanced && has("send.rich"),
@@ -633,6 +655,8 @@ export class ImsgClient {
     }
     const feature = normalized.params.client_guid
       ? "clientMessageGuid"
+      : normalized.method === "send.rich.transcript-visible"
+        ? "transcriptVisibleSend"
       : normalized.method === "send.attachment"
         ? "attachments"
         : normalized.params.url ? "urlPreviews" : "richText";

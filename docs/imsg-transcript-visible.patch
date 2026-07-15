@@ -1,0 +1,627 @@
+/Users/alexyang/.zshenv:.:1: no such file or directory: /Users/alexyang/.cargo/env
+diff --git a/Sources/IMsgHelper/IMsgInjected.m b/Sources/IMsgHelper/IMsgInjected.m
+index 1a0e82f..4581815 100644
+--- a/Sources/IMsgHelper/IMsgInjected.m
++++ b/Sources/IMsgHelper/IMsgInjected.m
+@@ -308,6 +308,7 @@ static BOOL ensureSecureDirectory(NSString *path, NSError **error) {
+ static NSDictionary *nicknameSharingSelectorStatus(void);
+ static BOOL urlPreviewMessageInitializerAvailable(void);
+ static BOOL clientMessageGUIDReplyConstructorAvailable(void);
++static BOOL transcriptVisibleSendAvailable(void);
+
+ static SEL customEmojiReactionSelector(void) {
+     return NSSelectorFromString(
+@@ -419,6 +420,7 @@ - (NSAttributedString *)subject;
+ - (NSArray *)fileTransferGUIDs;
+ - (id)_imMessageItem;
+ - (NSString *)threadIdentifier;
++- (id)threadOriginator;
+ - (void)_updateText:(NSAttributedString *)attributedText;
+ - (void)setThreadIdentifier:(NSString *)threadIdentifier;
+ - (void)setThreadOriginator:(id)originator;
+@@ -1098,6 +1100,11 @@ static void releaseClientMessageGuid(NSString *guid) {
+                 && stickerAssociatedMessage),
+         @"urlPreviewMessage": @(urlPreviewMessageInitializerAvailable()),
+         @"sendRichLinkAction": @YES,
++        // This capability is intentionally advertised by the injected helper,
++        // not inferred from the CLI's static RPC method list. It proves the
++        // running Messages process loaded and can construct the exact direct
++        // IMChat reply path used by transcript-visible sends.
++        @"transcriptVisibleSend": @(transcriptVisibleSendAvailable()),
+         @"clientMessageGuid": @(gHasClientMessageGUIDReplyConstructor),
+         @"customEmojiReaction": @(gHasCustomEmojiReaction),
+         @"pollUpdateMessage": @(pollVoteMessageInitializerAvailable()),
+@@ -2013,6 +2020,31 @@ static void dispatchIMMessageInChat(IMChat *chat,
+     scheduleThreadContextClear(chat, threadIdentifier);
+ }
+
++/// Dispatch through IMChat itself so the sending Messages process inserts the
++/// outgoing item into its live transcript. The registry-level dispatch is
++/// reliable for background automation but can persist and deliver a reply
++/// without updating an already-open sender transcript.
++static BOOL dispatchTranscriptVisibleIMMessageInChat(IMChat *chat,
++                                                     id message,
++                                                     NSString *selectedMessageGuid,
++                                                     NSString *threadIdentifier,
++                                                     id parentMessage,
++                                                     id parentItem) {
++    if (!chat || !message || ![chat respondsToSelector:@selector(sendMessage:)]) {
++        return NO;
++    }
++    BOOL isReply = selectedMessageGuid.length > 0;
++    if (isReply
++        && (!threadIdentifier.length || !parentMessage || !parentItem)) {
++        return NO;
++    }
++    if (!isReply) {
++        clearReplyMetadataOnMessage(message);
++    }
++    [chat sendMessage:message];
++    return YES;
++}
++
+ static unsigned long long flagsForMessagePayload(NSAttributedString *subject,
+                                                  NSArray *fileTransferGuids,
+                                                  BOOL isAudioMessage);
+@@ -3176,6 +3208,134 @@ static id buildIMMessage(NSAttributedString *body,
+     return nil;
+ }
+
++/// A transcript-visible reply is self-contained on its IMMessage. It must not
++/// depend on mutable per-chat inline-reply state.
++static BOOL transcriptVisibleReplyMetadataMatches(id message,
++                                                  NSString *selectedMessageGuid,
++                                                  NSString *threadIdentifier,
++                                                  id parentMessage,
++                                                  id parentItem,
++                                                  NSRange associatedRange) {
++    if (!message || !selectedMessageGuid.length || !threadIdentifier.length
++        || !parentMessage || !parentItem) {
++        return NO;
++    }
++    if (![message respondsToSelector:@selector(associatedMessageGUID)]
++        || ![message respondsToSelector:@selector(associatedMessageType)]
++        || ![message respondsToSelector:@selector(associatedMessageRange)]
++        || ![message respondsToSelector:@selector(threadIdentifier)]
++        || ![message respondsToSelector:@selector(threadOriginator)]) {
++        return NO;
++    }
++    @try {
++        NSString *messageAssociatedGuid =
++            [message performSelector:@selector(associatedMessageGUID)];
++        long long messageAssociatedType = [(IMMessage *)message associatedMessageType];
++        NSRange messageAssociatedRange = [(IMMessage *)message associatedMessageRange];
++        NSString *messageThreadIdentifier =
++            [message performSelector:@selector(threadIdentifier)];
++        id messageThreadOriginator =
++            [message performSelector:@selector(threadOriginator)];
++
++        return [messageAssociatedGuid isEqualToString:selectedMessageGuid]
++            && messageAssociatedType == 100
++            && NSEqualRanges(messageAssociatedRange, associatedRange)
++            && [messageThreadIdentifier isEqualToString:threadIdentifier]
++            && messageThreadOriginator == parentMessage;
++    } @catch (__unused NSException *exception) {
++        return NO;
++    }
++}
++
++static BOOL stampTranscriptVisibleReplyMetadata(id message,
++                                                NSString *selectedMessageGuid,
++                                                NSString *threadIdentifier,
++                                                id parentMessage,
++                                                id parentItem,
++                                                NSRange associatedRange) {
++    if (!parentItem
++        || ![message respondsToSelector:@selector(setThreadIdentifier:)]
++        || ![message respondsToSelector:@selector(setThreadOriginator:)]) {
++        return NO;
++    }
++    @try {
++        [message performSelector:@selector(setThreadIdentifier:)
++                      withObject:threadIdentifier];
++        [message performSelector:@selector(setThreadOriginator:)
++                      withObject:parentMessage];
++    } @catch (__unused NSException *exception) {
++        return NO;
++    }
++    return transcriptVisibleReplyMetadataMatches(message,
++                                                 selectedMessageGuid,
++                                                 threadIdentifier,
++                                                 parentMessage,
++                                                 parentItem,
++                                                 associatedRange);
++}
++
++/// Probe the exact self-contained reply object and direct IMChat send surface
++/// used by `send.rich.transcript-visible`. This never resolves a real chat or
++/// dispatches the in-memory probe message.
++static BOOL transcriptVisibleSendAvailable(void) {
++    @autoreleasepool {
++        @try {
++            Class chatClass = NSClassFromString(@"IMChat");
++            Class historyClass = NSClassFromString(@"IMChatHistoryController");
++            Class messageClass = NSClassFromString(@"IMMessage");
++            Class itemClass = NSClassFromString(@"IMMessageItem");
++            if (!chatClass
++                || ![chatClass instancesRespondToSelector:@selector(sendMessage:)]
++                || !historyClass
++                || ![historyClass instancesRespondToSelector:
++                    @selector(loadMessageWithGUID:completionBlock:)]
++                || !messageClass
++                || ![messageClass instancesRespondToSelector:@selector(_imMessageItem)]
++                || !itemClass
++                || ![itemClass instancesRespondToSelector:@selector(_newChatItems)]
++                || !imCreateThreadIdentifierFn()) {
++                return NO;
++            }
++
++            NSString *selectedMessageGuid =
++                @"p:0/00000000-0000-4000-8000-000000000002";
++            NSString *threadIdentifier =
++                @"p:0/00000000-0000-4000-8000-000000000003";
++            NSAttributedString *body = [[NSAttributedString alloc]
++                initWithString:@"imsg transcript-visible capability probe"];
++            NSRange associatedRange = NSMakeRange(0, body.length);
++            id parentMessage = [NSObject new];
++            id parentItem = [NSObject new];
++            id message = buildIMMessage(body,
++                                        nil,
++                                        nil,
++                                        threadIdentifier,
++                                        parentItem,
++                                        selectedMessageGuid,
++                                        100,
++                                        associatedRange,
++                                        nil,
++                                        @[],
++                                        NO,
++                                        NO,
++                                        nil);
++            if (!message || ![message respondsToSelector:@selector(guid)]) {
++                return NO;
++            }
++            NSString *guid = [message performSelector:@selector(guid)];
++            return guid.length > 0
++                && stampTranscriptVisibleReplyMetadata(message,
++                                                       selectedMessageGuid,
++                                                       threadIdentifier,
++                                                       parentMessage,
++                                                       parentItem,
++                                                       associatedRange);
++        } @catch (__unused NSException *exception) {
++            return NO;
++        }
++    }
++}
++
+ /// Probe the exact constructor shape used by service mirrors: a reply
+ /// association (type 100) plus a caller-owned GUID. This constructs an
+ /// in-memory message only; it never resolves a chat or dispatches the object.
+@@ -3785,6 +3945,7 @@ static BOOL validateRichLinkPreviewImage(NSDictionary *image,
+     id attributedBodyValue = params[@"attributedBody"];
+     id textFormattingValue = params[@"textFormatting"];
+     id clientMessageGuidValue = params[@"clientMessageGuid"];
++    id transcriptVisibleValue = params[@"transcriptVisible"];
+     if (![chatGuidValue isKindOfClass:[NSString class]] ||
+         (messageValue && ![messageValue isKindOfClass:[NSString class]]) ||
+         (effectIdValue && ![effectIdValue isKindOfClass:[NSString class]]) ||
+@@ -3796,7 +3957,8 @@ static BOOL validateRichLinkPreviewImage(NSDictionary *image,
+         (ddScanValue && ![ddScanValue isKindOfClass:[NSNumber class]]) ||
+         (attributedBodyValue && ![attributedBodyValue isKindOfClass:[NSString class]]) ||
+         (textFormattingValue && ![textFormattingValue isKindOfClass:[NSArray class]]) ||
+-        (clientMessageGuidValue && ![clientMessageGuidValue isKindOfClass:[NSString class]])) {
++        (clientMessageGuidValue && ![clientMessageGuidValue isKindOfClass:[NSString class]]) ||
++        (transcriptVisibleValue && ![transcriptVisibleValue isKindOfClass:[NSNumber class]])) {
+         return errorResponse(requestId, @"Invalid send-message parameter types");
+     }
+
+@@ -3813,8 +3975,13 @@ static BOOL validateRichLinkPreviewImage(NSDictionary *image,
+     NSString *attributedBodyB64 = attributedBodyValue;
+     NSArray *textFormatting = textFormattingValue;
+     NSString *clientMessageGuid = canonicalClientMessageGuid(clientMessageGuidValue);
++    BOOL transcriptVisible = [transcriptVisibleValue boolValue];
+
+     if (!chatGuid.length) return errorResponse(requestId, @"Missing chatGuid");
++    if (transcriptVisible && ddScan) {
++        return errorResponse(requestId,
++            @"Transcript-visible sends require synchronous ddScan=false");
++    }
+     if (clientMessageGuidValue && !clientMessageGuid) {
+         return errorResponse(requestId, @"Invalid clientMessageGuid");
+     }
+@@ -3866,7 +4033,12 @@ static BOOL validateRichLinkPreviewImage(NSDictionary *image,
+                                                   &parentItem);
+         debugLog(@"handleSendMessage: reply=%d thread=%d",
+                  selectedMessageGuid.length > 0, threadIdentifier.length > 0);
+-    } else {
++        if (transcriptVisible
++            && (!threadIdentifier.length || !parentMessage || !parentItem)) {
++            return errorResponse(requestId,
++                @"Transcript-visible reply target could not be resolved completely");
++        }
++    } else if (!transcriptVisible) {
+         clearThreadContextForChat(chat, nil);
+     }
+
+@@ -4004,18 +4176,32 @@ static BOOL validateRichLinkPreviewImage(NSDictionary *image,
+             richLinkImageUsed = YES;
+         }
+
+-        // IMCore exposes separate originator types: IMMessageItem wants the
+-        // parent item during item-first construction, while IMMessage wants
+-        // the parent message on the wrapped object.
+-        if (parentMessage
+-            && [imMessage respondsToSelector:@selector(setThreadOriginator:)]) {
+-            [imMessage performSelector:@selector(setThreadOriginator:)
+-                            withObject:parentMessage];
+-        }
+-        if (threadIdentifier
+-            && [imMessage respondsToSelector:@selector(setThreadIdentifier:)]) {
+-            [imMessage performSelector:@selector(setThreadIdentifier:)
+-                            withObject:threadIdentifier];
++        if (transcriptVisible && selectedMessageGuid.length) {
++            if (!stampTranscriptVisibleReplyMetadata(imMessage,
++                                                     selectedMessageGuid,
++                                                     threadIdentifier,
++                                                     parentMessage,
++                                                     parentItem,
++                                                     zeroRange)) {
++                removeRichLinkPreviewSnapshot(richLinkSnapshotPath);
++                richLinkSnapshotPath = nil;
++                return errorResponse(requestId,
++                    @"Transcript-visible reply metadata was not preserved");
++            }
++        } else {
++            // IMCore exposes separate originator types: IMMessageItem wants the
++            // parent item during item-first construction, while IMMessage wants
++            // the parent message on the wrapped object.
++            if (parentMessage
++                && [imMessage respondsToSelector:@selector(setThreadOriginator:)]) {
++                [imMessage performSelector:@selector(setThreadOriginator:)
++                                withObject:parentMessage];
++            }
++            if (threadIdentifier
++                && [imMessage respondsToSelector:@selector(setThreadIdentifier:)]) {
++                [imMessage performSelector:@selector(setThreadIdentifier:)
++                                withObject:threadIdentifier];
++            }
+         }
+
+         if (gHasSendMessageReason && ddScan) {
+@@ -4034,14 +4220,36 @@ static BOOL validateRichLinkPreviewImage(NSDictionary *image,
+                 [inv setArgument:&reason atIndex:3];
+                 [inv invoke];
+             });
++        } else if (transcriptVisible) {
++            if (!dispatchTranscriptVisibleIMMessageInChat(chat,
++                                                          imMessage,
++                                                          selectedMessageGuid,
++                                                          threadIdentifier,
++                                                          parentMessage,
++                                                          parentItem)) {
++                removeRichLinkPreviewSnapshot(richLinkSnapshotPath);
++                richLinkSnapshotPath = nil;
++                return errorResponse(requestId,
++                    @"Transcript-visible direct IMChat dispatch is unavailable");
++            }
+         } else {
+             dispatchIMMessageInChat(chat, imMessage, threadIdentifier, parentItem);
+         }
+
+-        // Best-effort messageGuid; not always available immediately.
++        // The direct transcript-visible path owns the exact IMMessage object
++        // that was dispatched. Prefer its GUID after the synchronous send so a
++        // concurrent adjacent send cannot make chat.lastSentMessage point at
++        // the wrong row. Retain the legacy last-sent fallback only when this
++        // object does not expose a GUID.
++        NSString *transcriptVisibleGuid = nil;
++        if (transcriptVisible && [imMessage respondsToSelector:@selector(guid)]) {
++            transcriptVisibleGuid = [imMessage performSelector:@selector(guid)];
++        }
+         NSString *guid = clientMessageGuid.length
+             ? clientMessageGuid
+-            : lastSentMessageGuid(chat);
++            : (transcriptVisibleGuid.length
++                ? transcriptVisibleGuid
++                : lastSentMessageGuid(chat));
+         NSMutableDictionary *response = [@{
+             @"chatGuid": chatGuid,
+             @"messageGuid": guid ?: @"",
+diff --git a/Sources/imsg/RPCServer+BridgeMessageHandlers.swift b/Sources/imsg/RPCServer+BridgeMessageHandlers.swift
+index 92bb2d3..1bee8ef 100644
+--- a/Sources/imsg/RPCServer+BridgeMessageHandlers.swift
++++ b/Sources/imsg/RPCServer+BridgeMessageHandlers.swift
+@@ -9,7 +9,26 @@ extension RPCServer {
+         "client_guid requires the send.rich.client-guid method"
+       )
+     }
+-    try await handleSendRich(params: params, id: id, clientGUID: nil)
++    try await handleSendRich(
++      params: params,
++      id: id,
++      clientGUID: nil,
++      transcriptVisible: false
++    )
++  }
++
++  func handleSendRichTranscriptVisible(params: [String: Any], id: Any?) async throws {
++    guard !params.keys.contains("client_guid") else {
++      throw RPCError.invalidParams(
++        "client_guid is not supported by send.rich.transcript-visible"
++      )
++    }
++    try await handleSendRich(
++      params: params,
++      id: id,
++      clientGUID: nil,
++      transcriptVisible: true
++    )
+   }
+
+   func handleSendRichWithClientGUID(params: [String: Any], id: Any?) async throws {
+@@ -18,37 +37,45 @@ extension RPCServer {
+         "send.rich.client-guid requires client_guid"
+       )
+     }
+-    try await handleSendRich(params: params, id: id, clientGUID: clientGUID)
++    try await handleSendRich(
++      params: params,
++      id: id,
++      clientGUID: clientGUID,
++      transcriptVisible: false
++    )
+   }
+
+   private func handleSendRich(
+     params: [String: Any],
+     id: Any?,
+-    clientGUID: String?
++    clientGUID: String?,
++    transcriptVisible: Bool
+   ) async throws {
+     let retiredRichLinkKeys = ["link", "rich_link", "richLink", "rich_link_url"]
+     if let key = retiredRichLinkKeys.first(where: { params.keys.contains($0) }) {
+       throw RPCError.invalidParams("\(key) is not supported; pass url without rich-link modifiers")
+     }
+     if params.keys.contains("url") {
+-      if clientGUID != nil {
+-        throw RPCError.invalidParams("client_guid is not supported with url")
++      if clientGUID != nil || transcriptVisible {
++        throw RPCError.invalidParams(
++          "synchronous transcript-visible or client-guid sends do not support url"
++        )
+       }
+       try await handleSendRichLink(params: params, id: id)
+       return
+     }
+     let chatGUID = try await resolveChatGUIDParam(params)
+     let text = stringParam(params["text"]) ?? stringParam(params["message"]) ?? ""
+-    if clientGUID != nil {
++    if clientGUID != nil || transcriptVisible {
+       for key in ["dd_scan", "ddScan"] where params.keys.contains(key) {
+         guard let value = params[key] as? Bool else {
+           throw RPCError.invalidParams(
+-            "\(key) must be a boolean for send.rich.client-guid"
++            "\(key) must be a boolean for synchronous rich sends"
+           )
+         }
+         guard !value else {
+           throw RPCError.invalidParams(
+-            "dd_scan must be false for send.rich.client-guid"
++            "dd_scan must be false for synchronous rich sends"
+           )
+         }
+       }
+@@ -58,7 +85,8 @@ extension RPCServer {
+       "chatGuid": chatGUID,
+       "message": text,
+       "partIndex": intParam(params["part_index"] ?? params["partIndex"]) ?? 0,
+-      "ddScan": clientGUID == nil ? (requestedDDScan ?? true) : false,
++      "ddScan": (clientGUID == nil && !transcriptVisible) ? (requestedDDScan ?? true) : false,
++      "transcriptVisible": transcriptVisible,
+     ]
+     if let clientGUID {
+       guard !(try store.messageExists(guid: clientGUID)) else {
+diff --git a/Sources/imsg/RPCServer.swift b/Sources/imsg/RPCServer.swift
+index 61ce091..f0d07d2 100644
+--- a/Sources/imsg/RPCServer.swift
++++ b/Sources/imsg/RPCServer.swift
+@@ -50,6 +50,7 @@ let kSupportedRPCMethods: [String] = [
+   "watch.unsubscribe",
+   "send",
+   "send.rich",
++  "send.rich.transcript-visible",
+   "send.rich.client-guid",
+   "send.attachment",
+   "send.sticker",
+@@ -193,6 +194,8 @@ final class RPCServer {
+         try await handleSend(params: params, id: id)
+       case "send.rich":
+         try await handleSendRich(params: params, id: id)
++      case "send.rich.transcript-visible":
++        try await handleSendRichTranscriptVisible(params: params, id: id)
+       case "send.rich.client-guid":
+         try await handleSendRichWithClientGUID(params: params, id: id)
+       case "send.attachment":
+diff --git a/Tests/imsgTests/BridgeCommandRegistrationTests.swift b/Tests/imsgTests/BridgeCommandRegistrationTests.swift
+index 0cd5c60..1a0f9f2 100644
+--- a/Tests/imsgTests/BridgeCommandRegistrationTests.swift
++++ b/Tests/imsgTests/BridgeCommandRegistrationTests.swift
+@@ -523,6 +523,96 @@ func injectedHelperWiresNativePollSend() throws {
+   #expect(source.contains(modernMessageInitializer))
+ }
+
++@Test
++func injectedHelperHasDedicatedTranscriptVisibleDispatch() throws {
++  let testFile = URL(fileURLWithPath: #filePath)
++  let repoRoot =
++    testFile
++    .deletingLastPathComponent()
++    .deletingLastPathComponent()
++    .deletingLastPathComponent()
++  let sourceURL = repoRoot.appendingPathComponent("Sources/IMsgHelper/IMsgInjected.m")
++  let source = try String(contentsOf: sourceURL, encoding: .utf8)
++  let statusBody = try #require(functionBody(named: "handleStatus", in: source))
++  let sendBody = try #require(functionBody(named: "handleSendMessage", in: source))
++  let visibleDispatch = try #require(
++    functionBody(named: "dispatchTranscriptVisibleIMMessageInChat", in: source))
++  let capabilityBody = try #require(
++    functionBody(named: "transcriptVisibleSendAvailable", in: source))
++  let metadataBody = try #require(
++    functionBody(named: "transcriptVisibleReplyMetadataMatches", in: source))
++
++  #expect(
++    statusBody.contains(
++      #"@"transcriptVisibleSend": @(transcriptVisibleSendAvailable())"#))
++  #expect(!statusBody.contains(#"@"transcriptVisibleSend": @YES"#))
++  #expect(sendBody.contains("transcriptVisible"))
++  #expect(sendBody.contains("dispatchTranscriptVisibleIMMessageInChat"))
++  #expect(sendBody.contains("stampTranscriptVisibleReplyMetadata"))
++  #expect(sendBody.contains("transcriptVisibleGuid"))
++  #expect(sendBody.contains("[imMessage performSelector:@selector(guid)]"))
++  #expect(sendBody.contains("transcriptVisibleGuid.length"))
++  let directDispatch = try #require(
++    sendBody.range(of: "dispatchTranscriptVisibleIMMessageInChat"))
++  let ownGuidRead = try #require(
++    sendBody.range(of: "transcriptVisibleGuid = [imMessage performSelector:@selector(guid)]"))
++  let lastSentFallback = try #require(sendBody.range(of: "lastSentMessageGuid(chat)"))
++  #expect(directDispatch.lowerBound < ownGuidRead.lowerBound)
++  #expect(ownGuidRead.lowerBound < lastSentFallback.lowerBound)
++  #expect(visibleDispatch.contains("clearReplyMetadataOnMessage(message)"))
++  #expect(visibleDispatch.contains("[chat sendMessage:message]"))
++  #expect(!visibleDispatch.contains("performSelector:@selector(sendMessage:)"))
++  #expect(!visibleDispatch.contains("_chat:sendMessage:"))
++  for forbidden in [
++    "prepareThreadContextForSend",
++    "clearThreadContextForChat",
++    "scheduleThreadContextClear",
++    "inlineReplyController",
++    "chatGUIDToCurrentThreadMap",
++  ] {
++    #expect(!visibleDispatch.contains(forbidden))
++  }
++  #expect(capabilityBody.contains("instancesRespondToSelector:@selector(sendMessage:)"))
++  #expect(capabilityBody.contains("stampTranscriptVisibleReplyMetadata"))
++  #expect(metadataBody.contains("associatedMessageGUID"))
++  #expect(metadataBody.contains("associatedMessageType"))
++  #expect(metadataBody.contains("associatedMessageRange"))
++  #expect(metadataBody.contains("threadIdentifier"))
++  #expect(metadataBody.contains("threadOriginator"))
++}
++
++@Test
++func transcriptVisibleReplyFailsClosedBeforeConstructionOrDispatchWhenParentIsIncomplete()
++  throws
++{
++  let testFile = URL(fileURLWithPath: #filePath)
++  let repoRoot =
++    testFile
++    .deletingLastPathComponent()
++    .deletingLastPathComponent()
++    .deletingLastPathComponent()
++  let sourceURL = repoRoot.appendingPathComponent("Sources/IMsgHelper/IMsgInjected.m")
++  let source = try String(contentsOf: sourceURL, encoding: .utf8)
++  let sendBody = try #require(functionBody(named: "handleSendMessage", in: source))
++  let visibleDispatch = try #require(
++    functionBody(named: "dispatchTranscriptVisibleIMMessageInChat", in: source))
++
++  #expect(
++    sendBody.contains(
++      "(!threadIdentifier.length || !parentMessage || !parentItem)"))
++  let unresolved = try #require(
++    sendBody.range(of: "Transcript-visible reply target could not be resolved completely"))
++  let construction = try #require(sendBody.range(of: "id imMessage = nil"))
++  let metadataFailure = try #require(
++    sendBody.range(of: "Transcript-visible reply metadata was not preserved"))
++  let directDispatch = try #require(
++    sendBody.range(of: "dispatchTranscriptVisibleIMMessageInChat"))
++  #expect(unresolved.lowerBound < construction.lowerBound)
++  #expect(metadataFailure.lowerBound < directDispatch.lowerBound)
++  #expect(visibleDispatch.contains("!threadIdentifier.length || !parentMessage || !parentItem"))
++  #expect(visibleDispatch.contains("return NO"))
++}
++
+ @Test
+ func injectedHelperBroadcastsFailClosedNativePollVoteMetadata() throws {
+   let testFile = URL(fileURLWithPath: #filePath)
+diff --git a/Tests/imsgTests/RPCBridgeMessageHandlersTests.swift b/Tests/imsgTests/RPCBridgeMessageHandlersTests.swift
+index 8b91d5c..34f06b1 100644
+--- a/Tests/imsgTests/RPCBridgeMessageHandlersTests.swift
++++ b/Tests/imsgTests/RPCBridgeMessageHandlersTests.swift
+@@ -26,6 +26,7 @@ func rpcStatusAdvertisesBridgeMessageMethods() {
+
+   for method in [
+     "send.rich",
++    "send.rich.transcript-visible",
+     "send.rich.client-guid",
+     "send.attachment",
+     "send.sticker",
+@@ -294,6 +295,67 @@ func rpcSendRichInvokesBridgeWithResolvedChat() async throws {
+   #expect(result?["guid"] as? String == "rich-guid")
+ }
+
++@Test
++func rpcTranscriptVisibleRichSendUsesSynchronousChatDispatch() async throws {
++  let store = try CommandTestDatabase.makeStoreForRPC()
++  let output = TestRPCOutput()
++  var capturedAction: BridgeAction?
++  var capturedParams: [String: Any] = [:]
++  let server = RPCServer(
++    store: store,
++    verbose: false,
++    output: output,
++    invokeBridge: { action, params in
++      capturedAction = action
++      capturedParams = params
++      return ["messageGuid": "visible-guid", "queued": false]
++    }
++  )
++
++  await server.handleLineForTesting(
++    #"{"jsonrpc":"2.0","id":"visible","method":"send.rich.transcript-visible","params":{"chat_id":1,"text":"clean","reply_to":"parent-guid"}}"#
++  )
++
++  #expect(capturedAction == .sendMessage)
++  #expect(capturedParams["transcriptVisible"] as? Bool == true)
++  #expect(capturedParams["ddScan"] as? Bool == false)
++  #expect(capturedParams["selectedMessageGuid"] as? String == "parent-guid")
++  let result = output.responses.first?["result"] as? [String: Any]
++  #expect(result?["guid"] as? String == "visible-guid")
++}
++
++@Test
++func rpcTranscriptVisibleRichSendPropagatesIncompleteParentFailureWithoutFallback() async throws {
++  let store = try CommandTestDatabase.makeStoreForRPC()
++  let output = TestRPCOutput()
++  var calls = 0
++  let server = RPCServer(
++    store: store,
++    verbose: false,
++    output: output,
++    invokeBridge: { action, params in
++      calls += 1
++      #expect(action == .sendMessage)
++      #expect(params["transcriptVisible"] as? Bool == true)
++      #expect(params["selectedMessageGuid"] as? String == "missing-parent")
++      throw IMsgBridgeError.dylibReturnedError(
++        "Transcript-visible reply target could not be resolved completely")
++    }
++  )
++
++  await server.handleLineForTesting(
++    #"{"jsonrpc":"2.0","id":"missing-parent","method":"send.rich.transcript-visible","params":{"chat_id":1,"text":"clean","reply_to":"missing-parent"}}"#
++  )
++
++  #expect(calls == 1)
++  #expect(output.responses.isEmpty)
++  let error = output.errors.first?["error"] as? [String: Any]
++  #expect(error?["code"] as? Int == -32603)
++  #expect(
++    (error?["data"] as? String)?
++      .contains("Transcript-visible reply target could not be resolved completely") == true)
++}
++
+ @Test
+ func rpcSendRichRejectsClientGuidSmugglingAndDedicatedMethodRequiresIt() async throws {
+   let store = try CommandTestDatabase.makeStoreForRPC()
