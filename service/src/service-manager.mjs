@@ -472,7 +472,11 @@ function serviceRuntime(paths, runLaunchctl = launchctl) {
 function waitForServiceReady(paths, options = {}) {
   const runLaunchctl = options.launchctlImpl || launchctl;
   const waitImpl = options.waitImpl || wait;
-  const attempts = options.readinessAttempts ?? 80;
+  // Core startup is normally much faster, but first-run Remote Control and
+  // Messages validation can cross the old 20-second boundary on a busy Mac.
+  // Keep activation transactional without killing a healthy candidate at the
+  // exact moment it publishes readiness.
+  const attempts = options.readinessAttempts ?? 240;
   const intervalMs = options.readinessIntervalMs ?? 250;
   let runtime = serviceRuntime(paths, runLaunchctl);
   for (let attempt = 0; attempt < attempts && !runtime.running; attempt += 1) {
@@ -491,7 +495,9 @@ export function rotateServiceProcess(options = {}) {
   const paths = options.paths || servicePaths();
   const runLaunchctl = options.launchctlImpl || launchctl;
   const waitImpl = options.waitImpl || wait;
-  const attempts = options.rotationAttempts ?? 80;
+  // Rotation launches the same daemon as transactional installation, so it
+  // needs the same first-run allowance for authenticated helper validation.
+  const attempts = options.rotationAttempts ?? 240;
   const intervalMs = options.rotationIntervalMs ?? 250;
   try {
     const before = serviceRuntime(paths, runLaunchctl);

@@ -334,6 +334,32 @@ test("service installation has no shared-backend or Desktop readiness prerequisi
   assert.equal("codexBackend" in result, false);
 });
 
+test("service installation tolerates a healthy candidate that needs more than twenty seconds to publish readiness", () => {
+  const run = transactionFixture();
+  let running = false;
+  let waits = 0;
+  const result = installService({
+    platform: "darwin",
+    paths: run.paths,
+    config: { imsg: { mode: "helper" } },
+    stageDeploymentImpl: () => run.deployment,
+    cleanupRetiredImpl: () => ({ cleaned: false, removed: [], failed: [] }),
+    plistLintImpl: () => {},
+    launchctlImpl(args) {
+      if (args[0] === "print") return running ? "state = running\npid = 42\n" : "";
+      if (args[0] === "bootout") running = false;
+      if (args[0] === "bootstrap") running = true;
+      return "";
+    },
+    waitImpl() {
+      waits += 1;
+      if (waits === 100) writeReadiness(run.paths.serviceReadinessState, 42);
+    },
+  });
+  assert.equal(result.changed, true);
+  assert.equal(waits, 100, "the default readiness window exceeds the former eighty-poll limit");
+});
+
 test("service installation activates only a ready versioned deployment", () => {
   const run = transactionFixture();
   const previousFingerprint = "b".repeat(64);
@@ -474,6 +500,27 @@ test("enrollment rotation proves a new ready service PID before succeeding", () 
   });
   assert.deepEqual(result, { rotated: true, previousPid: 41, pid: 42 });
   assert.equal(probes, 2);
+});
+
+test("enrollment rotation tolerates a healthy replacement that needs more than twenty seconds", () => {
+  const run = transactionFixture();
+  writeReadiness(run.paths.serviceReadinessState, 41);
+  let pid = 41;
+  let waits = 0;
+  const result = rotateServiceProcess({
+    paths: run.paths,
+    launchctlImpl(args) {
+      if (args[0] === "kickstart") pid = 42;
+      if (args[0] === "print") return `state = running\npid = ${pid}\n`;
+      return "";
+    },
+    waitImpl() {
+      waits += 1;
+      if (waits === 100) writeReadiness(run.paths.serviceReadinessState, 42);
+    },
+  });
+  assert.deepEqual(result, { rotated: true, previousPid: 41, pid: 42 });
+  assert.equal(waits, 100, "rotation shares the extended transactional readiness window");
 });
 
 test("failed enrollment rotation unloads the old LaunchAgent and retains no readiness", () => {

@@ -418,7 +418,11 @@ const liveMirrorScheduler = new RolloutReconcileScheduler({
 });
 
 function scheduleLiveMirrorScan(activity = null) {
-  if (stopped) return;
+  // Startup catalog synchronization can discover unread rollout records before
+  // the normal-profile mirror sender and authenticated watch are initialized.
+  // Hold every proactive scan until main() releases startup work; otherwise a
+  // deployment probe can race sender initialization and mutate its journal.
+  if (stopped || !startupWorkReleased) return;
   liveMirrorScheduler.schedule(activity || { source: "full" });
 }
 
@@ -2474,7 +2478,7 @@ async function main() {
       { code: "IMSG_HELPER_MISMATCH" },
     );
   }
-  localUserMirrorSender.initialize({
+  const localUserMirrorInitialization = localUserMirrorSender.initialize({
     expectedLocalSender: profile.expectedSender,
     knownRootGuids: threads.map((thread) => imsgTransport.router.nativeThread(thread.id)?.rootGuid).filter(Boolean),
     knownThreads: threads.map((thread) => ({
@@ -2494,15 +2498,20 @@ async function main() {
     threads.filter((thread) => effectiveState(thread).status === "working").map((thread) => thread.id),
   );
   for (const action of imsgTransport.pendingActions()) await queueLocalAction(action);
-  await completions.reconcile(threads, { deliver: deliverLocalCompletion, deliverPending: false });
-  allowStartupWork();
+  // Readiness proves the authenticated watch and core local transport. Slow
+  // backlog delivery is explicitly post-ready so the installer never kills a
+  // healthy daemon while an at-most-once native send is being reconciled.
+  serviceReadiness.markReady();
   log(`Ready on ${os.hostname()} with ${threads.length} top-level tasks via the authenticated local imsg helper.`);
+  setInterval(() => synchronize().catch(() => log("Background synchronization failed; will retry.")), 30 * 1000).unref();
+  await completions.reconcile(threads, { deliver: deliverLocalCompletion, deliverPending: false })
+    .catch(() => log("Completion synchronization failed; will retry."));
+  await localUserMirrorInitialization;
+  allowStartupWork();
   completionMonitoringStarted = true;
   scheduleCompletionScan();
   scheduleLiveMirrorScan();
   rolloutActivity.start();
-  setInterval(() => synchronize().catch(() => log("Background synchronization failed; will retry.")), 30 * 1000).unref();
-  serviceReadiness.markReady();
 }
 
 async function stop() {

@@ -10,7 +10,7 @@ test("daemon routes filesystem rollout paths through bounded dirty-task reconcil
   const daemon = readFileSync(path.join(repo, "service/src/daemon.mjs"), "utf8");
   assert.match(daemon, /new RolloutReconcileScheduler\(\{\s*maxConcurrent: 4,\s*runThread: scanLiveMirrorThread,/);
   assert.match(daemon, /onActivity: \(activity\) => \{\s*scheduleLiveMirrorScan\(activity\);\s*scheduleCompletionScan\(\);/);
-  assert.match(daemon, /function scheduleLiveMirrorScan\(activity = null\) \{\s*if \(stopped\) return;\s*liveMirrorScheduler\.schedule\(activity \|\| \{ source: "full" \}\);/);
+  assert.match(daemon, /function scheduleLiveMirrorScan\(activity = null\) \{[\s\S]{0,500}if \(stopped \|\| !startupWorkReleased\) return;\s*liveMirrorScheduler\.schedule\(activity \|\| \{ source: "full" \}\);/);
   assert.match(daemon, /multiLiveMirror\.reconcile\(current, \{ deliver: deliverLiveMessage \}\)/);
   assert.doesNotMatch(daemon, /multiLiveMirror\.reconcileAll\(/,
     "normal daemon activity must not serialize every task through a catalog-wide call");
@@ -50,4 +50,21 @@ test("daemon holds one private service lease without locking Codex", () => {
   assert.match(daemon, /daemonLease\.release\(\);\s*process\.exit\(0\);/);
   assert.doesNotMatch(daemon, /stateDb.*(?:lock|lease)|sessions.*(?:lock|lease)|codexRuntime.*(?:lock|lease)/i,
     "the singleton boundary must remain confined to the handoff service home");
+});
+
+test("daemon publishes core readiness before backlog work and gates live mirrors on initialized startup", () => {
+  const daemon = readFileSync(path.join(repo, "service/src/daemon.mjs"), "utf8");
+  assert.match(daemon, /function scheduleLiveMirrorScan\(activity = null\) \{\s*[^}]*if \(stopped \|\| !startupWorkReleased\) return;/);
+  const mainStart = daemon.indexOf("async function main()");
+  const mainEnd = daemon.indexOf("async function stop()", mainStart);
+  const main = daemon.slice(mainStart, mainEnd);
+  const initialize = main.indexOf("const localUserMirrorInitialization = localUserMirrorSender.initialize");
+  const ready = main.indexOf("serviceReadiness.markReady()");
+  const reconcile = main.indexOf("await completions.reconcile");
+  const initialized = main.indexOf("await localUserMirrorInitialization");
+  const release = main.indexOf("allowStartupWork()");
+  const scan = main.lastIndexOf("scheduleLiveMirrorScan()");
+  assert.ok(initialize >= 0 && initialize < ready);
+  assert.ok(ready < reconcile && reconcile < initialized);
+  assert.ok(initialized < release && release < scan);
 });
