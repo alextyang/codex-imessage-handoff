@@ -70,9 +70,11 @@ test("activates a deduplicated catalog and persists one private cursor per task"
     },
   });
 
-  assert.deepEqual(delivered, [
+  assert.deepEqual(delivered.filter(([id]) => id === "thread-a"), [
     ["thread-a", "user", "Request A"],
     ["thread-a", "assistant", "Progress A"],
+  ]);
+  assert.deepEqual(delivered.filter(([id]) => id === "thread-b"), [
     ["thread-b", "assistant", "Progress B"],
   ]);
   assert.equal(result.delivered, 3);
@@ -179,7 +181,7 @@ test("drains and clears tasks independently without replaying activity accumulat
   assert.deepEqual(delivered, ["Only A", "Only B"]);
 });
 
-test("serializes individual and catalog reconciliation through one scheduler", async () => {
+test("serializes reconciliation per task while unrelated tasks run concurrently", async () => {
   const item = fixture();
   const first = item.thread("thread-serial-a");
   const second = item.thread("thread-serial-b");
@@ -205,9 +207,18 @@ test("serializes individual and catalog reconciliation through one scheduler", a
     },
   });
 
-  await new Promise((resolve) => setImmediate(resolve));
-  assert.deepEqual(order, ["First delivery"]);
-  release();
-  await Promise.all([firstRun, secondRun]);
+  await secondRun;
   assert.deepEqual(order, ["First delivery", "Second delivery"]);
+  append(first, commentary("First follow-up"));
+  const followUp = mirrors.reconcile(first, {
+    deliver: async (event) => {
+      order.push(event.body);
+      return { sent: true };
+    },
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(order, ["First delivery", "Second delivery"]);
+  release();
+  await Promise.all([firstRun, followUp]);
+  assert.deepEqual(order, ["First delivery", "Second delivery", "First follow-up"]);
 });

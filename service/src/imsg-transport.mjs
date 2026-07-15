@@ -733,13 +733,19 @@ export class ImsgTransport {
         provisional = this.router.provisionalUserMirrorEcho(message);
       }
       if (provisional) {
-        // Visible text and a Reply root are not identity evidence. When the
-        // brief correlation window ends without an exact GUID, let
-        // the bubble proceed as genuine user input and retain the reservation
-        // for a later marker-bearing or exact-GUID echo. Never discard a user
-        // message solely because it happens to match a pending mirror body.
+        // Close the exact-GUID race once more before making the body-only
+        // decision. A definitely-unsent reservation releases an identical
+        // manual reply normally. Once the sender durably crossed its attempt
+        // boundary, however, a crash may have hidden the bridge result: fail
+        // closed after this short hold so the committed mirror cannot execute
+        // as a Codex prompt.
         userMirror = this.router.consumeUserMirrorEcho(message);
         if (userMirror) {
+          this.observeInbound().catch(() => {});
+          return;
+        }
+        if (provisional.dispatchMayHaveOccurred === true
+          && this.router.quarantineProvisionalUserMirrorEcho(message, provisional.reservationId)) {
           this.observeInbound().catch(() => {});
           return;
         }

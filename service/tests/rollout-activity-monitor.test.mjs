@@ -29,7 +29,70 @@ test("rollout activity coalesces JSONL events and ignores unrelated files", asyn
   listener("change", "two.jsonl");
   listener("change", "ignore.sqlite");
   await wait(25);
-  assert.deepEqual(observations, [{ source: "filesystem", watching: true }]);
+  assert.deepEqual(observations, [{
+    source: "filesystem",
+    watching: true,
+    paths: [
+      "/tmp/codex-sessions/one.jsonl",
+      "/tmp/codex-sessions/two.jsonl",
+    ],
+    unknownPath: false,
+  }]);
+  monitor.stop();
+});
+
+test("rollout activity retains unknown paths so callers can request a full fallback", async () => {
+  const watcher = new EventEmitter();
+  watcher.close = () => watcher.emit("close");
+  let listener;
+  const observations = [];
+  const monitor = new RolloutActivityMonitor({
+    root: "/tmp/codex-sessions",
+    existsImpl: () => true,
+    watchImpl: (_root, _options, callback) => {
+      listener = callback;
+      return watcher;
+    },
+    debounceMs: 10,
+    fallbackMs: 60_000,
+    onActivity: (event) => observations.push(event),
+  }).start();
+
+  listener("rename", null);
+  listener("change", "known.jsonl");
+  await wait(25);
+  assert.deepEqual(observations, [{
+    source: "filesystem",
+    watching: true,
+    paths: ["/tmp/codex-sessions/known.jsonl"],
+    unknownPath: true,
+  }]);
+  monitor.stop();
+});
+
+test("stop discards a pending debounce and restart watches with a clean path set", async () => {
+  const listeners = [];
+  const observations = [];
+  const monitor = new RolloutActivityMonitor({
+    root: "/tmp/codex-sessions",
+    existsImpl: () => true,
+    watchImpl: (_root, _options, callback) => {
+      listeners.push(callback);
+      const watcher = new EventEmitter();
+      watcher.close = () => watcher.emit("close");
+      return watcher;
+    },
+    debounceMs: 10,
+    fallbackMs: 60_000,
+    onActivity: (event) => observations.push(event),
+  }).start();
+
+  listeners[0]("change", "before-stop.jsonl");
+  monitor.stop();
+  monitor.start();
+  listeners[1]("change", "after-restart.jsonl");
+  await wait(25);
+  assert.deepEqual(observations.map((event) => event.paths), [["/tmp/codex-sessions/after-restart.jsonl"]]);
   monitor.stop();
 });
 

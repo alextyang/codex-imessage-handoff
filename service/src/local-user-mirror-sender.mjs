@@ -11,7 +11,7 @@ import {
   statSync,
   writeFileSync,
 } from "node:fs";
-import { createHash, randomBytes, randomUUID } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import path from "node:path";
 import {
   canonicalImsgIdentity,
@@ -188,14 +188,6 @@ function canonicalClientGuid(value) {
     : null;
 }
 
-function allocateClientGuid(factory) {
-  const guid = canonicalClientGuid(String(factory()).toUpperCase());
-  if (!guid) {
-    throw codedError("IMSG_LOCAL_MIRROR_GUID_INVALID", "Could not allocate a canonical user-mirror GUID.", { attempted: false });
-  }
-  return guid;
-}
-
 function isClientGuidDelivery(entry) {
   return entry?.clientGuidMode === true;
 }
@@ -328,7 +320,6 @@ export class LocalUserMirrorSender {
     sendTimeoutMs = DEFAULT_SEND_TIMEOUT_MS,
     conversationKey = null,
     imsgClientFactory = null,
-    clientGuidFactory = randomUUID,
     allowUnsafeTestBinary = false,
   } = {}) {
     if (!stateFile || !router) throw new TypeError("LocalUserMirrorSender requires private state and a conversation router.");
@@ -347,7 +338,6 @@ export class LocalUserMirrorSender {
       candidates: [binary],
       sendTimeoutMs: this.sendTimeoutMs,
     }));
-    this.clientGuidFactory = clientGuidFactory;
     this.allowUnsafeTestBinary = allowUnsafeTestBinary;
     this.state = readState(this.stateFile, this.conversationKey);
     this.binary = null;
@@ -438,8 +428,7 @@ export class LocalUserMirrorSender {
       if (!this.binary) await this.#locateBinary();
       const status = (await this.#runJson(["status", "--json"], { timeout: 8_000, maxBuffer: 512 * 1024 }))[0];
       const methods = new Set(Array.isArray(status?.rpc_methods) ? status.rpc_methods : []);
-      if (status?.advanced_features !== true || status?.v2_ready !== true || !methods.has("send.rich.client-guid")
-        || status?.selectors?.clientMessageGuid !== true) {
+      if (status?.advanced_features !== true || status?.v2_ready !== true || !methods.has("send.rich")) {
         return this.#unavailable("ACTIVATION_REQUIRED");
       }
       const account = (await this.#runJson(["account", "--json"], { timeout: 8_000, maxBuffer: 512 * 1024 }))[0];
@@ -580,8 +569,7 @@ export class LocalUserMirrorSender {
     try {
       const status = (await this.#runJson(["status", "--json"], { timeout: 8_000, maxBuffer: 512 * 1024 }))[0];
       const methods = new Set(Array.isArray(status?.rpc_methods) ? status.rpc_methods : []);
-      if (status?.advanced_features !== true || status?.v2_ready !== true || !methods.has("send.rich.client-guid")
-        || status?.selectors?.clientMessageGuid !== true) {
+      if (status?.advanced_features !== true || status?.v2_ready !== true || !methods.has("send.rich")) {
         return this.#unavailable("ACTIVATION_REQUIRED");
       }
       const account = (await this.#runJson(["account", "--json"], { timeout: 8_000, maxBuffer: 512 * 1024 }))[0];
@@ -687,6 +675,37 @@ export class LocalUserMirrorSender {
     }
   }
 
+  #receiverReceiptGuid(key, entry) {
+    const receipt = this.router.userMirrorEchoReceipt?.(key);
+    const guid = clean(receipt?.guid);
+    const receiptBodyHash = clean(receipt?.bodyHash).toLowerCase();
+    const bodyBound = /^[a-f0-9]{64}$/u.test(receiptBodyHash)
+      && receiptBodyHash === entry.bodyHash;
+    // Pre-migration receipts had no body binding. They remain usable only
+    // when the journal already owns the exact same GUID, which is independent
+    // evidence and preserves attempted caller-GUID recovery without letting a
+    // reused delivery id settle different content.
+    const independentlyExactLegacy = !receiptBodyHash && Boolean(entry.guid)
+      && entry.guid === guid;
+    if (!guid || clean(receipt?.threadId) !== entry.threadId
+      || clean(receipt?.rootGuid) !== entry.rootGuid
+      || (entry.guid && entry.guid !== guid)
+      || (!bodyBound && !independentlyExactLegacy)) return "";
+    return guid;
+  }
+
+  #acceptPart(key, entry, threadId, guidValue) {
+    const guid = clean(guidValue);
+    if (!guid) return null;
+    entry.guid = guid;
+    entry.status = "accepted";
+    entry.acceptedAt ||= new Date(this.now()).toISOString();
+    this.#saveDelivery(key, entry);
+    this.router.confirmUserMirrorEcho(key, guid);
+    this.router.routeOutboundGuid(guid, threadId);
+    return guid;
+  }
+
   #unresolvedPart(key, entry) {
     const attemptedAt = Date.parse(entry.attemptedAt || entry.preparedAt);
     if (Number.isFinite(attemptedAt) && this.now() - attemptedAt >= AMBIGUOUS_DEAD_LETTER_MS) {
@@ -713,7 +732,6 @@ export class LocalUserMirrorSender {
       throw codedError("IMSG_LOCAL_MIRROR_CONFLICT", "A local user-mirror delivery id was reused.", { attempted: false });
     }
     if (!entry) {
-      const assignedGuid = allocateClientGuid(this.clientGuidFactory);
       entry = {
         reservationId: key,
         threadId,
@@ -723,34 +741,49 @@ export class LocalUserMirrorSender {
         // Keep both the durable envelope and the actual wire body free of the
         // legacy Unicode compatibility suffix.
         wireMode: WIRE_MODE_PLAIN,
-        clientGuidMode: true,
+        // Let Messages allocate the native GUID. Caller-owned GUID messages
+        // can be delivered to the recipient without appearing in the sending
+        // profile's transcript, which defeats the purpose of a conversation
+        // mirror. The receiver briefly holds the exact clean body + Reply root
+        // until this standard send returns its bridge-assigned GUID.
+        clientGuidMode: false,
         rootGuid,
         status: "prepared",
         preparedAt: new Date(this.now()).toISOString(),
         attemptedAt: null,
         acceptedAt: null,
         deadLetteredAt: null,
-        // The caller owns the native Messages identity. Persist it before the
-        // bridge write so the receiving profile can suppress the exact echo
-        // even if the RPC response is delayed or the sender crashes.
-        guid: assignedGuid,
+        guid: null,
       };
       this.#saveDelivery(key, entry);
     }
-    const receiverReceiptGuid = clean(this.router.userMirrorEchoReceipt?.(key)?.guid);
-    if (!isClientGuidDelivery(entry) && entry.status === "prepared") {
-      const definitivelyUnattempted = !entry.attemptedAt && !entry.acceptedAt
-        && !entry.deadLetteredAt && !entry.guid && !receiverReceiptGuid;
-      if (definitivelyUnattempted) {
-        // A prepared journal is persisted before the router reservation and
-        // before the attempting transition. It is therefore safe to upgrade
-        // this legacy clean/tagged entry without sending it twice. Persist the
-        // new identity first; a restart can then repeat only the reservation
-        // cleanup below, never GUID allocation or dispatch.
+    let receiverReceiptGuid = this.#receiverReceiptGuid(key, entry);
+    if (entry.status === "prepared") {
+      const noAttemptEvidence = !entry.attemptedAt && !entry.acceptedAt
+        && !entry.deadLetteredAt && !receiverReceiptGuid;
+      if (isClientGuidDelivery(entry) && noAttemptEvidence) {
+        // A prepared caller-GUID journal has not crossed the send boundary.
+        // Convert it to the transcript-visible standard path before dispatch;
+        // attempted historical caller-GUID entries remain immutable and are
+        // reconciled by their exact persisted identity below.
+        // Release the old body/marker reservation first. If this process dies
+        // at the boundary, the e456 rollback reader still sees its unchanged
+        // prepared journal and can rebuild/send the original compatible body.
+        this.router.releaseUserMirrorEcho(key);
         entry.wireMode = WIRE_MODE_PLAIN;
-        entry.clientGuidMode = true;
-        entry.guid = allocateClientGuid(this.clientGuidFactory);
+        entry.clientGuidMode = false;
+        entry.guid = null;
         this.#saveDelivery(key, entry);
+      } else if (!isClientGuidDelivery(entry) && noAttemptEvidence && !entry.guid) {
+        // Current clean entries are already safe, while a definitely-unsent
+        // legacy tagged entry can shed its obsolete Unicode correlation marker
+        // before using the same standard bridge-assigned GUID path.
+        if (entry.wireMode !== WIRE_MODE_PLAIN || entry.clientGuidMode !== false) {
+          this.router.releaseUserMirrorEcho(key);
+          entry.wireMode = WIRE_MODE_PLAIN;
+          entry.clientGuidMode = false;
+          this.#saveDelivery(key, entry);
+        }
       } else if (receiverReceiptGuid) {
         // A durable receiving-side receipt is proof that the legacy bubble
         // already arrived. Repair a contradictory prepared journal instead
@@ -760,7 +793,7 @@ export class LocalUserMirrorSender {
         entry.acceptedAt ||= new Date(this.now()).toISOString();
         this.#saveDelivery(key, entry);
       } else {
-        // Any legacy prepared entry carrying attempt evidence is ambiguous,
+        // Any prepared entry carrying attempt evidence is ambiguous,
         // regardless of its stale status label. Preserve at-most-once
         // delivery and let the exact legacy reconciliation path settle it.
         entry.status = "ambiguous";
@@ -787,7 +820,18 @@ export class LocalUserMirrorSender {
       // Re-establish or migrate the body-free receiver reservation before any
       // crash reconciliation. This never sends; it only preserves late-echo
       // suppression if the router restarted between the RPC write and result.
-      this.router.reserveUserMirrorEcho({ reservationId: key, threadId, text: reservationText, rootGuid });
+      this.router.reserveUserMirrorEcho({
+        reservationId: key,
+        threadId,
+        text: reservationText,
+        rootGuid,
+        bodyHash: entry.bodyHash,
+      });
+      if (!this.router.markUserMirrorEchoAttempted(key, entry.bodyHash)) {
+        throw codedError("IMSG_LOCAL_MIRROR_RESERVATION_LOST", "The attempted user-mirror reservation could not be restored.", {
+          attempted: true,
+        });
+      }
     }
     if (isClientGuidDelivery(entry) && entry.guid
       && !["prepared", "dead-letter"].includes(entry.status) && !receiverReceiptGuid) {
@@ -797,7 +841,13 @@ export class LocalUserMirrorSender {
       if (entry.guid) {
         const hasDurableReceiverReceipt = receiverReceiptGuid === entry.guid;
         if (!hasDurableReceiverReceipt && !this.router.hasSeenMessageGuid(entry.guid)) {
-          this.router.reserveUserMirrorEcho({ reservationId: key, threadId, text: reservationText, rootGuid });
+          this.router.reserveUserMirrorEcho({
+            reservationId: key,
+            threadId,
+            text: reservationText,
+            rootGuid,
+            bodyHash: entry.bodyHash,
+          });
         }
         this.router.confirmUserMirrorEcho(key, entry.guid);
         this.router.routeOutboundGuid(entry.guid, threadId);
@@ -808,6 +858,11 @@ export class LocalUserMirrorSender {
       return { classification: "dead-letter", reservationId: key, attempted: true };
     }
     if (["attempting", "ambiguous"].includes(entry.status)) {
+      receiverReceiptGuid = this.#receiverReceiptGuid(key, entry);
+      if (receiverReceiptGuid) {
+        this.#acceptPart(key, entry, threadId, receiverReceiptGuid);
+        return { classification: "duplicate", guid: receiverReceiptGuid, reservationId: key };
+      }
       const recovered = await this.#reconcile(entry, entry.guid || "");
       if (!recovered) {
         // `attempting` is already beyond the crash-ambiguity boundary: the
@@ -816,34 +871,34 @@ export class LocalUserMirrorSender {
         // never reset to a state that can send again.
         return this.#unresolvedPart(key, entry);
       } else {
-        entry.status = "accepted";
-        entry.guid = messageGuid(recovered) || entry.guid;
-        entry.acceptedAt = new Date(this.now()).toISOString();
-        this.#saveDelivery(key, entry);
-        if (entry.guid) {
-          this.router.confirmUserMirrorEcho(key, entry.guid);
-          this.router.routeOutboundGuid(entry.guid, threadId);
-        }
+        this.#acceptPart(key, entry, threadId, messageGuid(recovered) || entry.guid);
         return { classification: "duplicate", guid: entry.guid, reservationId: key };
       }
     }
 
-    this.router.reserveUserMirrorEcho({ reservationId: key, threadId, text: reservationText, rootGuid });
-    if (isClientGuidDelivery(entry)) {
-      if (!canonicalClientGuid(entry.guid)) {
-        throw codedError("IMSG_LOCAL_MIRROR_GUID_INVALID", "The persisted user-mirror GUID is invalid.", { attempted: false });
-      }
+    this.router.reserveUserMirrorEcho({
+      reservationId: key,
+      threadId,
+      text: reservationText,
+      rootGuid,
+      bodyHash: entry.bodyHash,
+    });
+    // This reservation write is the receiver's durable crash boundary. Mark it
+    // before the sender journal and before the bridge call: a crash after the
+    // journal transition may have committed a native row even if no GUID ever
+    // returned, while a crash before that transition still leaves `prepared`
+    // and is safe to release/rebuild without dispatch.
+    if (!this.router.markUserMirrorEchoAttempted(key, entry.bodyHash)) {
+      throw codedError("IMSG_LOCAL_MIRROR_RESERVATION_LOST", "The user-mirror attempt reservation could not be persisted.", {
+        attempted: false,
+      });
     }
     entry.status = "attempting";
     entry.attemptedAt = new Date(this.now()).toISOString();
     this.#saveDelivery(key, entry);
-    if (isClientGuidDelivery(entry) && !this.router.confirmUserMirrorEcho(key, entry.guid)) {
-      // Persist the no-retry boundary before binding the reservation to the
-      // clean client GUID. A rollback that sees `prepared` can still send its
-      // clean legacy body and confirm the bridge-assigned GUID;
-      // once `attempting` is durable, neither version is allowed to resend.
-      throw codedError("IMSG_LOCAL_MIRROR_GUID_INVALID", "The persisted user-mirror GUID could not be reserved.", { attempted: true });
-    }
+    // Historical caller-GUID entries can only reach this point after a
+    // definitely-unsent prepared journal was converted above. Attempted
+    // caller-GUID entries take the exact reconciliation branch and never send.
     let result;
     try {
       const formatting = imsgTransportInternals.nativeFormatting(intent.ranges).slice(0, 512);
@@ -857,16 +912,23 @@ export class LocalUserMirrorSender {
         // suffix and could associate simultaneous equal text with the wrong
         // row. Exact GUID + exact Reply-root verification still follows.
         dd_scan: false,
-        ...(isClientGuidDelivery(entry) ? { client_guid: entry.guid } : {}),
       });
     } catch (error) {
       if (error?.attempted === false) {
-        this.router.releaseUserMirrorEcho(key);
         entry.status = "prepared";
         entry.attemptedAt = null;
         this.#saveDelivery(key, entry);
+        // Persist the authoritative definitely-unsent result first. If the
+        // process dies before releasing the attempted receiver guard, the
+        // prepared resume path removes that stale guard before retrying.
+        this.router.releaseUserMirrorEcho(key);
         this.#unavailable("SEND_UNAVAILABLE");
         return { classification: "unavailable", reservationId: key, attempted: false, fallbackSafe: true };
+      }
+      receiverReceiptGuid = this.#receiverReceiptGuid(key, entry);
+      if (receiverReceiptGuid) {
+        this.#acceptPart(key, entry, threadId, receiverReceiptGuid);
+        return { classification: "accepted", guid: receiverReceiptGuid, reservationId: key };
       }
       const recovered = await this.#reconcile(entry);
       if (recovered) result = { classification: "accepted", ok: true, guid: messageGuid(recovered) };
@@ -875,10 +937,10 @@ export class LocalUserMirrorSender {
       }
     }
     if (result?.classification === "unsupported" || result?.retrySafe === true) {
-      this.router.releaseUserMirrorEcho(key);
       entry.status = "prepared";
       entry.attemptedAt = null;
       this.#saveDelivery(key, entry);
+      this.router.releaseUserMirrorEcho(key);
       this.#unavailable("SEND_UNSUPPORTED");
       return { classification: "unavailable", reservationId: key, attempted: false, fallbackSafe: true };
     }
@@ -894,6 +956,11 @@ export class LocalUserMirrorSender {
       this.#saveDelivery(key, entry);
       this.router.confirmUserMirrorEcho(key, returnedGuid, { verified: false });
     }
+    receiverReceiptGuid = this.#receiverReceiptGuid(key, entry);
+    if (receiverReceiptGuid) {
+      this.#acceptPart(key, entry, threadId, receiverReceiptGuid);
+      return { classification: "accepted", guid: receiverReceiptGuid, reservationId: key };
+    }
     if (result?.classification === "ambiguous") {
       const recovered = await this.#reconcile(entry, returnedGuid);
       if (!recovered) {
@@ -901,7 +968,7 @@ export class LocalUserMirrorSender {
       }
       result = { classification: "accepted", ok: true, guid: messageGuid(recovered) };
     }
-    const guid = messageGuid(result) || clean(this.router.userMirrorEchoReceipt?.(key)?.guid);
+    const guid = messageGuid(result) || this.#receiverReceiptGuid(key, entry);
     if (guid) entry.guid = guid;
     // A bridge acknowledgement is only provisional. `send.rich` may return
     // ok/queued without a GUID, and its built-in verifier does not prove that
@@ -915,14 +982,7 @@ export class LocalUserMirrorSender {
     if (!verified || !verifiedGuid || (guid && verifiedGuid !== guid)) {
       return this.#unresolvedPart(key, entry);
     }
-    entry.guid = verifiedGuid;
-    entry.status = "accepted";
-    entry.acceptedAt = new Date(this.now()).toISOString();
-    this.#saveDelivery(key, entry);
-    if (entry.guid) {
-      this.router.confirmUserMirrorEcho(key, entry.guid);
-      this.router.routeOutboundGuid(entry.guid, threadId);
-    }
+    this.#acceptPart(key, entry, threadId, verifiedGuid);
     return { classification: "accepted", guid: entry.guid, reservationId: key };
   }
 

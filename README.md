@@ -45,16 +45,29 @@ credentials, controller enrollment, and device key.
 Codex-authored user messages take one deliberately narrow reverse path: a
 normal-profile `imsg rpc` child sends only rich text to the root-proven direct
 service conversation. The body travels over the child's stdin, never process
-arguments. Before dispatch, the service persists a canonical UUIDv4 and the
-patched bridge constructs the native `IMMessage` with that exact GUID. The
-receiving profile therefore knows the message identity before any send or
-watch response can race: exact GUID plus exact native Reply root suppresses the
-dedicated-account echo without adding hidden Unicode to the message body. A
-send is accepted only after the normal profile observes that exact GUID, body,
-and `thread_originator_guid`. Legacy tagged journals remain recoverable, while
-new mirrors never use body-only correlation or a timeout-based suppression
-decision. Ambiguous writes are reconciled without resending; after 15 minutes,
-a content-free task notice unblocks later output.
+arguments. New mirrors use standard `send.rich`, so Messages assigns the native
+GUID and the outgoing bubble remains visible in the normal profile's transcript.
+Before dispatch, the service persists a private delivery journal and reserves
+a fingerprint of the exact clean body plus native Reply root. The receiver may
+provisionally hold that candidate while the bridge returns its GUID. Before the
+durable send-attempt boundary, body/root similarity alone never consumes a
+message. After that boundary, a briefly held body/root candidate is parked
+privately and fail-closed if the bridge result was lost. A candidate becomes a
+receipt only when the authoritative bridge result names its exact GUID; every
+nonmatching candidate is atomically restored to the ordinary durable inbox as
+genuine user input. Parked input is bounded to eight plain-text messages of 96
+KiB each, and overflow leaves the inbox cursor behind for safe watch recovery.
+While no authoritative identity exists, the unavoidable ambiguity still favors
+preventing a duplicate Codex action. The bridge-returned GUID is registered
+immediately. An exact receiver receipt or an exact normal-profile sender-row
+proof for GUID, body, chat, and Reply root makes acceptance durable and
+suppresses only that echo. Receipts are body-bound so a reused delivery ID
+cannot settle different content. This preserves crash idempotence without
+hidden Unicode. Ambiguous writes are reconciled without resending; after 15
+minutes, a content-free task notice unblocks later output. Historical
+caller-GUID and tagged journals remain reconciliation-only and are never
+resent.
+
 This sender cannot select recipients, send files or URLs, watch Messages,
 launch/relaunch Messages, or control any Codex process.
 
@@ -79,16 +92,17 @@ start`, switch Desktop to another backend, or signal Desktop-owned processes.
 - An installed Codex build supported by this service. The app version,
   app-server version, signed native device-key module, and module digest are
   pinned and fail closed after an unsupported Codex update.
-- `imsg` 0.13.0 with these patches applied in order: daemon contacts,
-  custom-emoji tapbacks, macOS 27 edits, runtime hardening, then client-owned
-  message GUIDs (`docs/imsg-*.patch`), plus the full IMCore bridge enabled.
-- The active Codex profile also needs that patched local `imsg` IMCore bridge
-  active for outgoing user mirrors. Its status must advertise
-  `rpc_methods: ["send.rich.client-guid", ...]` and
-  `selectors.clientMessageGuid: true`. The distinct RPC method makes a mixed
-  old-CLI/new-helper installation fail before any send. The service probes it
-  but never launches or relaunches Messages automatically; core helper and
-  Codex functions remain independent.
+- `imsg` 0.13.0 with the daemon-contacts, custom-emoji tapback, macOS 27 edit,
+  and runtime-hardening patches (`docs/imsg-*.patch`), plus the full IMCore
+  bridge enabled. The client-owned message-GUID patch may remain installed for
+  compatibility and diagnostics, but outgoing user mirrors do not require or
+  use it.
+- The active Codex profile also needs the local `imsg` full IMCore bridge active
+  for outgoing user mirrors. Its status must advertise standard `send.rich`.
+  `selectors.clientMessageGuid` and `send.rich.client-guid` are optional and
+  are not mirror-readiness requirements. The service probes the standard rich
+  bridge but never launches or relaunches Messages automatically; core helper
+  and Codex functions remain independent.
 - Network access to OpenAI authentication and Remote Control endpoints.
 - Node.js 22.6 or newer and pnpm 10.26.
 
@@ -377,9 +391,19 @@ Codex on the Mac.
   the last fully delivered cursor.
 - Text and generated-image acceptance are checkpointed so a restart does not
   replay an already accepted part.
+- Rollout filesystem activity is path-aware: a changed JSONL path wakes only
+  the matching task at foreground priority. Unknown paths and periodic recovery
+  ticks schedule a background catalog pass. Reconciliation is serialized per
+  task, coalesces repeated activity into one pending pass, and runs for at most
+  four tasks concurrently, so a slow or ambiguous mirror send cannot stall
+  unrelated task mirrors. Durable cursors make fallback passes non-replaying.
 - Native message GUID routing, poll state, mute/listen state, run state, and
   live-mirror offsets are private local files. The user-mirror journal stores
   hashes, markers, and routing metadata, never message bodies.
+- New user-mirror journals use clean standard rich sends and bridge-assigned
+  GUIDs. Definitely-unsent prepared legacy entries may migrate to that path;
+  any historical caller-GUID entry with attempt evidence remains immutable and
+  is reconciled by its persisted identity without another send.
 - Helper/watch degradation changes local service readiness immediately and
   recovers without claiming a healthy state prematurely.
 - Periodic bridge/account checks run asynchronously and sequentially, tolerate

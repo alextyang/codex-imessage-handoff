@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { createHash } from "node:crypto";
 import { mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -22,6 +23,10 @@ function message(id, text, extras = {}) {
     created_at: extras.createdAt || "2026-07-12T12:00:00.000Z",
     ...extras,
   };
+}
+
+function mirrorBodyHash(body) {
+  return createHash("sha256").update(`local-user-mirror-body-v1\0${body}`).digest("hex");
 }
 
 test("persists a prompt before acknowledgement and resumes it after restart", () => {
@@ -1080,6 +1085,145 @@ test("a clean user-mirror reservation requires exact GUID evidence before consum
   const consumed = resumed.consumeUserMirrorEcho(early);
   assert.equal(consumed.reservationId, reservationId);
   assert.equal(consumed.expectedGuid, "clean-mirror-guid");
+});
+
+test("an attempted clean mirror releases disproved candidates and fails closed on quarantine overflow", () => {
+  const { router, stateFile } = fixture();
+  router.routeOutboundGuid("root-a", "thread-a", { root: true });
+  const reservationId = "5".repeat(64);
+  const body = "Committed before the bridge result";
+  const bodyHash = mirrorBodyHash(body);
+  router.reserveUserMirrorEcho({
+    reservationId,
+    threadId: "thread-a",
+    text: body,
+    rootGuid: "root-a",
+    bodyHash,
+  });
+  assert.equal(router.markUserMirrorEchoAttempted(reservationId, bodyHash), true);
+
+  for (let index = 0; index < 8; index += 1) {
+    const candidate = message(58_200 + index, body, {
+      guid: `quarantined-${index}`,
+      createdAt: `2026-07-12T12:00:${String(index + 1).padStart(2, "0")}.000Z`,
+      thread_originator_guid: "root-a",
+    });
+    const provisional = router.provisionalUserMirrorEcho(candidate);
+    assert.equal(provisional.dispatchMayHaveOccurred, true);
+    assert.equal(router.quarantineProvisionalUserMirrorEcho(candidate, reservationId), true);
+  }
+
+  const overflow = message(58_208, body, {
+    guid: "quarantined-overflow",
+    createdAt: "2026-07-12T12:00:09.000Z",
+    thread_originator_guid: "root-a",
+  });
+  assert.throws(
+    () => router.quarantineProvisionalUserMirrorEcho(overflow, reservationId),
+    { code: "IMSG_MIRROR_ECHO_QUARANTINE_FULL" },
+  );
+  assert.equal(router.lastRowId, 58_207, "overflow must not advance the durable inbox cursor");
+
+  const persisted = JSON.parse(readFileSync(stateFile, "utf8"));
+  assert.deepEqual(
+    persisted.userMirrorEchoes[0].quarantinedCandidates.map((candidate) => candidate.guid),
+    Array.from({ length: 8 }, (_, index) => `quarantined-${index}`),
+  );
+  assert.equal(router.userMirrorEchoReceipt(reservationId), null,
+    "body-only quarantine is not a delivery receipt");
+  assert.equal(router.confirmUserMirrorEcho(reservationId, "unrelated-returned-guid", { verified: false }), true);
+  assert.equal(router.userMirrorEchoReceipt(reservationId), null,
+    "a bridge GUID that names no quarantined row cannot promote one");
+  assert.deepEqual(
+    router.pendingActions().map((action) => action.messageKey),
+    Array.from({ length: 8 }, (_, index) => `quarantined-${index}`),
+    "an authoritative different GUID durably releases every parked row as genuine input",
+  );
+  assert.deepEqual(
+    router.drainReleasedUserMirrorActions().map((action) => action.messageKey),
+    Array.from({ length: 8 }, (_, index) => `quarantined-${index}`),
+  );
+  assert.deepEqual(router.drainReleasedUserMirrorActions(), [], "the callback drain is single-use");
+});
+
+test("a late exact bridge GUID promotes its quarantined candidate into a body-bound receipt", () => {
+  const { router, stateFile } = fixture();
+  router.routeOutboundGuid("root-a", "thread-a", { root: true });
+  const reservationId = "4".repeat(64);
+  const body = "Wait for the authoritative GUID";
+  const bodyHash = mirrorBodyHash(body);
+  router.reserveUserMirrorEcho({ reservationId, threadId: "thread-a", text: body, rootGuid: "root-a", bodyHash });
+  router.markUserMirrorEchoAttempted(reservationId, bodyHash);
+  const genuine = message(58_219, body, {
+    guid: "genuine-same-body-guid",
+    createdAt: "2026-07-12T12:00:00.500Z",
+    thread_originator_guid: "root-a",
+  });
+  const candidate = message(58_220, body, {
+    guid: "late-authoritative-guid",
+    createdAt: "2026-07-12T12:00:01.000Z",
+    thread_originator_guid: "root-a",
+  });
+  assert.equal(router.quarantineProvisionalUserMirrorEcho(genuine, reservationId), true);
+  assert.equal(router.quarantineProvisionalUserMirrorEcho(candidate, reservationId), true);
+
+  const resumed = new LocalConversationRouter({ stateFile });
+  assert.equal(resumed.confirmUserMirrorEcho(reservationId, "late-authoritative-guid", { verified: false }), true);
+  const receipt = resumed.userMirrorEchoReceipt(reservationId);
+  assert.equal(receipt.guid, "late-authoritative-guid");
+  assert.equal(receipt.bodyHash, bodyHash);
+  assert.match(receipt.fingerprint, /^[a-f0-9]{64}$/u);
+  assert.equal(resumed.provisionalUserMirrorEcho({ ...candidate, id: 58_221, guid: "later-copy" }), null,
+    "promotion removes the active reservation");
+  assert.equal(resumed.nativeThread("thread-a").latestGuid, "late-authoritative-guid");
+  assert.deepEqual(resumed.pendingActions().map((action) => action.messageKey), ["genuine-same-body-guid"],
+    "restart recovery releases every nonmatching parked row before settling the exact mirror");
+  assert.deepEqual(resumed.drainReleasedUserMirrorActions().map((action) => action.messageKey), ["genuine-same-body-guid"]);
+  assert.equal(resumed.ingest(candidate), null, "the exact authoritative mirror remains suppressed");
+});
+
+test("settled mirror ids are body-bound and legacy unbound receipts fail closed", () => {
+  const { router, stateFile } = fixture();
+  router.routeOutboundGuid("root-a", "thread-a", { root: true });
+  const reservationId = "3".repeat(64);
+  const body = "Immutable mirror body";
+  const bodyHash = mirrorBodyHash(body);
+  router.reserveUserMirrorEcho({ reservationId, threadId: "thread-a", text: body, rootGuid: "root-a", bodyHash });
+  router.confirmUserMirrorEcho(reservationId, "settled-guid");
+  router.consumeUserMirrorEcho(message(58_230, body, {
+    guid: "settled-guid",
+    createdAt: "2026-07-12T12:00:01.000Z",
+    thread_originator_guid: "root-a",
+  }));
+
+  assert.equal(router.reserveUserMirrorEcho({
+    reservationId,
+    threadId: "thread-a",
+    text: body,
+    rootGuid: "root-a",
+    bodyHash,
+  }), reservationId, "an exact settled reservation is idempotent");
+  assert.throws(() => router.reserveUserMirrorEcho({
+    reservationId,
+    threadId: "thread-a",
+    text: "Different reused body",
+    rootGuid: "root-a",
+    bodyHash: mirrorBodyHash("Different reused body"),
+  }), { code: "IMSG_MIRROR_ECHO_CONFLICT" });
+
+  const persisted = JSON.parse(readFileSync(stateFile, "utf8"));
+  delete persisted.userMirrorReceipts[reservationId].bodyHash;
+  delete persisted.userMirrorReceipts[reservationId].fingerprint;
+  writeFileSync(stateFile, `${JSON.stringify(persisted, null, 2)}\n`, { mode: 0o600 });
+  const legacy = new LocalConversationRouter({ stateFile });
+  assert.throws(() => legacy.reserveUserMirrorEcho({
+    reservationId,
+    threadId: "thread-a",
+    text: body,
+    rootGuid: "root-a",
+    bodyHash,
+  }), { code: "IMSG_MIRROR_ECHO_CONFLICT" },
+  "an unbound historical receipt cannot authorize a new GUID-less attempt");
 });
 
 test("an unverified bridge GUID requires matching body, root, and post-reservation time", () => {

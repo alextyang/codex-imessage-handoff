@@ -79,7 +79,8 @@ function addResult(aggregate, result) {
 /**
  * Own one durable LiveMirror cursor per Codex task. This class deliberately
  * contains no polling or timers; callers decide when catalog activation and
- * reconciliation happen, while one operation chain preserves delivery order.
+ * reconciliation happen. One operation chain per task preserves that task's
+ * delivery order without allowing a slow send to stall unrelated tasks.
  */
 export class MultiLiveMirror {
   constructor(options) {
@@ -91,7 +92,7 @@ export class MultiLiveMirror {
     this.mirrors = new Map();
     this.mirrorsByDigest = new Map();
     this.catalog = new Map();
-    this.reconcileChain = Promise.resolve();
+    this.reconcileChains = new Map();
     mkdirSync(this.stateDirectory, { recursive: true, mode: 0o700 });
     chmodSync(this.stateDirectory, 0o700);
   }
@@ -161,29 +162,32 @@ export class MultiLiveMirror {
   }
 
   reconcile(thread, options = {}) {
-    return this.#enqueue(() => this.#reconcile(thread, options));
+    const details = threadDetails(thread);
+    return this.#enqueueThread(details.id, () => this.#reconcile(thread, options));
   }
 
   reconcileAll(threads, options = {}) {
-    return this.#enqueue(async () => {
-      const unique = new Map();
-      for (const thread of Array.isArray(threads) ? threads : []) {
-        const details = threadDetails(thread);
-        unique.set(details.id, thread);
-      }
+    const unique = new Map();
+    for (const thread of Array.isArray(threads) ? threads : []) {
+      const details = threadDetails(thread);
+      unique.set(details.id, thread);
+    }
+    const ordered = [...unique.entries()].sort(([left], [right]) => left.localeCompare(right));
+    return Promise.all(ordered.map(([id, thread]) => (
+      this.#enqueueThread(id, () => this.#reconcile(thread, options))
+    ))).then((resolved) => {
       const aggregate = emptyAggregate();
-      const results = [];
-      for (const [id, thread] of [...unique.entries()].sort(([left], [right]) => left.localeCompare(right))) {
-        const result = await this.#reconcile(thread, options);
-        results.push({ threadId: id, ...result });
+      const results = resolved.map((result, index) => {
         addResult(aggregate, result);
-      }
+        return { threadId: ordered[index][0], ...result };
+      });
       return { ...aggregate, threads: results };
     });
   }
 
   drain(thread, options = {}) {
-    return this.#enqueue(async () => {
+    const id = threadDetails(thread).id;
+    return this.#enqueueThread(id, async () => {
       const aggregate = emptyAggregate();
       const maxPasses = Math.max(1, Math.min(256, Number(options.maxPasses) || DEFAULT_MAX_DRAIN_PASSES));
       let last = null;
@@ -211,9 +215,14 @@ export class MultiLiveMirror {
     });
   }
 
-  #enqueue(operation) {
-    const result = this.reconcileChain.then(operation, operation);
-    this.reconcileChain = result.then(() => undefined, () => undefined);
+  #enqueueThread(id, operation) {
+    const previous = this.reconcileChains.get(id) || Promise.resolve();
+    const result = previous.then(operation, operation);
+    const settled = result.then(() => undefined, () => undefined);
+    this.reconcileChains.set(id, settled);
+    settled.finally(() => {
+      if (this.reconcileChains.get(id) === settled) this.reconcileChains.delete(id);
+    });
     return result;
   }
 

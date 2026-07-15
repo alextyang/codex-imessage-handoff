@@ -216,6 +216,21 @@ text is checkpointed independently from generated images; images are accepted
 and checkpointed one at a time. A crash may delay a result but must not replay
 an already checkpointed component.
 
+Rollout reconciliation is path-aware and bounded. A known changed JSONL path
+queues only its catalog task at foreground priority; an unknown path, missing
+path, restart, or periodic fallback queues a background full-catalog pass. One
+chain per task preserves task-local order, repeated activity while that chain
+runs coalesces into one pending pass, and no more than four tasks reconcile at
+once. A slow or ambiguous delivery for one task must not block live mirrors for
+unrelated tasks. Full passes remain safe because every task owns a durable
+rollout cursor.
+
+Delivery retry state is task-local. A retryable result pauses only that task
+and schedules one targeted retry; it cannot close the reconciliation gate for
+another task. Filesystem work keeps foreground priority, but after a bounded
+burst the oldest fallback item must run so sustained hot rollouts cannot starve
+recovery scans.
+
 An ambiguous rich send remains pending. It is never repeated through a simpler
 send API. No operation falls back to direct `imsg send`, a remote messaging
 provider, a local Codex process, or another Remote Control environment.
@@ -224,19 +239,39 @@ The sole active-profile messaging exception is a target-locked `imsg rpc`
 child for mirroring Codex-authored user text as the outgoing half of the
 conversation. It may send only formatted text to the root-proven direct
 service chat and exact native task root. Prompt bodies cross stdin rather than
-argv. A private delivery journal, confirmed GUID, and dedicated-side echo
-ledger make the operation crash-idempotent without adding hidden Unicode to
-new message bodies. Outstanding legacy tagged journal entries remain readable
-only for migration and reconciliation. A provisional bridge response becomes
-accepted only after an exact local GUID/`thread_originator_guid` proof. The
-bridge-returned GUID is registered immediately so the dedicated receiver can
-suppress only that exact GUID on that exact native Reply root. An exact-root
-visible-body candidate may wait one second for this registration race, with a
-hard two-second cap; body/root correlation never creates a receipt, removes a
-reservation, or discards the candidate. Without exact confirmation it proceeds
-as genuine user input. Crash-bound or timed-out writes are reconciled without
-another send; after fifteen minutes, a body-free task notice advances the
-mirror.
+argv. New mirrors use standard `send.rich` and the GUID assigned by Messages;
+the caller-GUID extension is optional and is not a readiness dependency. This
+standard path is required because caller-owned GUID messages can reach the
+recipient without rendering in the sending profile's transcript.
+
+A private delivery journal, exact native Reply-root reservation, confirmed
+bridge GUID, and dedicated-side echo ledger make the operation crash-idempotent
+without adding hidden Unicode to new message bodies. The receiver may
+provisionally hold an exact clean-body/root candidate for the short bridge
+registration race. Before the durable send-attempt boundary, body/root
+correlation alone never creates a receipt, removes a reservation, or discards
+the candidate. Once dispatch may have occurred, a candidate that remains
+indistinguishable after the bounded hold is parked privately and fail-closed by
+GUID. It is promoted to a receipt only if the later authoritative bridge GUID
+names that exact candidate. Every parked nonmatch is atomically re-ingested as
+ordinary durable user input, and the daemon dispatches those released actions
+immediately; startup pending-action replay is the crash fallback. Parking is
+limited to eight plain-text candidates of at most 96 KiB each. Capacity
+exhaustion fails before cursor advancement so watch recovery cannot evict user
+input. While the bridge supplies no authoritative identity, the unavoidable
+ambiguity still prefers preventing a duplicate Codex action. The bridge-returned
+GUID is registered immediately, and acceptance requires either the matching
+body-bound receiver receipt or an exact normal-profile sender-row proof for
+GUID, body, chat, and `thread_originator_guid`. Echo suppression then applies
+only to that GUID on that native Reply root, and a reused delivery ID cannot
+settle different content.
+
+Outstanding tagged and caller-GUID journals remain readable only for migration
+and reconciliation. A definitely-unsent prepared entry may be converted to the
+clean standard path, but any entry with send-attempt evidence keeps its
+persisted identity and is never resent. Crash-bound or timed-out writes are
+reconciled without another send; after fifteen minutes, a body-free task notice
+advances the mirror.
 It has no recipient, attachment, URL, watch, launch, or Messages lifecycle API;
 failure is a separate readiness capability and cannot degrade the helper or
 Codex Remote Control.
@@ -335,7 +370,9 @@ A release also requires:
 - directory poll, task selection, native reply routing, unthreaded routing,
   task-scoped command picker, rich text, poll vote, attachment, cancellation,
   restart recovery, helper reconnect from the dedicated Messages identity,
-  normal-profile outgoing user mirrors, echo-before-result suppression,
-  same-body collision resistance, and bridge-loss fallback behavior;
+  transcript-visible normal-profile outgoing user mirrors, echo-before-result
+  suppression, exact sender-row verification, same-body collision resistance,
+  historical caller-GUID no-resend reconciliation, and bridge-loss fallback
+  behavior;
 - deauthorization proving the controller is removed while Codex Desktop and its
   normal private app-server remain unaffected.

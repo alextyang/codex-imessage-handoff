@@ -939,12 +939,13 @@ test("an early marker-normalized user mirror is held, suppressed on its exact na
   assert.deepEqual(actions, []);
   assert.equal(transport.router.lastRowId, 20_401);
   assert.deepEqual(transport.router.pendingActions(), []);
-  assert.deepEqual(transport.router.userMirrorEchoReceipt(reservationId), {
-    threadId: THREAD.id,
-    rootGuid: "normalized-root",
-    guid: "normalized-early-guid",
-    consumedAt: "2026-07-12T12:00:00.000Z",
-  });
+  const receipt = transport.router.userMirrorEchoReceipt(reservationId);
+  assert.equal(receipt.threadId, THREAD.id);
+  assert.equal(receipt.rootGuid, "normalized-root");
+  assert.equal(receipt.guid, "normalized-early-guid");
+  assert.match(receipt.bodyHash, /^[a-f0-9]{64}$/u);
+  assert.match(receipt.fingerprint, /^[a-f0-9]{64}$/u);
+  assert.equal(receipt.consumedAt, "2026-07-12T12:00:00.000Z");
   assert.ok(client.calls.some(([kind]) => kind === "read"));
   await transport.stop();
 });
@@ -1066,6 +1067,65 @@ test("an unconfirmed clean same-body reply and its follower route promptly witho
     guid: "later-candidate-guid",
   }).reservationId, reservationId, "the fail-closed reservation survives body-only input");
   assert.equal(transport.router.lastRowId, 20_405);
+  await transport.stop();
+});
+
+test("a committed mirror with a lost GUID is quarantined across restart while followers retain order", async () => {
+  const { transport, client, stateFile } = fixture({ provisionalMirrorHoldMs: 25, provisionalMirrorPollMs: 1 });
+  const actions = [];
+  await transport.start({ onAction: (action) => actions.push(action) });
+  transport.router.routeOutboundGuid("attempted-root", THREAD.id, { root: true });
+  const reservationId = "a".repeat(64);
+  transport.router.reserveUserMirrorEcho({
+    reservationId,
+    threadId: THREAD.id,
+    text: "Native row committed before result",
+    rootGuid: "attempted-root",
+  });
+  assert.equal(transport.router.markUserMirrorEchoAttempted(reservationId), true);
+
+  const candidate = {
+    id: 20_410,
+    guid: "committed-no-result-guid",
+    chat_id: 42,
+    chat_guid: "iMessage;-;+15550000000",
+    sender: "+15551111111",
+    is_from_me: false,
+    text: "Native row committed before result",
+    thread_originator_guid: "attempted-root",
+    created_at: "2026-07-12T12:00:04.000Z",
+  };
+  const followers = [
+    { ...candidate, id: 20_411, guid: "after-crash-one", text: "First follower", created_at: "2026-07-12T12:00:05.000Z" },
+    { ...candidate, id: 20_412, guid: "after-crash-two", text: "Second follower", created_at: "2026-07-12T12:00:06.000Z" },
+  ];
+
+  client.watchHandlers.onMessage(candidate);
+  client.watchHandlers.onMessage(followers[0]);
+  await new Promise((resolve) => setTimeout(resolve, 2));
+  await transport.stop();
+  assert.equal(transport.router.lastRowId, 0, "stop leaves the unresolved ordered row replayable");
+
+  await transport.start({ onAction: (action) => actions.push(action) });
+  const startedAt = Date.now();
+  client.watchHandlers.onMessage(candidate);
+  client.watchHandlers.onMessage(followers[0]);
+  client.watchHandlers.onMessage(followers[1]);
+  await new Promise((resolve) => setTimeout(resolve, 70));
+
+  assert.deepEqual(actions.map((action) => action.messageKey), ["after-crash-one", "after-crash-two"]);
+  assert.ok(Date.now() - startedAt < 200, "the bounded quarantine must not recreate mutation-timeout HOL blocking");
+  assert.equal(transport.router.lastRowId, 20_412);
+  assert.equal(transport.router.userMirrorEchoReceipt(reservationId), null,
+    "a clean body/root candidate alone is never a receipt");
+  const persisted = JSON.parse(readFileSync(stateFile, "utf8"));
+  const reservation = persisted.userMirrorEchoes.find((echo) => echo.reservationId === reservationId);
+  assert.equal(reservation.dispatchMayHaveOccurred, true);
+  assert.deepEqual(reservation.quarantinedCandidates.map((item) => item.guid), [candidate.guid]);
+
+  assert.equal(transport.router.confirmUserMirrorEcho(reservationId, candidate.guid, { verified: false }), true);
+  assert.equal(transport.router.userMirrorEchoReceipt(reservationId).guid, candidate.guid,
+    "the later exact bridge GUID promotes only its matching quarantined row");
   await transport.stop();
 });
 

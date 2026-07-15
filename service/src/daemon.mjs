@@ -39,6 +39,7 @@ import { readSidebarTitleRecords } from "./sidebar-title-index.mjs";
 import { SidebarTitleArbiter } from "./sidebar-title-arbiter.mjs";
 import { RunManager } from "./run-manager.mjs";
 import { RolloutActivityMonitor } from "./rollout-activity-monitor.mjs";
+import { RolloutReconcileScheduler } from "./rollout-reconcile-scheduler.mjs";
 import { ServerRequestBroker } from "./server-request-broker.mjs";
 import { FailureQueue } from "./failure-queue.mjs";
 import { isImmediateLocalAction, isTerminalLocalActionFailure, LocalActionDispatch } from "./local-action-dispatch.mjs";
@@ -122,7 +123,7 @@ function markRemoteControlFailure(error) {
 }
 const completions = new CompletionMonitor(paths.completionState);
 const multiLiveMirror = new MultiLiveMirror({ stateDirectory: paths.multiLiveMirrorState });
-const liveMirrorBackoff = new LiveMirrorRetryBackoff();
+const liveMirrorBackoffs = new Map();
 const failedRuns = new FailureQueue();
 const newThreadFlows = new NewThreadFlowStore();
 const localActionContext = new AsyncLocalStorage();
@@ -194,9 +195,8 @@ let catalogById = new Map();
 const sidebarTitleArbiter = new SidebarTitleArbiter();
 let completionMonitoringStarted = false;
 let completionScanInFlight = null;
-let liveMirrorScanInFlight = null;
 let completionScanRequested = false;
-let liveMirrorScanRequested = false;
+const liveMirrorRetryTimers = new Map();
 let releaseStartupWork;
 let startupWorkReleased = false;
 const startupWorkReady = new Promise((resolve) => { releaseStartupWork = resolve; });
@@ -279,13 +279,25 @@ async function deliverLiveMessage(message) {
       rootGuid = imsgTransport.router.nativeThread(thread.id)?.rootGuid || "";
       if (!rootGuid) return header;
     }
-    const local = await localUserMirrorSender.sendMirror({
-      deliveryId: message.deliveryId,
-      threadId: thread.id,
-      rootGuid,
-      body: message.body,
-      phase: message.phase,
-    });
+    let local;
+    try {
+      local = await localUserMirrorSender.sendMirror({
+        deliveryId: message.deliveryId,
+        threadId: thread.id,
+        rootGuid,
+        body: message.body,
+        phase: message.phase,
+      });
+    } finally {
+      // An authoritative bridge GUID may prove that body-matched rows parked
+      // by the receiver were genuine user input. Their actions are already in
+      // the durable inbox; enqueue them immediately, while startup replay
+      // remains the crash fallback. LocalActionDispatch deduplicates overlap
+      // with the live watch without exposing message content here.
+      for (const action of imsgTransport.router.drainReleasedUserMirrorActions()) {
+        queueLocalAction(action).catch(() => {});
+      }
+    }
     if (local.sent) return local;
     if (local.classification === "dead-letter") {
       // Do not replay an unverified side effect through another sender. A
@@ -321,45 +333,113 @@ async function deliverLiveMessage(message) {
   }, { signal: AbortSignal.timeout(15_000), proactive: true });
 }
 
-async function scanLiveMirror() {
-  if (!liveMirrorBackoff.ready()) return;
-  const result = await multiLiveMirror.reconcileAll([...catalogById.values()], { deliver: deliverLiveMessage });
-  if (result.retryable > 0) liveMirrorBackoff.recordFailure();
-  else liveMirrorBackoff.reset();
+function liveMirrorBackoffFor(threadIdValue) {
+  const threadId = String(threadIdValue || "").trim();
+  if (!threadId) throw new TypeError("A task id is required for live-mirror retry state.");
+  let backoff = liveMirrorBackoffs.get(threadId);
+  if (!backoff) {
+    backoff = new LiveMirrorRetryBackoff();
+    liveMirrorBackoffs.set(threadId, backoff);
+  }
+  return backoff;
 }
 
-function scheduleLiveMirrorScan() {
-  if (stopped || !liveMirrorBackoff.ready()) return;
-  if (liveMirrorScanInFlight) {
-    liveMirrorScanRequested = true;
+function clearLiveMirrorRetryTimer(threadIdValue) {
+  const threadId = String(threadIdValue || "").trim();
+  const timer = liveMirrorRetryTimers.get(threadId);
+  if (!timer) return;
+  clearTimeout(timer);
+  liveMirrorRetryTimers.delete(threadId);
+}
+
+function resetLiveMirrorRetry(threadIdValue) {
+  const threadId = String(threadIdValue || "").trim();
+  clearLiveMirrorRetryTimer(threadId);
+  liveMirrorBackoffFor(threadId).reset();
+}
+
+function scheduleLiveMirrorRetry(threadIdValue) {
+  const threadId = String(threadIdValue || "").trim();
+  if (stopped || !threadId || !catalogById.has(threadId) || liveMirrorRetryTimers.has(threadId)) return;
+  const timer = setTimeout(() => {
+    liveMirrorRetryTimers.delete(threadId);
+    if (stopped) return;
+    if (!catalogById.has(threadId)) {
+      liveMirrorBackoffs.delete(threadId);
+      return;
+    }
+    liveMirrorScheduler.scheduleThread(threadId);
+  }, Math.max(10, liveMirrorBackoffFor(threadId).remaining()));
+  liveMirrorRetryTimers.set(threadId, timer);
+  timer.unref?.();
+}
+
+function recordLiveMirrorFailure(threadIdValue) {
+  const threadId = String(threadIdValue || "").trim();
+  const delay = liveMirrorBackoffFor(threadId).recordFailure();
+  scheduleLiveMirrorRetry(threadId);
+  return delay;
+}
+
+function pruneLiveMirrorRetryState(threads) {
+  const currentIds = new Set((Array.isArray(threads) ? threads : []).map((thread) => String(thread?.id || "")));
+  for (const threadId of liveMirrorRetryTimers.keys()) {
+    if (!currentIds.has(threadId)) clearLiveMirrorRetryTimer(threadId);
+  }
+  for (const threadId of liveMirrorBackoffs.keys()) {
+    if (!currentIds.has(threadId)) liveMirrorBackoffs.delete(threadId);
+  }
+}
+
+async function scanLiveMirrorThread(thread) {
+  const threadId = String(thread?.id || "");
+  const current = catalogById.get(threadId);
+  if (!current) return;
+  const backoff = liveMirrorBackoffFor(threadId);
+  if (!backoff.ready()) {
+    scheduleLiveMirrorRetry(threadId);
     return;
   }
-  liveMirrorScanRequested = false;
-  liveMirrorScanInFlight = scanLiveMirror()
-    .catch(() => {
-      liveMirrorBackoff.recordFailure();
-      log("Live task synchronization failed; will retry.");
-    })
-    .finally(() => {
-      liveMirrorScanInFlight = null;
-      if (liveMirrorScanRequested) queueMicrotask(scheduleLiveMirrorScan);
-    });
+  try {
+    const result = await multiLiveMirror.reconcile(current, { deliver: deliverLiveMessage });
+    if (result.retryable > 0) recordLiveMirrorFailure(threadId);
+    else resetLiveMirrorRetry(threadId);
+  } catch (error) {
+    recordLiveMirrorFailure(threadId);
+    throw error;
+  }
+}
+
+const liveMirrorScheduler = new RolloutReconcileScheduler({
+  maxConcurrent: 4,
+  runThread: scanLiveMirrorThread,
+  onError: () => log("Live task synchronization failed; will retry."),
+});
+
+function scheduleLiveMirrorScan(activity = null) {
+  if (stopped) return;
+  liveMirrorScheduler.schedule(activity || { source: "full" });
 }
 
 const rolloutActivity = new RolloutActivityMonitor({
   root: paths.sessions,
-  onActivity: () => {
-    scheduleLiveMirrorScan();
+  onActivity: (activity) => {
+    scheduleLiveMirrorScan(activity);
     scheduleCompletionScan();
   },
 });
 
 async function drainSelectedLiveMirror(thread) {
   if (!thread) return { pending: false };
-  if (imsgTransport.router.shouldPauseIncoming(thread.id) || !liveMirrorBackoff.ready()) return { pending: true };
+  const backoff = liveMirrorBackoffFor(thread.id);
+  if (imsgTransport.router.shouldPauseIncoming(thread.id)) return { pending: true };
+  if (!backoff.ready()) {
+    scheduleLiveMirrorRetry(thread.id);
+    return { pending: true };
+  }
   const result = await multiLiveMirror.drain(thread, { deliver: deliverLiveMessage, maxPasses: 16 });
-  if (result.retryable > 0) liveMirrorBackoff.recordFailure();
-  else if (!result.pending) liveMirrorBackoff.reset();
+  if (result.retryable > 0) recordLiveMirrorFailure(thread.id);
+  else if (!result.pending) resetLiveMirrorRetry(thread.id);
   return { pending: result.pending === true };
 }
 
@@ -372,7 +452,7 @@ async function settleLiveSuppression(event, thread, { forceClear = false } = {})
   try {
     drain = await drainSelectedLiveMirror(thread);
   } catch {
-    liveMirrorBackoff.recordFailure();
+    if (thread?.id) recordLiveMirrorFailure(thread.id);
     drain = { pending: true };
   } finally {
     if (token && (forceClear || !drain.pending)) {
@@ -609,6 +689,8 @@ async function synchronizeNow() {
     applyCanonicalThreadTitle(thread, sidebarRecords.get(thread.id), { source: "index" });
   }
   catalogById = new Map(threads.map((thread) => [thread.id, thread]));
+  pruneLiveMirrorRetryState(threads);
+  liveMirrorScheduler.replaceCatalog(threads);
   multiLiveMirror.activateCatalog(threads, { resume: true, clearMissing: true });
   await imsgTransport.syncWorkingThreads(
     threads.filter((thread) => effectiveState(thread).status === "working").map((thread) => thread.id),
@@ -833,7 +915,7 @@ async function executeReply(event, context) {
       const mirror = await settleLiveSuppression(event, thread);
       saveClaimedJob(event, "delivering");
       if (mirror.pending) {
-        context.defer(Math.max(1000, liveMirrorBackoff.remaining()));
+        context.defer(Math.max(1000, liveMirrorBackoffFor(thread.id).remaining()));
         return;
       }
       await deliverCompleted(event, thread);
@@ -971,7 +1053,7 @@ async function executeReply(event, context) {
       saveClaimedJob(event, "delivering");
       if (mirror.pending) {
         deferred = true;
-        context.defer(Math.max(1000, liveMirrorBackoff.remaining()));
+        context.defer(Math.max(1000, liveMirrorBackoffFor(thread.id).remaining()));
         return;
       }
       await deliverCompleted(event, thread);
@@ -1535,6 +1617,8 @@ async function finishNewThreadFlow(flow, action, promptValue = flow.prompt, atta
     normalizeThread: normalizeCreatedThread,
     prepareThread: async (thread, current) => {
       catalogById.set(thread.id, thread);
+      multiLiveMirror.activate(thread, { resume: true });
+      liveMirrorScheduler.replaceCatalog([...catalogById.values()]);
       if (current.reasoning && current.reasoning !== "default") setReasoningOverride(thread.id, current.reasoning);
       else setReasoningOverride(thread.id, "default");
       imsgTransport.router.setThreadListen(thread.id, true);
@@ -2420,10 +2504,16 @@ async function stop() {
   stopped = true;
   if (presenceOfflineTimer) clearTimeout(presenceOfflineTimer);
   presenceOfflineTimer = null;
+  for (const threadId of [...liveMirrorRetryTimers.keys()]) clearLiveMirrorRetryTimer(threadId);
   runs.shutdown();
   rolloutActivity.stop();
+  liveMirrorScheduler.stop();
   serverRequests.stop();
   codexRuntime.close();
+  await Promise.race([
+    liveMirrorScheduler.whenIdle(),
+    new Promise((resolve) => setTimeout(resolve, 5_000)),
+  ]);
   await localUserMirrorSender.stop().catch(() => {});
   await imsgTransport.stop().catch(() => {});
   clearServiceReadiness();

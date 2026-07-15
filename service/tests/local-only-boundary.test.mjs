@@ -51,7 +51,7 @@ test("runtime entry points expose only the authenticated local helper", () => {
 test("normal-profile user mirrors cannot be disabled by Codex window or task focus", () => {
   const daemon = readFileSync(path.join(repo, "service/src/daemon.mjs"), "utf8");
   const start = daemon.indexOf("async function deliverLiveMessage(message)");
-  const end = daemon.indexOf("\nasync function scanLiveMirror()", start);
+  const end = daemon.indexOf("\nfunction liveMirrorBackoffFor(", start);
   assert.ok(start >= 0 && end > start, "live user-mirror flow must remain inspectable");
   const flow = daemon.slice(start, end);
 
