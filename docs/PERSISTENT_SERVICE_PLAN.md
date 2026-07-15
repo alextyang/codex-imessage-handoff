@@ -249,9 +249,14 @@ item into the live sender transcript. Readiness requires both the static
 `send.rich`, or only the new method from an updated CLI with a stale injected
 helper, is insufficient: the service fails closed rather than use the
 registry-level background dispatch, which can persist and deliver a reply
-without refreshing the open sender transcript. The direct path carries all
-associated GUID/type/range and thread identifier/originator metadata on the
-new message object. It never mutates the chat's shared
+without refreshing the open sender transcript. The direct path must construct
+an ordinary `IMMessageItem`, not an `IMAssociatedMessageItem`: associated
+GUID/type/range stay absent (`nil`/`0`/empty), while the derived thread
+identifier and exact parent message/backing item carry native Reply context.
+Type `100` associated rows can be delivered and stored while remaining hidden
+from the sender's Reply transcript, so the running capability probe constructs
+a real ordinary parent/child pair and reads back both wrapper and backing-item
+thread metadata. The path never mutates the chat's shared
 inline-reply controller or current-thread map. A reply fails before dispatch
 unless the selected GUID, derived thread identifier, parent message, and
 parent item are all available and the stamped metadata reads back exactly.

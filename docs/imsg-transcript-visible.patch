@@ -1,6 +1,5 @@
-/Users/alexyang/.zshenv:.:1: no such file or directory: /Users/alexyang/.cargo/env
 diff --git a/Sources/IMsgHelper/IMsgInjected.m b/Sources/IMsgHelper/IMsgInjected.m
-index 1a0e82f..4581815 100644
+index 1a0e82f..0cc2e92 100644
 --- a/Sources/IMsgHelper/IMsgInjected.m
 +++ b/Sources/IMsgHelper/IMsgInjected.m
 @@ -308,6 +308,7 @@ static BOOL ensureSecureDirectory(NSString *path, NSError **error) {
@@ -19,7 +18,19 @@ index 1a0e82f..4581815 100644
  - (void)_updateText:(NSAttributedString *)attributedText;
  - (void)setThreadIdentifier:(NSString *)threadIdentifier;
  - (void)setThreadOriginator:(id)originator;
-@@ -1098,6 +1100,11 @@ static void releaseClientMessageGuid(NSString *guid) {
+@@ -449,9 +451,10 @@ - (id)initWithSender:(id)sender
+ - (void)setExpressiveSendStyleID:(NSString *)styleID;
+ - (void)setSubject:(NSString *)subject;
+ - (void)setMessageSubject:(NSAttributedString *)subject;
++- (NSString *)threadIdentifier;
++- (id)threadOriginator;
+ - (void)setThreadIdentifier:(NSString *)threadIdentifier;
+ - (void)setThreadOriginator:(id)originator;
+-- (void)setReplyToGUID:(NSString *)guid;
+ - (void)setBalloonBundleID:(NSString *)bundleID;
+ - (void)setPayloadData:(NSData *)data;
+ - (void)setAssociatedMessageGUID:(NSString *)guid;
+@@ -1098,6 +1101,11 @@ static void releaseClientMessageGuid(NSString *guid) {
                  && stickerAssociatedMessage),
          @"urlPreviewMessage": @(urlPreviewMessageInitializerAvailable()),
          @"sendRichLinkAction": @YES,
@@ -31,7 +42,7 @@ index 1a0e82f..4581815 100644
          @"clientMessageGuid": @(gHasClientMessageGUIDReplyConstructor),
          @"customEmojiReaction": @(gHasCustomEmojiReaction),
          @"pollUpdateMessage": @(pollVoteMessageInitializerAvailable()),
-@@ -2013,6 +2020,31 @@ static void dispatchIMMessageInChat(IMChat *chat,
+@@ -2013,6 +2021,31 @@ static void dispatchIMMessageInChat(IMChat *chat,
      scheduleThreadContextClear(chat, threadIdentifier);
  }
 
@@ -63,7 +74,7 @@ index 1a0e82f..4581815 100644
  static unsigned long long flagsForMessagePayload(NSAttributedString *subject,
                                                   NSArray *fileTransferGuids,
                                                   BOOL isAudioMessage);
-@@ -3176,6 +3208,134 @@ static id buildIMMessage(NSAttributedString *body,
+@@ -3176,6 +3209,183 @@ static id buildIMMessage(NSAttributedString *body,
      return nil;
  }
 
@@ -79,9 +90,10 @@ index 1a0e82f..4581815 100644
 +        || !parentMessage || !parentItem) {
 +        return NO;
 +    }
++    (void)associatedRange;
 +    if (![message respondsToSelector:@selector(associatedMessageGUID)]
 +        || ![message respondsToSelector:@selector(associatedMessageType)]
-+        || ![message respondsToSelector:@selector(associatedMessageRange)]
++        || ![message respondsToSelector:@selector(_imMessageItem)]
 +        || ![message respondsToSelector:@selector(threadIdentifier)]
 +        || ![message respondsToSelector:@selector(threadOriginator)]) {
 +        return NO;
@@ -90,17 +102,45 @@ index 1a0e82f..4581815 100644
 +        NSString *messageAssociatedGuid =
 +            [message performSelector:@selector(associatedMessageGUID)];
 +        long long messageAssociatedType = [(IMMessage *)message associatedMessageType];
-+        NSRange messageAssociatedRange = [(IMMessage *)message associatedMessageRange];
 +        NSString *messageThreadIdentifier =
 +            [message performSelector:@selector(threadIdentifier)];
 +        id messageThreadOriginator =
 +            [message performSelector:@selector(threadOriginator)];
++        id messageItem = [message performSelector:@selector(_imMessageItem)];
++        if (!messageItem
++            || ![messageItem respondsToSelector:@selector(threadIdentifier)]
++            || ![messageItem respondsToSelector:@selector(threadOriginator)]) {
++            return NO;
++        }
++        NSString *itemThreadIdentifier =
++            [messageItem performSelector:@selector(threadIdentifier)];
++        id itemThreadOriginator =
++            [messageItem performSelector:@selector(threadOriginator)];
++        NSString *itemOriginatorGuid =
++            [itemThreadOriginator respondsToSelector:@selector(guid)]
++                ? [itemThreadOriginator performSelector:@selector(guid)]
++                : nil;
++        NSString *parentItemGuid = [parentItem respondsToSelector:@selector(guid)]
++            ? [parentItem performSelector:@selector(guid)]
++            : nil;
 +
-+        return [messageAssociatedGuid isEqualToString:selectedMessageGuid]
-+            && messageAssociatedType == 100
-+            && NSEqualRanges(messageAssociatedRange, associatedRange)
-+            && [messageThreadIdentifier isEqualToString:threadIdentifier]
-+            && messageThreadOriginator == parentMessage;
++        BOOL associatedGuidClear = messageAssociatedGuid.length == 0;
++        BOOL associatedTypeClear = messageAssociatedType == 0;
++        BOOL messageThreadMatches =
++            [messageThreadIdentifier isEqualToString:threadIdentifier];
++        BOOL messageOriginatorMatches = messageThreadOriginator == parentMessage;
++        BOOL itemThreadMatches =
++            [itemThreadIdentifier isEqualToString:threadIdentifier];
++        BOOL itemOriginatorMatches = itemThreadOriginator == parentItem
++            || (itemOriginatorGuid.length > 0
++                && ([itemOriginatorGuid isEqualToString:selectedMessageGuid]
++                    || [itemOriginatorGuid isEqualToString:parentItemGuid]));
++        return associatedGuidClear
++            && associatedTypeClear
++            && messageThreadMatches
++            && messageOriginatorMatches
++            && itemThreadMatches
++            && itemOriginatorMatches;
 +    } @catch (__unused NSException *exception) {
 +        return NO;
 +    }
@@ -152,6 +192,8 @@ index 1a0e82f..4581815 100644
 +                || ![messageClass instancesRespondToSelector:@selector(_imMessageItem)]
 +                || !itemClass
 +                || ![itemClass instancesRespondToSelector:@selector(_newChatItems)]
++                || ![itemClass instancesRespondToSelector:@selector(threadIdentifier)]
++                || ![itemClass instancesRespondToSelector:@selector(threadOriginator)]
 +                || !imCreateThreadIdentifierFn()) {
 +                return NO;
 +            }
@@ -160,18 +202,38 @@ index 1a0e82f..4581815 100644
 +                @"p:0/00000000-0000-4000-8000-000000000002";
 +            NSString *threadIdentifier =
 +                @"p:0/00000000-0000-4000-8000-000000000003";
++            NSAttributedString *parentBody = [[NSAttributedString alloc]
++                initWithString:@"imsg transcript-visible parent probe"];
++            NSRange parentRange = NSMakeRange(0, parentBody.length);
++            id parentMessage = buildIMMessage(parentBody,
++                                              nil,
++                                              nil,
++                                              nil,
++                                              nil,
++                                              nil,
++                                              0,
++                                              parentRange,
++                                              nil,
++                                              @[],
++                                              NO,
++                                              NO,
++                                              selectedMessageGuid);
++            id parentItem = [parentMessage respondsToSelector:@selector(_imMessageItem)]
++                ? [parentMessage performSelector:@selector(_imMessageItem)]
++                : nil;
++            if (!parentMessage || !parentItem) {
++                return NO;
++            }
 +            NSAttributedString *body = [[NSAttributedString alloc]
 +                initWithString:@"imsg transcript-visible capability probe"];
 +            NSRange associatedRange = NSMakeRange(0, body.length);
-+            id parentMessage = [NSObject new];
-+            id parentItem = [NSObject new];
 +            id message = buildIMMessage(body,
 +                                        nil,
 +                                        nil,
 +                                        threadIdentifier,
 +                                        parentItem,
-+                                        selectedMessageGuid,
-+                                        100,
++                                        nil,
++                                        0,
 +                                        associatedRange,
 +                                        nil,
 +                                        @[],
@@ -181,9 +243,7 @@ index 1a0e82f..4581815 100644
 +            if (!message || ![message respondsToSelector:@selector(guid)]) {
 +                return NO;
 +            }
-+            NSString *guid = [message performSelector:@selector(guid)];
-+            return guid.length > 0
-+                && stampTranscriptVisibleReplyMetadata(message,
++            return stampTranscriptVisibleReplyMetadata(message,
 +                                                       selectedMessageGuid,
 +                                                       threadIdentifier,
 +                                                       parentMessage,
@@ -198,7 +258,7 @@ index 1a0e82f..4581815 100644
  /// Probe the exact constructor shape used by service mirrors: a reply
  /// association (type 100) plus a caller-owned GUID. This constructs an
  /// in-memory message only; it never resolves a chat or dispatches the object.
-@@ -3785,6 +3945,7 @@ static BOOL validateRichLinkPreviewImage(NSDictionary *image,
+@@ -3785,6 +3995,7 @@ static BOOL validateRichLinkPreviewImage(NSDictionary *image,
      id attributedBodyValue = params[@"attributedBody"];
      id textFormattingValue = params[@"textFormatting"];
      id clientMessageGuidValue = params[@"clientMessageGuid"];
@@ -206,7 +266,7 @@ index 1a0e82f..4581815 100644
      if (![chatGuidValue isKindOfClass:[NSString class]] ||
          (messageValue && ![messageValue isKindOfClass:[NSString class]]) ||
          (effectIdValue && ![effectIdValue isKindOfClass:[NSString class]]) ||
-@@ -3796,7 +3957,8 @@ static BOOL validateRichLinkPreviewImage(NSDictionary *image,
+@@ -3796,7 +4007,8 @@ static BOOL validateRichLinkPreviewImage(NSDictionary *image,
          (ddScanValue && ![ddScanValue isKindOfClass:[NSNumber class]]) ||
          (attributedBodyValue && ![attributedBodyValue isKindOfClass:[NSString class]]) ||
          (textFormattingValue && ![textFormattingValue isKindOfClass:[NSArray class]]) ||
@@ -216,7 +276,7 @@ index 1a0e82f..4581815 100644
          return errorResponse(requestId, @"Invalid send-message parameter types");
      }
 
-@@ -3813,8 +3975,13 @@ static BOOL validateRichLinkPreviewImage(NSDictionary *image,
+@@ -3813,8 +4025,13 @@ static BOOL validateRichLinkPreviewImage(NSDictionary *image,
      NSString *attributedBodyB64 = attributedBodyValue;
      NSArray *textFormatting = textFormattingValue;
      NSString *clientMessageGuid = canonicalClientMessageGuid(clientMessageGuidValue);
@@ -230,7 +290,17 @@ index 1a0e82f..4581815 100644
      if (clientMessageGuidValue && !clientMessageGuid) {
          return errorResponse(requestId, @"Invalid clientMessageGuid");
      }
-@@ -3866,7 +4033,12 @@ static BOOL validateRichLinkPreviewImage(NSDictionary *image,
+@@ -3851,7 +4068,8 @@ static BOOL validateRichLinkPreviewImage(NSDictionary *image,
+         : nil;
+
+     NSRange zeroRange = NSMakeRange(0, body.length);
+-    long long associatedType = selectedMessageGuid.length ? 100 : 0;
++    NSRange replyAssociationRange = transcriptVisible ? NSMakeRange(0, 0) : zeroRange;
++    long long associatedType = selectedMessageGuid.length && !transcriptVisible ? 100 : 0;
+
+     // Reply targets need a derived thread identifier on macOS 26 to render
+     // as a threaded in-line reply rather than a standalone message.
+@@ -3866,7 +4084,12 @@ static BOOL validateRichLinkPreviewImage(NSDictionary *image,
                                                    &parentItem);
          debugLog(@"handleSendMessage: reply=%d thread=%d",
                   selectedMessageGuid.length > 0, threadIdentifier.length > 0);
@@ -244,7 +314,19 @@ index 1a0e82f..4581815 100644
          clearThreadContextForChat(chat, nil);
      }
 
-@@ -4004,18 +4176,32 @@ static BOOL validateRichLinkPreviewImage(NSDictionary *image,
+@@ -3967,9 +4190,9 @@ static BOOL validateRichLinkPreviewImage(NSDictionary *image,
+                                        effectId,
+                                        threadIdentifier,
+                                        parentItem,
+-                                       selectedMessageGuid,
++                                       transcriptVisible ? nil : selectedMessageGuid,
+                                        associatedType,
+-                                       zeroRange,
++                                       replyAssociationRange,
+                                        /*summaryInfo*/ nil,
+                                        /*fileTransferGuids*/ @[],
+                                        /*isAudio*/ NO,
+@@ -4004,18 +4227,32 @@ static BOOL validateRichLinkPreviewImage(NSDictionary *image,
              richLinkImageUsed = YES;
          }
 
@@ -266,7 +348,7 @@ index 1a0e82f..4581815 100644
 +                                                     threadIdentifier,
 +                                                     parentMessage,
 +                                                     parentItem,
-+                                                     zeroRange)) {
++                                                     replyAssociationRange)) {
 +                removeRichLinkPreviewSnapshot(richLinkSnapshotPath);
 +                richLinkSnapshotPath = nil;
 +                return errorResponse(requestId,
@@ -289,7 +371,7 @@ index 1a0e82f..4581815 100644
          }
 
          if (gHasSendMessageReason && ddScan) {
-@@ -4034,14 +4220,36 @@ static BOOL validateRichLinkPreviewImage(NSDictionary *image,
+@@ -4034,14 +4271,36 @@ static BOOL validateRichLinkPreviewImage(NSDictionary *image,
                  [inv setArgument:&reason atIndex:3];
                  [inv invoke];
              });
@@ -445,10 +527,24 @@ index 61ce091..f0d07d2 100644
          try await handleSendRichWithClientGUID(params: params, id: id)
        case "send.attachment":
 diff --git a/Tests/imsgTests/BridgeCommandRegistrationTests.swift b/Tests/imsgTests/BridgeCommandRegistrationTests.swift
-index 0cd5c60..1a0f9f2 100644
+index 0cd5c60..76913ba 100644
 --- a/Tests/imsgTests/BridgeCommandRegistrationTests.swift
 +++ b/Tests/imsgTests/BridgeCommandRegistrationTests.swift
-@@ -523,6 +523,96 @@ func injectedHelperWiresNativePollSend() throws {
+@@ -399,7 +399,12 @@ func bridgeReplySendsKeepAssociatedMessageFallback() throws {
+   let helper = repoRoot.appendingPathComponent("Sources/IMsgHelper/IMsgInjected.m")
+   let source = stripObjectiveCComments(try String(contentsOf: helper, encoding: .utf8))
+
+-  for function in ["handleSendMessage", "handleSendMultipart", "handleSendAttachment"] {
++  let sendBody = try #require(functionBody(named: "handleSendMessage", in: source))
++  #expect(sendBody.contains("selectedMessageGuid.length && !transcriptVisible ? 100 : 0"))
++  #expect(sendBody.contains("selectedMessageGuid"))
++  #expect(sendBody.contains("associatedType"))
++
++  for function in ["handleSendMultipart", "handleSendAttachment"] {
+     let body = try #require(functionBody(named: function, in: source))
+     #expect(body.contains("selectedMessageGuid.length ? 100 : 0"))
+     #expect(body.contains("selectedMessageGuid"))
+@@ -523,6 +528,100 @@ func injectedHelperWiresNativePollSend() throws {
    #expect(source.contains(modernMessageInitializer))
  }
 
@@ -503,9 +599,13 @@ index 0cd5c60..1a0f9f2 100644
 +  }
 +  #expect(capabilityBody.contains("instancesRespondToSelector:@selector(sendMessage:)"))
 +  #expect(capabilityBody.contains("stampTranscriptVisibleReplyMetadata"))
++  #expect(sendBody.contains("selectedMessageGuid.length && !transcriptVisible ? 100 : 0"))
++  #expect(sendBody.contains("transcriptVisible ? nil : selectedMessageGuid"))
++  #expect(sendBody.contains("transcriptVisible ? NSMakeRange(0, 0) : zeroRange"))
 +  #expect(metadataBody.contains("associatedMessageGUID"))
 +  #expect(metadataBody.contains("associatedMessageType"))
-+  #expect(metadataBody.contains("associatedMessageRange"))
++  #expect(metadataBody.contains("messageAssociatedGuid.length == 0"))
++  #expect(metadataBody.contains("messageAssociatedType == 0"))
 +  #expect(metadataBody.contains("threadIdentifier"))
 +  #expect(metadataBody.contains("threadOriginator"))
 +}

@@ -50,8 +50,11 @@ arguments. New mirrors use the distinct synchronous
 and the sending `IMChat` inserts the outgoing bubble into the normal profile's
 live transcript. The service fails closed when that capability is absent; it
 never silently falls back to the background-oriented standard rich-send path.
-Reply messages are fully stamped on their message object before direct
-dispatch. This path never changes Messages' mutable per-chat
+Each mirror is constructed as an ordinary message, with associated-message
+GUID/type/range deliberately absent (`nil`/`0`/empty). Native Reply context is
+carried by the derived thread identifier plus the exact parent message and
+backing item, and those fields are read back before direct dispatch. This path
+never changes Messages' mutable per-chat
 inline-reply controller or thread map, so concurrent sends cannot steal or
 clear another conversation's reply context. A reply whose selected GUID,
 derived thread identifier, parent message, or parent item is missing is not

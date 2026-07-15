@@ -215,17 +215,21 @@ test("a delayed periodic probe is asynchronous and never overlaps another sample
   let maximumActive = 0;
   let calls = 0;
   let eventLoopResponsive = false;
+  const releases = [];
   const run = async (_binary, args, { signal } = {}) => {
     calls += 1;
     active += 1;
     maximumActive = Math.max(maximumActive, active);
     try {
       await new Promise((resolve, reject) => {
-        const timer = setTimeout(resolve, 15);
-        signal?.addEventListener("abort", () => {
-          clearTimeout(timer);
+        const onAbort = () => {
           reject(Object.assign(new Error("aborted"), { name: "AbortError" }));
-        }, { once: true });
+        };
+        signal?.addEventListener("abort", onAbort, { once: true });
+        releases.push(() => {
+          signal?.removeEventListener("abort", onAbort);
+          resolve();
+        });
       });
       if (args[0] === "status") return `${JSON.stringify(readyStatus)}\n`;
       if (calls >= 4) abort.abort();
@@ -239,9 +243,20 @@ test("a delayed periodic probe is asynchronous and never overlaps another sample
     pendingFatalServer(),
     { run, wait: async () => {}, signal: abort.signal },
   );
-  setImmediate(() => { eventLoopResponsive = true; });
-  await new Promise((resolve) => setTimeout(resolve, 5));
+  while (calls < 1 || releases.length < 1) await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setImmediate(() => {
+    eventLoopResponsive = true;
+    resolve();
+  }));
   assert.equal(eventLoopResponsive, true, "the helper event loop must remain responsive during a probe");
+  for (let expected = 1; expected <= 4; expected += 1) {
+    const release = releases.shift();
+    assert.equal(typeof release, "function");
+    release();
+    while (expected < 4 && (calls < expected + 1 || releases.length < 1)) {
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+  }
   await monitor;
   assert.equal(calls, 4);
   assert.equal(maximumActive, 1);
