@@ -48,15 +48,15 @@ service conversation. The body travels over the child's stdin, never process
 arguments. The shared message GUID and exact native Reply root suppress the
 dedicated-account echo without adding hidden Unicode to the message body. A
 send is accepted only after the normal profile observes that exact GUID with
-the expected native `thread_originator_guid`. While the bridge returns the
-GUID, the receiver defers an exact-root, visible-body-hash candidate created
-inside that send's timestamp window until the complete bounded mutation window
-ends. Body/root correlation alone never
-creates a receipt or consumes the reservation; an unresolved row is
-quarantined while the guard remains active for any later echo. Ambiguous writes
-are reconciled without resending; after 15 minutes, a content-free task notice
-unblocks later output while the late-echo quarantine remains active. This
-sender cannot select recipients, send files or URLs, watch Messages,
+the expected native `thread_originator_guid`. The returned GUID is registered
+before the slower local-history proof so the receiver can suppress its exact
+echo immediately. If the incoming bubble wins that race, an exact-root,
+visible-body-hash candidate waits for at most one second by default, with a
+hard two-second cap. Body/root correlation never creates a receipt, consumes a
+reservation, or discards a message; without exact GUID/root confirmation the
+bubble proceeds as genuine user input. Ambiguous writes are reconciled without
+resending; after 15 minutes, a content-free task notice unblocks later output.
+This sender cannot select recipients, send files or URLs, watch Messages,
 launch/relaunch Messages, or control any Codex process.
 
 Codex window focus and the task currently open in the Codex sidebar are never

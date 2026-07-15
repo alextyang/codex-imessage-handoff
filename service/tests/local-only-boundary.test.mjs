@@ -86,3 +86,14 @@ test("the daemon bounds concurrent Remote Control work without reporting missing
   assert.match(daemon, /Queued behind earlier iMessage work\. Codex will start this message automatically\./);
   assert.doesNotMatch(daemon, /(?:no|free) (?:run )?slots?|run slot is free/i);
 });
+
+test("the daemon releases per-run Remote Control clients on every execute path", () => {
+  const daemon = readFileSync(path.join(repo, "service/src/daemon.mjs"), "utf8");
+  const start = daemon.indexOf("async function executeReply(event, context)");
+  const end = daemon.indexOf("\nconst runs = new RunManager", start);
+  assert.ok(start >= 0 && end > start, "executeReply must remain inspectable");
+  const executeReply = daemon.slice(start, end);
+
+  assert.match(executeReply, /finally\s*\{\s*try\s*\{\s*runner\?\.close\(\)/,
+    "an early failure after runner creation must still release its logical client");
+});

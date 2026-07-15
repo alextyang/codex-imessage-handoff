@@ -1337,6 +1337,79 @@ test("a runtime-owned injected client closes and releases tracking after each ru
   assert.equal(released, 1);
 });
 
+test("an idle owned runner can be released explicitly and only once", () => {
+  let closeCount = 0;
+  let released = 0;
+  const client = {
+    isRunning: () => false,
+    close() { closeCount += 1; },
+  };
+  const runner = new AppServerCodexRunner({
+    client,
+    ownsClient: true,
+    onClientClose(closedClient) {
+      assert.equal(closedClient, client);
+      released += 1;
+    },
+  });
+
+  assert.equal(runner.close(), true);
+  assert.equal(runner.close(), false);
+  assert.equal(closeCount, 1);
+  assert.equal(released, 1);
+});
+
+test("explicit release refuses to interrupt a client that reports active work", () => {
+  let closeCount = 0;
+  const runner = new AppServerCodexRunner({
+    client: {
+      isRunning: () => true,
+      close() { closeCount += 1; },
+    },
+    ownsClient: true,
+  });
+
+  assert.equal(runner.close(), false);
+  assert.equal(closeCount, 0);
+});
+
+test("explicit release waits for an active owned turn instead of interrupting it", async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "imessage-app-server-deferred-close-"));
+  let resolveTurn;
+  let running = false;
+  let closeCount = 0;
+  let released = 0;
+  const client = {
+    isRunning: () => running,
+    async runTurn() {
+      running = true;
+      try {
+        return await new Promise((resolve) => { resolveTurn = resolve; });
+      } finally {
+        running = false;
+      }
+    },
+    close() { closeCount += 1; },
+  };
+  const runner = new AppServerCodexRunner({
+    client,
+    ownsClient: true,
+    onClientClose() { released += 1; },
+  });
+
+  const run = runner.run({ thread: { id: "thread-1", cwd: directory }, prompt: "Keep working." });
+  await Promise.resolve();
+  assert.equal(runner.isRunning(), true);
+  assert.equal(runner.close(), false, "release is deferred while the turn is active");
+  assert.equal(closeCount, 0, "the logical stream must remain open for the active turn");
+
+  resolveTurn({ status: "completed", body: "Done.", generatedImages: [] });
+  assert.deepEqual(await run, { status: "completed", body: "Done.", generatedImages: [] });
+  assert.equal(closeCount, 1);
+  assert.equal(released, 1);
+  assert.equal(runner.close(), false, "the deferred release remains idempotent");
+});
+
 test("runner bounds Remote Control initialization waits", async (t) => {
   const directory = mkdtempSync(path.join(os.tmpdir(), "imessage-app-server-timeout-"));
   const { runner } = testRunner(directory, "timeout", { requestTimeoutMs: 40 });

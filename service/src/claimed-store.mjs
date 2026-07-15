@@ -4,7 +4,26 @@ import { writePrivateJson } from "./config.mjs";
 import { servicePaths } from "./paths.mjs";
 
 function emptyStore() {
-  return { version: 2, jobs: Object.create(null) };
+  return { version: 3, nextAdmissionOrder: 1, jobs: Object.create(null) };
+}
+
+function validAdmissionOrder(value) {
+  const order = Number(value);
+  return Number.isSafeInteger(order) && order > 0 ? order : null;
+}
+
+function upgradeLegacyStore(value) {
+  let admissionOrder = 1;
+  const jobs = Object.create(null);
+  // Object property order is the durable insertion order used by the v1/v2
+  // store. Materialize it once so equal Messages timestamps remain ordered
+  // after every subsequent restart.
+  for (const [id, job] of Object.entries(value.jobs)) {
+    jobs[id] = job && typeof job === "object"
+      ? { ...job, admissionOrder: admissionOrder++ }
+      : job;
+  }
+  return { version: 3, nextAdmissionOrder: admissionOrder, jobs };
 }
 
 function readStore() {
@@ -18,17 +37,30 @@ function readStore() {
   }
   if (
     !value
-    || ![1, 2].includes(value.version)
+    || ![1, 2, 3].includes(value.version)
     || !value.jobs
     || typeof value.jobs !== "object"
     || Array.isArray(value.jobs)
   ) {
     throw Object.assign(new Error("Claimed-run state has an unsupported format."), { code: "INVALID_RUN_STATE" });
   }
-  // Version 1 used the same job representation. Normalize it in memory so
-  // read-only commands remain side-effect free; the next intentional state
-  // update writes the current format atomically through writeStore().
-  return value.version === 1 ? { version: 2, jobs: value.jobs } : value;
+  // Older versions relied on timestamps (and, accidentally, object order) for
+  // FIFO decisions. Normalize that insertion order in memory so read-only
+  // commands remain side-effect free; the next intentional update persists it.
+  if (value.version < 3) return upgradeLegacyStore(value);
+  const orders = Object.values(value.jobs).map((job) => validAdmissionOrder(job?.admissionOrder));
+  const uniqueOrders = new Set(orders.filter(Boolean));
+  const nextAdmissionOrder = validAdmissionOrder(value.nextAdmissionOrder);
+  const maximumOrder = orders.length ? Math.max(0, ...orders.filter(Boolean)) : 0;
+  if (
+    orders.some((order) => order === null)
+    || uniqueOrders.size !== orders.length
+    || !nextAdmissionOrder
+    || nextAdmissionOrder <= maximumOrder
+  ) {
+    throw Object.assign(new Error("Claimed-run state has an invalid admission order."), { code: "INVALID_RUN_STATE" });
+  }
+  return value;
 }
 
 function writeStore(store) {
@@ -113,6 +145,7 @@ export function saveClaimedJob(event, state = "queued") {
   );
   const queuedAt = event.queuedAt || existing?.queuedAt || new Date().toISOString();
   const receivedAtMs = Number(event.receivedAtMs) || Number(existing?.receivedAtMs) || Date.now();
+  const admissionOrder = validAdmissionOrder(existing?.admissionOrder) || store.nextAdmissionOrder++;
   const predecessorClientUserMessageIds = [...new Set([
     ...validPredecessorIds(existing?.predecessorClientUserMessageIds),
     ...validPredecessorIds(event.predecessorClientUserMessageIds),
@@ -120,18 +153,14 @@ export function saveClaimedJob(event, state = "queued") {
       if (otherId === id || String(other?.threadId || "") !== String(event.threadId)
         || !["queued", "running", "delivering"].includes(other?.state)
         || !validClientUserMessageId(other?.clientUserMessageId)) return [];
-      const otherReceivedAtMs = Number(other.receivedAtMs) || 0;
-      const otherQueuedAt = String(other.queuedAt || "");
-      const isEarlier = otherReceivedAtMs && receivedAtMs
-        ? otherReceivedAtMs < receivedAtMs
-        : otherQueuedAt && otherQueuedAt.localeCompare(String(queuedAt)) <= 0;
-      return isEarlier ? [other.clientUserMessageId] : [];
+      return validAdmissionOrder(other.admissionOrder) < admissionOrder ? [other.clientUserMessageId] : [];
     }),
   ])].filter((value) => value !== clientUserMessageId).slice(-32);
   const threadCheckpoint = normalizedThreadCheckpoint(event.threadCheckpoint)
     || normalizedThreadCheckpoint(existing?.threadCheckpoint);
   event.clientUserMessageId = clientUserMessageId;
   event.legacyClientUserMessageId = legacyClientUserMessageId;
+  event.admissionOrder = admissionOrder;
   event.predecessorClientUserMessageIds = predecessorClientUserMessageIds;
   if (threadCheckpoint) event.threadCheckpoint = threadCheckpoint;
   store.jobs[id] = {
@@ -140,6 +169,7 @@ export function saveClaimedJob(event, state = "queued") {
     clientUserMessageId,
     legacyClientUserMessageId,
     predecessorClientUserMessageIds,
+    admissionOrder,
     threadCheckpoint,
     queuedAt,
     receivedAtMs,
@@ -210,5 +240,5 @@ export function removeClaimedJobs(ids) {
 export function loadClaimedJobs() {
   return Object.values(readStore().jobs)
     .filter((job) => job && typeof job === "object" && job.threadId && job.replyId && job.claimed?.reply)
-    .sort((left, right) => String(left.queuedAt).localeCompare(String(right.queuedAt)));
+    .sort((left, right) => left.admissionOrder - right.admissionOrder);
 }

@@ -180,6 +180,39 @@ test("a runner-owned client is removed from runtime shutdown tracking after it c
   assert.equal(fx.calls.terminate, 1);
 });
 
+test("releasing one runner leaves the shared physical relay available to later runners", () => {
+  let terminateCount = 0;
+  let logicalStreams = 0;
+  const runtime = new RemoteControlCodexRuntime({
+    codexHome: "/Users/test/.codex",
+    controllerFactory: () => ({
+      websocketUrl: "wss://chatgpt.com/backend-api/codex/remote/control/client",
+      refreshSession: async () => ({}),
+      authorizeDeviceChallenge: async () => ({}),
+    }),
+    connectionFactory: () => ({
+      createStream() {
+        logicalStreams += 1;
+        return { readyState: 3, close() {} };
+      },
+      terminate() { terminateCount += 1; },
+    }),
+  });
+
+  const first = runtime.createRunner();
+  assert.equal(first.close(), true);
+  assert.equal(terminateCount, 0, "runner release must not terminate the physical relay");
+
+  const second = runtime.createRunner();
+  assert.notEqual(second.client, first.client);
+  assert.equal(second.close(), true);
+  assert.equal(terminateCount, 0);
+  assert.equal(logicalStreams, 0, "logical streams remain lazy until a client connects");
+
+  runtime.close();
+  assert.equal(terminateCount, 1);
+});
+
 test("runtime source has no local process or socket attachment implementation", () => {
   const source = readFileSync(new URL("../src/remote-control-runner.mjs", import.meta.url), "utf8");
   assert.doesNotMatch(source, /node:child_process|\bspawn(?:Sync)?\s*\(|execFile|\.kill\s*\(/);

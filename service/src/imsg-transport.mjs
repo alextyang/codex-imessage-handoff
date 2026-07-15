@@ -3,7 +3,6 @@ import { createHash } from "node:crypto";
 import { REQUIRED_PINNED_IMSG_CAPABILITIES } from "./imsg-client.mjs";
 import { createImsgIpcClientFromConfig } from "./imsg-ipc-client.mjs";
 import { safeImsgFailureDetails } from "./imsg-rpc-diagnostics.mjs";
-import { IMSG_LOCAL_MIRROR_CORRELATION_TIMEOUT_MS } from "./imsg-timeouts.mjs";
 import { LocalConversationRouter } from "./local-conversation-router.mjs";
 import { renderRichOutboundIntents, richTextIntent } from "../../protocol/rich-presentation.ts";
 import {
@@ -34,12 +33,13 @@ const POLL_OPTION_IDENTIFIER = "00000000-0000-0000-0000-000000000000";
 // formatting and JSON framing never turn a valid transcript into a retry loop.
 const MAX_TEXT_BUBBLE_BYTES = 96 * 1024;
 const MULTIPART_PREFIX_RESERVE_BYTES = 32;
-// A marker-normalized echo cannot be distinguished from an identical genuine
-// reply until the normal-profile send returns its GUID. Keep the ordered
-// inbound cursor behind that candidate for the complete mutation window; the
-// common case resolves as soon as the GUID arrives, while a hung send remains
-// fail-closed instead of becoming a duplicate Codex prompt.
-const DEFAULT_PROVISIONAL_MIRROR_HOLD_MS = IMSG_LOCAL_MIRROR_CORRELATION_TIMEOUT_MS;
+// Give the normal-profile sender a brief chance to register the exact GUID if
+// the dedicated account observes the bubble first. Body + Reply root never
+// become suppression evidence: after this small race window the message flows
+// as genuine input. Keep this hard cap local so a configuration regression can
+// never restore the former five-minute head-of-line watch stall.
+const MAX_PROVISIONAL_MIRROR_HOLD_MS = 2_000;
+const DEFAULT_PROVISIONAL_MIRROR_HOLD_MS = 1_000;
 const DEFAULT_PROVISIONAL_MIRROR_POLL_MS = 100;
 
 function delay(milliseconds) {
@@ -474,7 +474,10 @@ export class ImsgTransport {
     this.readObservation = null;
     this.sendQueue = Promise.resolve();
     this.inboundQueue = Promise.resolve();
-    this.provisionalMirrorHoldMs = Math.max(0, Number(provisionalMirrorHoldMs) || 0);
+    this.provisionalMirrorHoldMs = Math.min(
+      MAX_PROVISIONAL_MIRROR_HOLD_MS,
+      Math.max(0, Number(provisionalMirrorHoldMs) || 0),
+    );
     this.provisionalMirrorPollMs = Math.max(1, Number(provisionalMirrorPollMs) || DEFAULT_PROVISIONAL_MIRROR_POLL_MS);
     this.watchCallbacks = null;
     this.watchSubscribePromise = null;
@@ -730,17 +733,11 @@ export class ImsgTransport {
         provisional = this.router.provisionalUserMirrorEcho(message);
       }
       if (provisional) {
-        // The complete sender window elapsed without authoritative GUID
-        // evidence. Quarantine this one candidate but retain the reservation:
-        // a second same-body/root bubble may be the actual mirror, so consuming
-        // the guard here could execute it as a duplicate Codex prompt.
-        const quarantined = this.router.quarantineProvisionalUserMirrorEcho(message);
-        if (quarantined) {
-          this.observeInbound().catch(() => {});
-          return;
-        }
-        // Confirmation can race the final provisional check. Re-evaluate the
-        // authoritative GUID path once more before ordinary prompt ingestion.
+        // Visible text and a Reply root are not identity evidence. When the
+        // brief correlation window ends without an exact GUID, let
+        // the bubble proceed as genuine user input and retain the reservation
+        // for a later marker-bearing or exact-GUID echo. Never discard a user
+        // message solely because it happens to match a pending mirror body.
         userMirror = this.router.consumeUserMirrorEcho(message);
         if (userMirror) {
           this.observeInbound().catch(() => {});

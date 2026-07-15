@@ -236,6 +236,11 @@ test("helper mode constructs the authenticated IPC client from its private confi
   assert.equal(transport.mode, "helper");
 });
 
+test("provisional mirror holds are hard-capped below the bridge mutation timeout", () => {
+  const { transport } = fixture({ provisionalMirrorHoldMs: 300_000 });
+  assert.equal(transport.provisionalMirrorHoldMs, 2_000);
+});
+
 test("local, basic, and plain transport profiles are rejected", () => {
   const directory = mkdtempSync(path.join(os.tmpdir(), "imsg-transport-rejected-profile-"));
   const base = {
@@ -944,6 +949,39 @@ test("an early marker-normalized user mirror is held, suppressed on its exact na
   await transport.stop();
 });
 
+test("an early clean mirror is briefly held and suppressed when its exact GUID arrives", async () => {
+  const { transport, client } = fixture({ provisionalMirrorHoldMs: 20, provisionalMirrorPollMs: 1 });
+  const actions = [];
+  await transport.start({ onAction: (action) => actions.push(action) });
+  transport.router.routeOutboundGuid("clean-race-root", THREAD.id, { root: true });
+  const reservationId = "1".repeat(64);
+  transport.router.reserveUserMirrorEcho({
+    reservationId,
+    threadId: THREAD.id,
+    text: "Clean body racing its GUID",
+    rootGuid: "clean-race-root",
+  });
+
+  client.watchHandlers.onMessage({
+    id: 20_402,
+    guid: "clean-race-guid",
+    chat_id: 42,
+    chat_guid: "iMessage;-;+15550000000",
+    sender: "+15551111111",
+    is_from_me: false,
+    text: "Clean body racing its GUID",
+    thread_originator_guid: "clean-race-root",
+    created_at: "2026-07-12T12:00:03.000Z",
+  });
+  setTimeout(() => transport.router.confirmUserMirrorEcho(reservationId, "clean-race-guid"), 2);
+  await new Promise((resolve) => setTimeout(resolve, 30));
+
+  assert.deepEqual(actions, []);
+  assert.equal(transport.router.lastRowId, 20_402);
+  assert.equal(transport.router.userMirrorEchoReceipt(reservationId).guid, "clean-race-guid");
+  await transport.stop();
+});
+
 test("watch recovery routes an identical pre-reservation backlog row as genuine user input", async () => {
   const { transport, client } = fixture({ provisionalMirrorHoldMs: 5, provisionalMirrorPollMs: 1 });
   const actions = [];
@@ -976,8 +1014,8 @@ test("watch recovery routes an identical pre-reservation backlog row as genuine 
   await transport.stop();
 });
 
-test("an unresolved normalized candidate never consumes the guard for a later same-body mirror", async () => {
-  const { transport, client } = fixture({ provisionalMirrorHoldMs: 2, provisionalMirrorPollMs: 1 });
+test("an unconfirmed clean same-body reply and its follower route promptly without consuming the guard", async () => {
+  const { transport, client } = fixture({ provisionalMirrorHoldMs: 5, provisionalMirrorPollMs: 1 });
   const actions = [];
   await transport.start({ onAction: (action) => actions.push(action) });
   transport.router.routeOutboundGuid("slow-root", THREAD.id, { root: true });
@@ -985,13 +1023,13 @@ test("an unresolved normalized candidate never consumes the guard for a later sa
   transport.router.reserveUserMirrorEcho({
     reservationId,
     threadId: THREAD.id,
-    text: "Slow identical text\u{E0001}\u{E0061}\u{E007F}",
+    text: "Slow identical text",
     rootGuid: "slow-root",
   });
 
-  const candidate = (id, guid) => ({
-    id,
-    guid,
+  const candidate = {
+    id: 20_404,
+    guid: "genuine-same-body-guid",
     chat_id: 42,
     chat_guid: "iMessage;-;+15550000000",
     sender: "+15551111111",
@@ -999,15 +1037,34 @@ test("an unresolved normalized candidate never consumes the guard for a later sa
     text: "Slow identical text",
     thread_originator_guid: "slow-root",
     created_at: "2026-07-12T12:00:04.000Z",
-  });
-  client.watchHandlers.onMessage(candidate(20_404, "first-unresolved-guid"));
-  client.watchHandlers.onMessage(candidate(20_405, "later-actual-guid"));
-  await new Promise((resolve) => setTimeout(resolve, 20));
+  };
+  const follower = {
+    id: 20_405,
+    guid: "prompt-follower-guid",
+    chat_id: 42,
+    chat_guid: "iMessage;-;+15550000000",
+    sender: "+15551111111",
+    is_from_me: false,
+    text: "Follower stays live",
+    thread_originator_guid: "slow-root",
+    created_at: "2026-07-12T12:00:05.000Z",
+  };
+  const startedAt = Date.now();
+  client.watchHandlers.onMessage(candidate);
+  client.watchHandlers.onMessage(follower);
+  await new Promise((resolve) => setTimeout(resolve, 30));
 
-  assert.deepEqual(actions, []);
+  assert.deepEqual(actions.map((action) => action.messageKey), [
+    "genuine-same-body-guid",
+    "prompt-follower-guid",
+  ]);
+  assert.ok(Date.now() - startedAt < 200, "the follower must not wait on the mutation timeout");
   assert.equal(transport.router.userMirrorEchoReceipt(reservationId), null);
-  assert.equal(transport.router.provisionalUserMirrorEcho(candidate(20_406, "third-candidate-guid")).reservationId,
-    reservationId, "the fail-closed reservation must survive every body-only candidate");
+  assert.equal(transport.router.provisionalUserMirrorEcho({
+    ...candidate,
+    id: 20_406,
+    guid: "later-candidate-guid",
+  }).reservationId, reservationId, "the fail-closed reservation survives body-only input");
   assert.equal(transport.router.lastRowId, 20_405);
   await transport.stop();
 });
@@ -1056,9 +1113,12 @@ test("stop and restart during a provisional hold replays in order without losing
   client.watchHandlers.onMessage(follower);
   await new Promise((resolve) => setTimeout(resolve, 50));
 
-  assert.equal(actions.length, 1);
-  assert.equal(actions[0].messageKey, "restart-follower-guid");
-  assert.equal(actions[0].body, "Follower after restart");
+  assert.deepEqual(actions.map((action) => action.messageKey), [
+    "restart-candidate-guid",
+    "restart-follower-guid",
+  ]);
+  assert.equal(actions[0].body, "Restart collision");
+  assert.equal(actions[1].body, "Follower after restart");
   assert.equal(transport.router.lastRowId, 20_407);
   assert.equal(transport.router.userMirrorEchoReceipt(reservationId), null);
   assert.equal(transport.router.provisionalUserMirrorEcho({

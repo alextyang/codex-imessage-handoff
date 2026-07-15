@@ -1057,6 +1057,7 @@ async function executeReply(event, context) {
       try { await updateThreadStatus(thread, "error"); } catch {}
     }
   } finally {
+    try { runner?.close(); } catch { log(`Codex runner for ${thread.id} could not be released.`); }
     await imsgTransport.setThreadTyping(thread.id, false).catch(() => {});
     if (progressTimer) clearInterval(progressTimer);
     if (managedCompletion) completions.unmanage(thread.id);

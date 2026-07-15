@@ -770,10 +770,18 @@ export class LocalUserMirrorSender {
       this.#unavailable("SEND_UNSUPPORTED");
       return { classification: "unavailable", reservationId: key, attempted: false, fallbackSafe: true };
     }
+    const returnedGuid = messageGuid(result);
+    if (returnedGuid) {
+      // Register the bridge-created identity before the slower local-history
+      // proof. This closes the receiver race without accepting the delivery:
+      // exact GUID + exact Reply root can suppress the echo immediately, while
+      // the sender still remains fail-closed until reconciliation below.
+      entry.guid = returnedGuid;
+      this.#saveDelivery(key, entry);
+      this.router.confirmUserMirrorEcho(key, returnedGuid, { verified: false });
+    }
     if (result?.classification === "ambiguous") {
-      const candidateGuid = messageGuid(result);
-      if (candidateGuid) entry.guid = candidateGuid;
-      const recovered = await this.#reconcile(entry, candidateGuid);
+      const recovered = await this.#reconcile(entry, returnedGuid);
       if (!recovered) {
         return this.#unresolvedPart(key, entry);
       }

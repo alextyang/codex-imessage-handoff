@@ -75,7 +75,7 @@ test("claimed prompts survive restart state privately until completion", () => {
   }
 });
 
-test("later same-task claims retain durable predecessor client ids", () => {
+test("later same-task claims retain durable predecessor client ids when Messages timestamps tie", () => {
   const home = mkdtempSync(path.join(os.tmpdir(), "imessage-claimed-predecessors-"));
   const previous = process.env.IMESSAGE_HANDOFF_HOME;
   process.env.IMESSAGE_HANDOFF_HOME = home;
@@ -90,13 +90,15 @@ test("later same-task claims retain durable predecessor client ids", () => {
     const second = {
       threadId: "thread-fifo",
       replyId: "second",
-      queuedAt: "2026-07-12T00:00:01.000Z",
-      receivedAtMs: 200,
+      queuedAt: "2026-07-12T00:00:00.000Z",
+      receivedAtMs: 100,
       claimed: { reply: { body: "Second", media: [] }, images: [] },
     };
     saveClaimedJob(first, "running");
     saveClaimedJob(second, "queued");
     assert.deepEqual(second.predecessorClientUserMessageIds, [first.clientUserMessageId]);
+    assert.equal(first.admissionOrder, 1);
+    assert.equal(second.admissionOrder, 2);
 
     // Re-saving the earlier job after the later one exists must not reverse
     // the predecessor relationship.
@@ -104,6 +106,51 @@ test("later same-task claims retain durable predecessor client ids", () => {
     assert.deepEqual(loadClaimedJobs().find((job) => job.replyId === "first").predecessorClientUserMessageIds, []);
     assert.deepEqual(loadClaimedJobs().find((job) => job.replyId === "second").predecessorClientUserMessageIds,
       [first.clientUserMessageId]);
+  } finally {
+    if (previous === undefined) delete process.env.IMESSAGE_HANDOFF_HOME;
+    else process.env.IMESSAGE_HANDOFF_HOME = previous;
+  }
+});
+
+test("persisted admission order survives restart and orders later same-millisecond claims", () => {
+  const home = mkdtempSync(path.join(os.tmpdir(), "imessage-claimed-admission-order-"));
+  const previous = process.env.IMESSAGE_HANDOFF_HOME;
+  process.env.IMESSAGE_HANDOFF_HOME = home;
+  try {
+    const claim = (replyId) => ({
+      threadId: "thread-restart-fifo",
+      replyId,
+      queuedAt: "2026-07-12T00:00:00.000Z",
+      receivedAtMs: 100,
+      claimed: { reply: { body: replyId, media: [] }, images: [] },
+    });
+    const first = claim("first");
+    const second = claim("second");
+    saveClaimedJob(first, "running");
+    saveClaimedJob(second, "queued");
+
+    const persisted = JSON.parse(readFileSync(path.join(home, "run-state.json"), "utf8"));
+    assert.equal(persisted.version, 3);
+    assert.equal(persisted.jobs.first.admissionOrder, 1);
+    assert.equal(persisted.jobs.second.admissionOrder, 2);
+    assert.equal(persisted.nextAdmissionOrder, 3);
+
+    // Each public operation reloads the file, matching a new daemon process.
+    const restored = loadClaimedJobs();
+    assert.deepEqual(restored.map((job) => job.replyId), ["first", "second"]);
+    const third = claim("third");
+    saveClaimedJob(third, "queued");
+    assert.equal(third.admissionOrder, 3);
+    assert.deepEqual(third.predecessorClientUserMessageIds, [
+      first.clientUserMessageId,
+      second.clientUserMessageId,
+    ]);
+
+    // Re-saving an earlier claim cannot make it a successor of later work.
+    saveClaimedJob({ ...restored[0] }, "running");
+    const final = loadClaimedJobs();
+    assert.deepEqual(final.find((job) => job.replyId === "first").predecessorClientUserMessageIds, []);
+    assert.deepEqual(final.map((job) => job.admissionOrder), [1, 2, 3]);
   } finally {
     if (previous === undefined) delete process.env.IMESSAGE_HANDOFF_HOME;
     else process.env.IMESSAGE_HANDOFF_HOME = previous;
@@ -189,7 +236,9 @@ test("legacy version 1 state is read without mutation and upgrades on the next w
 
     assert.equal(markClaimedJobState("legacy", "running").state, "running");
     const upgraded = JSON.parse(readFileSync(file, "utf8"));
-    assert.equal(upgraded.version, 2);
+    assert.equal(upgraded.version, 3);
+    assert.equal(upgraded.jobs.legacy.admissionOrder, 1);
+    assert.equal(upgraded.nextAdmissionOrder, 2);
     assert.equal(upgraded.jobs.legacy.claimed.reply.body, "Legacy request");
     assert.equal(upgraded.jobs.legacy.state, "running");
   } finally {

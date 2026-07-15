@@ -1235,6 +1235,7 @@ export class AppServerCodexRunner {
     this.client = options.client || new AppServerRpcClient(options);
     this.ownsClient = options.ownsClient == null ? !options.client : Boolean(options.ownsClient);
     this.onClientClose = typeof options.onClientClose === "function" ? options.onClientClose : null;
+    this.activeOperations = 0;
   }
 
   isRunning() {
@@ -1246,16 +1247,12 @@ export class AppServerCodexRunner {
   }
 
   async cancelRecoveredTurn(threadId, turnId) {
-    try {
-      return await this.client.interruptTurn(threadId, turnId);
-    } finally {
-      this.#closeOwnedClient();
-    }
+    return this.#withClient(() => this.client.interruptTurn(threadId, turnId));
   }
 
   async createThread({ cwd, threadSource } = {}) {
     const canonicalCwd = String(cwd || "").trim();
-    try {
+    return this.#withClient(async () => {
       if (!canonicalCwd || !existsSync(canonicalCwd)) {
         throw codedError("MISSING_CWD", "Thread working directory no longer exists.");
       }
@@ -1268,17 +1265,11 @@ export class AppServerCodexRunner {
         reasoningEffort: result.reasoningEffort || null,
         modelProvider: result.modelProvider || result.thread.modelProvider || null,
       };
-    } finally {
-      this.#closeOwnedClient();
-    }
+    });
   }
 
   async findTurnByClientUserMessageId(threadId, clientMessageId) {
-    try {
-      return await this.client.findTurnByClientUserMessageId(threadId, clientMessageId);
-    } finally {
-      this.#closeOwnedClient();
-    }
+    return this.#withClient(() => this.client.findTurnByClientUserMessageId(threadId, clientMessageId));
   }
 
   async run({
@@ -1296,7 +1287,7 @@ export class AppServerCodexRunner {
     onServerRequest,
     turnTimeoutMs,
   }) {
-    try {
+    return this.#withClient(async () => {
       if (!existsSync(thread.cwd)) throw codedError("MISSING_CWD", "Thread working directory no longer exists.");
       if (this.client.isRunning()) throw codedError("BUSY", "Another Codex run is active.");
       return await this.client.runTurn({
@@ -1314,18 +1305,41 @@ export class AppServerCodexRunner {
         onServerRequest,
         turnTimeoutMs,
       });
+    });
+  }
+
+  /**
+   * Release an unused runner without interrupting an operation already in
+   * flight. The operation's completion boundary performs a deferred release.
+   */
+  close() {
+    return this.#closeOwnedClient();
+  }
+
+  async #withClient(operation) {
+    this.activeOperations += 1;
+    try {
+      return await operation();
     } finally {
+      this.activeOperations = Math.max(0, this.activeOperations - 1);
       this.#closeOwnedClient();
     }
   }
 
   #closeOwnedClient() {
-    if (!this.ownsClient) return;
+    if (!this.ownsClient || this.activeOperations > 0) return false;
+    try {
+      if (this.client.isRunning?.()) return false;
+    } catch {
+      // If the client cannot prove it is idle, do not risk interrupting work.
+      return false;
+    }
     this.ownsClient = false;
     try {
       this.client.close();
     } finally {
       this.onClientClose?.(this.client);
     }
+    return true;
   }
 }

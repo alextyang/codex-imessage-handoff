@@ -4,8 +4,6 @@ import { PassThrough, Writable } from "node:stream";
 import test from "node:test";
 import { ImsgClient } from "../src/imsg-client.mjs";
 import {
-  IMSG_LOCAL_MIRROR_CORRELATION_TIMEOUT_MS,
-  IMSG_IPC_MUTATION_TIMEOUT_MS,
   IMSG_RPC_SEND_TIMEOUT_MS,
   IMSG_UPSTREAM_BRIDGE_SEND_TIMEOUT_MS,
 } from "../src/imsg-timeouts.mjs";
@@ -144,8 +142,6 @@ test("default RPC send timeout exceeds imsg's full private-bridge window", () =>
 
   assert.equal(client.sendTimeoutMs, IMSG_RPC_SEND_TIMEOUT_MS);
   assert.ok(client.sendTimeoutMs > IMSG_UPSTREAM_BRIDGE_SEND_TIMEOUT_MS);
-  assert.ok(IMSG_LOCAL_MIRROR_CORRELATION_TIMEOUT_MS >= IMSG_IPC_MUTATION_TIMEOUT_MS + 60_000,
-    "receiver correlation must outlast the complete controller mutation path with margin");
 });
 
 test("locates imsg and reports normalized basic and bridge capabilities", async () => {

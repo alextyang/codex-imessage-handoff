@@ -1071,6 +1071,7 @@ test("a clean user-mirror reservation requires exact GUID evidence before consum
 
   const resumed = new LocalConversationRouter({ stateFile });
   assert.equal(resumed.consumeUserMirrorEcho(early), null, "plain markerEvidence=false survives restart");
+  assert.equal(resumed.provisionalUserMirrorEcho(early).reservationId, reservationId);
   assert.equal(resumed.confirmUserMirrorEcho(reservationId, "clean-mirror-guid"), true);
   assert.equal(resumed.consumeUserMirrorEcho(message(58_121, "Different visible body", {
     guid: "wrong-guid",
@@ -1081,7 +1082,46 @@ test("a clean user-mirror reservation requires exact GUID evidence before consum
   assert.equal(consumed.expectedGuid, "clean-mirror-guid");
 });
 
-test("an early marker-normalized echo can be quarantined without consuming its fail-closed reservation", () => {
+test("an unverified bridge GUID requires matching body, root, and post-reservation time", () => {
+  const { router, stateFile } = fixture();
+  router.routeOutboundGuid("root-a", "thread-a", { root: true });
+  const reservationId = "6".repeat(64);
+  router.reserveUserMirrorEcho({
+    reservationId,
+    threadId: "thread-a",
+    text: "Exact clean mirror",
+    rootGuid: "root-a",
+  });
+  assert.equal(router.confirmUserMirrorEcho(reservationId, "best-effort-guid", { verified: false }), true);
+
+  const candidate = (text, extras = {}) => message(58_130, text, {
+    guid: "best-effort-guid",
+    createdAt: "2026-07-12T12:00:01.000Z",
+    thread_originator_guid: "root-a",
+    ...extras,
+  });
+  for (const malformed of [
+    candidate("Different body"),
+    candidate("Exact clean mirror", { thread_originator_guid: "other-root" }),
+    candidate("Exact clean mirror", { createdAt: "2026-07-12T11:59:59.000Z" }),
+  ]) {
+    assert.equal(router.consumeUserMirrorEcho(malformed), null);
+    assert.equal(router.isReservedUserMirrorEcho(malformed), false,
+      "an unproved best-effort GUID must not quarantine unrelated input");
+  }
+
+  const persisted = JSON.parse(readFileSync(stateFile, "utf8"));
+  assert.equal(persisted.userMirrorEchoes[0].guidVerified, false);
+  const resumed = new LocalConversationRouter({
+    stateFile,
+    now: () => Date.parse("2026-07-12T12:00:02.000Z"),
+  });
+  const consumed = resumed.consumeUserMirrorEcho(candidate("Exact clean mirror"));
+  assert.equal(consumed.reservationId, reservationId);
+  assert.equal(consumed.expectedGuid, "best-effort-guid");
+});
+
+test("a marker-normalized provisional match cannot discard a genuine same-body reply", () => {
   const { router, stateFile } = fixture();
   router.routeOutboundGuid("root-a", "thread-a", { root: true });
   const reservationId = "7".repeat(64);
@@ -1103,9 +1143,10 @@ test("an early marker-normalized echo can be quarantined without consuming its f
     reply_to_guid: "root-a",
   })), null, "an incidental reply parent is not an authoritative provisional root");
 
-  const quarantined = router.quarantineProvisionalUserMirrorEcho(normalized);
-  assert.equal(quarantined.threadId, "thread-a");
-  assert.deepEqual(router.pendingActions(), []);
+  const action = router.ingest(normalized);
+  assert.equal(action.kind, "prompt");
+  assert.equal(action.threadId, "thread-a");
+  assert.equal(action.body, "Normalized before result");
   assert.equal(router.userMirrorEchoReceipt(reservationId), null);
   const laterCandidate = message(58_152, "Normalized before result", {
     guid: "later-same-body-guid",
@@ -1113,14 +1154,17 @@ test("an early marker-normalized echo can be quarantined without consuming its f
     createdAt: "2026-07-12T12:00:02.000Z",
   });
   assert.equal(router.provisionalUserMirrorEcho(laterCandidate).reservationId, reservationId,
-    "quarantining one ambiguous row must retain the guard for a later actual mirror");
-  const persisted = readFileSync(stateFile, "utf8");
-  assert.equal(persisted.includes("Normalized before result"), false);
-  assert.equal(persisted.includes("codex-mirror-777"), false);
+    "routing one genuine row must retain the guard for a later actual mirror");
 
   const resumed = new LocalConversationRouter({ stateFile });
   assert.equal(resumed.userMirrorEchoReceipt(reservationId), null);
   assert.equal(resumed.provisionalUserMirrorEcho(laterCandidate).reservationId, reservationId);
+  assert.equal(resumed.confirmUserMirrorEcho(reservationId, "later-mirror-guid"), true);
+  assert.equal(resumed.consumeUserMirrorEcho(message(58_153, tagged, {
+    guid: "later-mirror-guid",
+    thread_originator_guid: "root-a",
+    createdAt: "2026-07-12T12:00:03.000Z",
+  })).guid, "later-mirror-guid");
 });
 
 test("provisional mirror matching excludes pre-reservation backlog and rows outside the send window", () => {

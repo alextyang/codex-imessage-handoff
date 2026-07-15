@@ -6,8 +6,3 @@
 export const IMSG_UPSTREAM_BRIDGE_SEND_TIMEOUT_MS = 150_000;
 export const IMSG_RPC_SEND_TIMEOUT_MS = 180_000;
 export const IMSG_IPC_MUTATION_TIMEOUT_MS = 210_000;
-// Normal-profile mirroring can still be correlating its exact local row after
-// the RPC mutation deadline: capability/startup probes and two bounded history
-// verification passes surround the send. Keep the receiver's ordered-body
-// fallback beyond that complete pipeline with substantial scheduling margin.
-export const IMSG_LOCAL_MIRROR_CORRELATION_TIMEOUT_MS = 300_000;

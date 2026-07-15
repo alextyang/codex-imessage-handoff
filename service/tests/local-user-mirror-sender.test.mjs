@@ -569,10 +569,25 @@ test("a genuine same-body message remains actionable while only the exact mirror
   assert.equal(item.router.nativeThread(THREAD_ID).latestGuid, "MIRROR-GUID");
 });
 
-test("holds a clean receiver echo until the local send GUID is confirmed", async () => {
+test("registers a clean send GUID before local verification and exact-GUID suppression wins the race", async () => {
   let item;
   let candidate;
+  let sendReturned = false;
+  let observedBeforeVerification = false;
   const fake = fakeImsg({
+    history: () => {
+      if (sendReturned && !observedBeforeVerification) {
+        assert.equal(item.router.nativeThread(THREAD_ID).latestGuid, ROOT_GUID,
+          "a best-effort bridge GUID must not become a durable route before proof");
+        const state = JSON.parse(readFileSync(item.routerFile, "utf8"));
+        assert.equal(state.userMirrorEchoes[0].guidVerified, false);
+        const consumed = item.router.consumeUserMirrorEcho(candidate);
+        assert.equal(consumed.threadId, THREAD_ID);
+        assert.equal(consumed.expectedGuid, "EARLY-ECHO-GUID");
+        observedBeforeVerification = true;
+      }
+      return [rootRow()];
+    },
     onSendRich: ({ params }) => {
       candidate = {
         id: 601,
@@ -584,6 +599,7 @@ test("holds a clean receiver echo until the local send GUID is confirmed", async
       assert.equal(item.router.consumeUserMirrorEcho(candidate), null);
       assert.equal(item.router.isReservedUserMirrorEcho(candidate), false);
       assert.equal(item.router.provisionalUserMirrorEcho(candidate).threadId, THREAD_ID);
+      sendReturned = true;
       return { ok: true, guid: "EARLY-ECHO-GUID" };
     },
   });
@@ -591,9 +607,8 @@ test("holds a clean receiver echo until the local send GUID is confirmed", async
   await initialize(item.sender);
   const result = await item.sender.sendMirror(mirror({ body: "Race the result" }));
   assert.equal(result.classification, "accepted");
-  const consumed = item.router.consumeUserMirrorEcho(candidate);
-  assert.equal(consumed.threadId, THREAD_ID);
-  assert.equal(consumed.expectedGuid, "EARLY-ECHO-GUID");
+  assert.equal(observedBeforeVerification, true);
+  assert.equal(item.router.consumeUserMirrorEcho(candidate), null);
   assert.equal(item.router.lastRowId, 601);
   assert.deepEqual(item.router.pendingActions(), []);
 });
@@ -626,7 +641,6 @@ test("a marker-normalized no-GUID response remains ambiguous and cannot promote 
         thread_originator_guid: ROOT_GUID,
       };
       assert.equal(item.router.provisionalUserMirrorEcho(candidate).threadId, THREAD_ID);
-      assert.equal(item.router.quarantineProvisionalUserMirrorEcho(candidate).guid, "NORMALIZED-NO-GUID");
       delivered = true;
       assert.equal(localUserMirrorInternals.containsMarker(params.text,
         localUserMirrorInternals.markerToken("normalized-no-guid", THREAD_ID, 0)), false);

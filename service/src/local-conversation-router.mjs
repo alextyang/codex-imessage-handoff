@@ -436,10 +436,12 @@ function normalizeState(value, expectedConversationKey = null) {
       // Missing means a pre-migration reservation, all of which used the
       // legacy tagged wire format. New plain reservations persist false.
       const markerEvidence = typeof echo.markerEvidence === "boolean" ? echo.markerEvidence : true;
+      // Older expected GUIDs were stored only after local-history proof.
+      const guidVerified = typeof echo.guidVerified === "boolean" ? echo.guidVerified : Boolean(expectedGuid);
       return reservationId && threadId && /^[a-f0-9]{64}$/u.test(fingerprint || "")
         && (!provisionalFingerprint || /^[a-f0-9]{64}$/u.test(provisionalFingerprint)) && rootGuid && createdAt
         && earlyUntil && expiresAt
-        ? [{ reservationId, threadId, fingerprint, provisionalFingerprint, markerEvidence, rootGuid, expectedGuid, createdAt, earlyUntil, expiresAt }]
+        ? [{ reservationId, threadId, fingerprint, provisionalFingerprint, markerEvidence, rootGuid, expectedGuid, guidVerified, createdAt, earlyUntil, expiresAt }]
         : [];
     }).slice(-MAX_USER_MIRROR_ECHOES);
   }
@@ -581,6 +583,20 @@ function userMirrorProvisionalFingerprint(value) {
 function hasUserMirrorMarker(value) {
   return typeof value === "string"
     && /\u{E0001}[\u{E0020}-\u{E007E}]+\u{E007F}$/u.test(value.trim());
+}
+
+function hasExactUserMirrorEvidence(message, echo) {
+  if (!message?.guid || message.guid !== echo?.expectedGuid
+    || !message.threadOriginatorGuid || message.threadOriginatorGuid !== echo.rootGuid) return false;
+  if (echo.guidVerified === true) return true;
+  const messageCreatedAt = Date.parse(message.createdAt);
+  const reservationCreatedAt = Date.parse(echo.createdAt);
+  if (!message.hasReliableCreatedAt || !Number.isFinite(messageCreatedAt)
+    || !Number.isFinite(reservationCreatedAt) || messageCreatedAt < reservationCreatedAt) return false;
+  const fingerprint = userMirrorEchoFingerprint(message.text);
+  if (fingerprint === echo.fingerprint) return true;
+  return echo.markerEvidence === true
+    && userMirrorProvisionalFingerprint(message.text) === echo.provisionalFingerprint;
 }
 
 function pruneOutboundEchoes(state, nowMs) {
@@ -1227,6 +1243,7 @@ export class LocalConversationRouter {
       markerEvidence,
       rootGuid,
       expectedGuid: null,
+      guidVerified: false,
       createdAt: new Date(nowMs).toISOString(),
       earlyUntil: new Date(nowMs + USER_MIRROR_EARLY_MATCH_MS).toISOString(),
       expiresAt: new Date(nowMs + USER_MIRROR_RESERVATION_MS).toISOString(),
@@ -1235,7 +1252,7 @@ export class LocalConversationRouter {
     return reservationId;
   }
 
-  confirmUserMirrorEcho(reservationIdValue, guidValue) {
+  confirmUserMirrorEcho(reservationIdValue, guidValue, options = {}) {
     const reservationId = cleanString(reservationIdValue, 96);
     const guid = cleanString(guidValue, 256);
     if (!reservationId || !guid) return false;
@@ -1245,6 +1262,7 @@ export class LocalConversationRouter {
     if (!echo) return false;
     if (echo.expectedGuid && echo.expectedGuid !== guid) return false;
     echo.expectedGuid = guid;
+    if (options.verified !== false) echo.guidVerified = true;
     writeState(this.stateFile, this.state);
     return true;
   }
@@ -1277,6 +1295,10 @@ export class LocalConversationRouter {
     const messageCreatedAt = Date.parse(message.createdAt);
     const index = fingerprint && message.threadOriginatorGuid
       ? this.state.userMirrorEchoes.findIndex((echo) => !echo.expectedGuid
+        // This match is only a bounded opportunity for the sender's exact
+        // GUID to arrive. Visible body + Reply root are never sufficient to
+        // consume or discard a message, whether the reservation is a new
+        // plain send or a marker-normalized legacy journal.
         && echo.provisionalFingerprint === fingerprint
         && echo.rootGuid === message.threadOriginatorGuid
         // Watch recovery can replay rows that predate a new mirror send. The
@@ -1301,24 +1323,6 @@ export class LocalConversationRouter {
     };
   }
 
-  quarantineProvisionalUserMirrorEcho(rawMessage) {
-    const priorState = structuredClone(this.state);
-    try {
-      const candidate = this.provisionalUserMirrorEcho(rawMessage);
-      if (!candidate) return null;
-      // A normalized visible-body match is not proof of which bubble the
-      // normal-profile sender created. Mark this row handled only after the
-      // bounded GUID wait, but retain the reservation so a later exact echo
-      // remains fail-closed. In particular, never create a sender receipt or
-      // remove the only guard based on body/root correlation alone.
-      if (!this.#discard(rawMessage)) return null;
-      return candidate;
-    } catch (error) {
-      this.state = priorState;
-      throw error;
-    }
-  }
-
   consumeUserMirrorEcho(rawMessage) {
     const priorState = structuredClone(this.state);
     try {
@@ -1339,6 +1343,7 @@ export class LocalConversationRouter {
     let index = message.guid
       ? this.state.userMirrorEchoes.findIndex((echo) => echo.expectedGuid === message.guid)
       : -1;
+    const matchedExpectedGuid = index >= 0;
     if (index < 0 && fingerprint) index = this.state.userMirrorEchoes.findIndex((echo) => {
       if (!echo.markerEvidence || echo.expectedGuid || echo.fingerprint !== fingerprint
         || Date.parse(echo.earlyUntil) < nowMs) return false;
@@ -1350,13 +1355,12 @@ export class LocalConversationRouter {
       return null;
     }
     const echo = this.state.userMirrorEchoes[index];
-    const messageRoot = message.threadOriginatorGuid;
-    // A matching send GUID alone does not prove native Reply continuity.
-    // Messages can surface a committed bubble before, or without, its reply
-    // metadata. Keep the reservation unresolved unless the receiver observes
-    // the exact expected root; the transport will quarantine reserved-marker
-    // rows that are missing or carry conflicting context.
-    if (messageRoot !== echo.rootGuid) return null;
+    // A bridge-returned GUID is best-effort until the normal profile proves
+    // its local row. Before that proof, require the exact native root, clean
+    // body, and a post-reservation timestamp as receiver-side corroboration.
+    // A verified GUID still requires the exact native Reply root.
+    if (matchedExpectedGuid ? !hasExactUserMirrorEvidence(message, echo)
+      : message.threadOriginatorGuid !== echo.rootGuid) return null;
     return this.#settleUserMirrorEcho(message, echo, index);
   }
 
@@ -1400,7 +1404,10 @@ export class LocalConversationRouter {
     if (!message) return false;
     const pruned = pruneUserMirrorEchoes(this.state, this.now());
     if (pruned) writeState(this.stateFile, this.state);
-    if (message.guid && this.state.userMirrorEchoes.some((echo) => echo.expectedGuid === message.guid)) return true;
+    if (message.guid && this.state.userMirrorEchoes.some((echo) => (
+      echo.expectedGuid === message.guid
+      && (echo.guidVerified === true || hasExactUserMirrorEvidence(message, echo))
+    ))) return true;
     const fingerprint = userMirrorEchoFingerprint(message.text);
     return Boolean(fingerprint && this.state.userMirrorEchoes.some((echo) => (
       echo.markerEvidence && echo.fingerprint === fingerprint
