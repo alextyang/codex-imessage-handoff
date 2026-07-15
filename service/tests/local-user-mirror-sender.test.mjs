@@ -1261,8 +1261,10 @@ test("an exact returned GUID wins among multiple post-attempt matches only after
 });
 
 test("an ambiguous attempted send never retries or permits helper fallback, including after restart", async () => {
+  let rootProofAvailable = true;
   const fake = fakeImsg({
-    history: ({ historyCalls }) => historyCalls === 1 ? [rootRow()] : [rootRow()],
+    history: () => rootProofAvailable ? [rootRow()] : [],
+    search: () => rootProofAvailable ? [rootRow()] : [],
     onSendRich: () => { throw new Error("transport closed after write"); },
   });
   const item = fixture({ fake, reconcileTimeoutMs: 1 });
@@ -1290,12 +1292,53 @@ test("an ambiguous attempted send never retries or permits helper fallback, incl
     discoveryTimeoutMs: 1,
     reconcileTimeoutMs: 1,
   });
-  await initialize(resumed);
+  rootProofAvailable = false;
+  assert.equal((await initialize(resumed)).status, "READY",
+    "temporary root-proof loss retains the same-account target pin");
+  const retained = JSON.parse(readFileSync(item.senderFile, "utf8"));
+  assert.equal(Object.values(retained.deliveries)[0]?.status, "ambiguous",
+    "temporary root-proof loss must not erase crash-bound delivery evidence");
+  rootProofAvailable = true;
   const afterRestart = await resumed.sendMirror(mirror({ body: "Potentially accepted" }));
   assert.equal(afterRestart.classification, "ambiguous");
   assert.equal(afterRestart.retryable, true);
   assert.equal(afterRestart.fallbackSafe, false);
   assert.equal(fake.sendCalls().length, 1);
+});
+
+test("a transient chat-list omission during revalidation cannot erase and resend an ambiguous delivery", async () => {
+  const item = fixture({
+    fake: fakeImsg({ onSendRich: () => { throw new Error("transport closed after write"); } }),
+    reconcileTimeoutMs: 1,
+  });
+  await initialize(item.sender);
+  const request = mirror({ deliveryId: "chat-list-transient", body: "Potentially committed during chat refresh" });
+  assert.equal((await item.sender.sendMirror(request)).classification, "ambiguous");
+
+  let chatQueries = 0;
+  const resumedFake = fakeImsg({
+    chats: () => {
+      chatQueries += 1;
+      return chatQueries === 2 ? [] : [directChat()];
+    },
+    onSendRich: () => { throw new Error("a second native send must not occur"); },
+  });
+  const resumedRouter = new LocalConversationRouter({ stateFile: item.routerFile, now: item.clock.now });
+  const resumed = createSender({
+    stateFile: item.senderFile,
+    router: resumedRouter,
+    fake: resumedFake,
+    clock: item.clock,
+    discoveryTimeoutMs: 1,
+    reconcileTimeoutMs: 1,
+  });
+  assert.equal((await initialize(resumed)).status, "READY");
+  const held = await resumed.sendMirror(request);
+  assert.equal(held.classification, "ambiguous");
+  assert.equal(resumedFake.sendCalls().length, 0,
+    "an incomplete same-account chat list must not reopen the native send boundary");
+  assert.equal(chatQueries, 2);
+  assert.equal(Object.values(JSON.parse(readFileSync(item.senderFile, "utf8")).deliveries)[0]?.status, "ambiguous");
 });
 
 test("a pre-upgrade tagged journal still reconciles without resending", async () => {

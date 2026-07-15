@@ -533,10 +533,14 @@ export class LocalUserMirrorSender {
       }
       if (matches.length > 1) return this.#unavailable("CHAT_AMBIGUOUS");
       if (selected) this.#bindChat(selected);
-      else if (roots.length || this.state.binding?.accountFingerprint !== accountFingerprint) {
+      else if (this.state.binding?.accountFingerprint !== accountFingerprint) {
         this.state = emptyState(this.conversationKey);
         writeState(this.stateFile, this.state);
       }
+      // A same-account root lookup can be transiently empty while Messages is
+      // still indexing or the CLI is recovering. Keep the already target-pinned
+      // binding and, critically, its at-most-once delivery journal. Every send
+      // still revalidates the account and proves its exact Reply root locally.
       this.capability = {
         available: true,
         status: this.state.binding ? "READY" : "AWAITING_THREAD_ROOT",
@@ -628,12 +632,13 @@ export class LocalUserMirrorSender {
       this.chats = chats.filter((chat) => directExternalChat(chat, identitySet)
         && chatUsesSender(chat, this.expectedLocalSender));
       if (this.state.binding) {
-        const selected = this.chats.find((chat) => Number(chat.id) === this.state.binding.chatId
-          && clean(chat.guid) === this.state.binding.chatGuid);
-        if (!selected || this.state.binding.accountFingerprint !== fingerprint) {
+        if (this.state.binding.accountFingerprint !== fingerprint) {
           this.state = emptyState(this.conversationKey);
           writeState(this.stateFile, this.state);
         }
+        // A transiently incomplete chat list is not evidence that the durable
+        // conversation scope changed. Retain the pinned binding and journal;
+        // #localRoot must independently prove the requested root before send.
       }
       this.capability = {
         available: true,
