@@ -55,9 +55,16 @@ the complete bounded mutation window ends. Body/root correlation alone never
 creates a receipt or consumes the reservation; an unresolved row is
 quarantined while the guard remains active for any later echo. Ambiguous writes
 are reconciled without resending; after 15 minutes, a content-free task notice
-unblocks later output while the late-echo quarantine remains active. This sender cannot select
-recipients, send files or URLs, watch Messages, launch/relaunch Messages, or
-control any Codex process.
+unblocks later output while the late-echo quarantine remains active. This
+sender cannot select recipients, send files or URLs, watch Messages,
+launch/relaunch Messages, or control any Codex process.
+
+Codex window focus and the task currently open in the Codex sidebar are never
+inputs to user-mirror delivery. A Codex-authored user message remains visible
+in iMessage whether Codex is frontmost, backgrounded, or showing that same
+task. Only an explicit task mute, the short manual-selection prompt lease, or
+the one-shot suppression of an iMessage message already visible in its native
+Reply thread can intentionally omit or defer that user mirror.
 
 The Remote Control client is independent from Codex Desktop. It does not
 attach to a local socket, launch `codex app-server`, use `codex remote-control

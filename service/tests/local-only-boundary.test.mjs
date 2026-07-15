@@ -48,6 +48,19 @@ test("runtime entry points expose only the authenticated local helper", () => {
   assert.doesNotMatch(manager, /<key>\$\{retiredLocalDaemonEnvironment\}<\/key>/);
 });
 
+test("normal-profile user mirrors cannot be disabled by Codex window or task focus", () => {
+  const daemon = readFileSync(path.join(repo, "service/src/daemon.mjs"), "utf8");
+  const start = daemon.indexOf("async function deliverLiveMessage(message)");
+  const end = daemon.indexOf("\nasync function scanLiveMirror()", start);
+  assert.ok(start >= 0 && end > start, "live user-mirror flow must remain inspectable");
+  const flow = daemon.slice(start, end);
+
+  assert.match(flow, /localUserMirrorSender\.sendMirror\(\{/);
+  assert.doesNotMatch(flow, /codexFocus|shouldSuppressUserMirror|frontmost|activeThreadId|activeThread\.id/);
+  assert.equal(existsSync(path.join(repo, "service/src/codex-focus.mjs")), false,
+    "the retired focus detector must not be restored");
+});
+
 test("the main service can only reach Codex through an injected Remote Control stream", () => {
   const daemon = readFileSync(path.join(repo, "service/src/daemon.mjs"), "utf8");
   const manager = readFileSync(path.join(repo, "service/src/service-manager.mjs"), "utf8");
