@@ -20,6 +20,7 @@ const fullStatus = {
   bridge_version: 2,
   v2_ready: true,
   selectors: {
+    clientMessageGuid: true,
     urlPreviewMessage: true,
     sendRichLinkAction: true,
     pollPayloadMessage: true,
@@ -32,6 +33,7 @@ const fullStatus = {
     "watch.subscribe",
     "watch.unsubscribe",
     "send.rich",
+    "send.rich.client-guid",
     "send.attachment",
     "poll.send",
     "poll.vote",
@@ -151,6 +153,7 @@ test("locates imsg and reports normalized basic and bridge capabilities", async 
   assert.equal(status.available, true);
   assert.equal(status.version, "0.13.0");
   assert.equal(status.capabilities.richText, true);
+  assert.equal(status.capabilities.clientMessageGuid, true);
   assert.equal(status.capabilities.urlPreviews, true);
   assert.equal(status.capabilities.polls, true);
   assert.equal(status.capabilities.pollCaptionControl, true);
@@ -264,6 +267,76 @@ test("advanced send capability failures fail closed before delivery", async () =
   assert.deepEqual([formatted, reply, link, file].map((result) => result.classification),
     ["unsupported", "unsupported", "unsupported", "unsupported"]);
   assert.equal(child.requests.length, 0, "capability rejection must happen before spawning RPC");
+});
+
+test("caller-owned message GUIDs are canonical, capability-gated, and forwarded unchanged", async () => {
+  const guid = "12345678-1234-4ABC-8DEF-1234567890AB";
+  const { client, child } = createClient();
+  const sent = await client.sendRich({
+    chat_id: 42,
+    text: "clean mirror",
+    reply_to: "PARENT",
+    dd_scan: false,
+    client_guid: guid,
+  });
+  assert.equal(sent.classification, "accepted");
+  const request = child.requests.find((item) => item.method === "send.rich.client-guid");
+  assert.equal(request.params.client_guid, guid);
+  assert.equal(request.params.text, "clean mirror");
+
+  const count = child.requests.length;
+  assert.equal((await client.sendRich({ chat_id: 42, text: "bad", client_guid: guid.toLowerCase() })).classification, "unsupported");
+  assert.equal(child.requests.length, count, "an invalid GUID must fail before an RPC write");
+  await client.stop();
+
+  const unsupportedStatus = structuredClone(fullStatus);
+  delete unsupportedStatus.selectors.clientMessageGuid;
+  const missing = createClient({ status: unsupportedStatus });
+  assert.equal((await missing.client.sendRich({ chat_id: 42, text: "blocked", client_guid: guid })).classification, "unsupported");
+  assert.equal(missing.child.requests.length, 0);
+
+  const mixedVersionStatus = structuredClone(fullStatus);
+  mixedVersionStatus.rpc_methods = mixedVersionStatus.rpc_methods.filter((method) => method !== "send.rich.client-guid");
+  const mixedVersion = createClient({ status: mixedVersionStatus });
+  assert.equal(mixedVersionStatus.selectors.clientMessageGuid, true,
+    "the newer injected helper advertises GUID construction");
+  assert.equal((await mixedVersion.client.sendRich({
+    chat_id: 42,
+    text: "must not use the legacy RPC method",
+    client_guid: guid,
+  })).classification, "unsupported");
+  assert.equal(mixedVersion.child.requests.length, 0,
+    "a newer helper cannot make an older RPC binary safe to send through");
+});
+
+test("an RPC binary swapped after capability probing rejects the distinct GUID method without legacy fallback", async () => {
+  const guid = "12345678-1234-4ABC-8DEF-1234567890AB";
+  const child = respondingChild({
+    "send.rich.client-guid": (request, process) => queueMicrotask(() => process.json({
+      jsonrpc: "2.0",
+      id: request.id,
+      error: { code: -32601, message: "Method not found" },
+    })),
+  });
+  const { client } = createClient({ child });
+  const probed = await client.probeCapabilities();
+  assert.equal(probed.capabilities.clientMessageGuid, true);
+
+  const result = await client.sendRich({
+    chat_id: 42,
+    text: "must remain unsent",
+    reply_to: "PARENT",
+    client_guid: guid,
+  });
+  assert.equal(result.classification, "unsupported");
+  assert.equal(result.retrySafe, true);
+  assert.deepEqual(child.requests.map((request) => request.method), [
+    "chats.list",
+    "send.rich.client-guid",
+  ]);
+  assert.equal(child.requests.some((request) => request.method === "send.rich"), false,
+    "method-not-found must never downgrade to an uncorrelatable legacy send");
+  await client.stop();
 });
 
 test("sends rich text, native polls, votes, tapbacks, typing, read receipts, and status through documented RPC methods", async () => {

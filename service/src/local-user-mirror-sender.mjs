@@ -11,7 +11,7 @@ import {
   statSync,
   writeFileSync,
 } from "node:fs";
-import { createHash, randomBytes } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import path from "node:path";
 import {
   canonicalImsgIdentity,
@@ -36,6 +36,7 @@ const MARKER_START = "\u{E0001}";
 const MARKER_END = "\u{E007F}";
 const WIRE_MODE_PLAIN = "plain";
 const WIRE_MODE_TAGGED = "tagged";
+const WIRE_MODE_CLIENT_GUID = "client-guid";
 const BINARY_CANDIDATES = Object.freeze([
   "/opt/homebrew/bin/imsg",
   "/usr/local/bin/imsg",
@@ -131,15 +132,36 @@ function normalizedDelivery(value) {
   const preparedAt = clean(value.preparedAt);
   // Journals written before wireMode existed always used the legacy Unicode
   // Tags-block suffix. Preserve their crash reconciliation without putting
-  // that suffix on newly prepared mirrors.
-  const wireMode = value.wireMode === WIRE_MODE_PLAIN
+  // that suffix on current wire bodies or current receiver reservations.
+  // A deployed rollback build strips unknown fields when it rewrites an
+  // entry. If that build definitely fails before dispatch, it can leave a
+  // current plain entry (or an earlier tagged compatibility entry) in prepared
+  // state with the caller-owned GUID intact but without `clientGuidMode`.
+  // That exact state is safe to infer: no send boundary was crossed, and
+  // legacy senders never allocated an uppercase UUIDv4 while still prepared
+  // with no attempt evidence.
+  const inferredRollbackClientGuid = [WIRE_MODE_PLAIN, WIRE_MODE_TAGGED].includes(value.wireMode)
+    && clean(value.status) === "prepared"
+    && Boolean(canonicalClientGuid(value.guid))
+    && value.attemptedAt == null
+    && value.acceptedAt == null
+    && value.deadLetteredAt == null;
+  const clientGuidMode = value.clientGuidMode === true
+    || value.wireMode === WIRE_MODE_CLIENT_GUID
+    || inferredRollbackClientGuid;
+  const compatibleWireMode = value.wireMode === WIRE_MODE_PLAIN
     ? WIRE_MODE_PLAIN
     : value.wireMode === undefined || value.wireMode === WIRE_MODE_TAGGED
       ? WIRE_MODE_TAGGED
       : null;
+  // Normalize every client-GUID generation to the plain envelope, including
+  // the unreleased `client-guid` mode and the earlier tagged compatibility
+  // mode. Only a true legacy entry without client-GUID evidence remains tagged.
+  const wireMode = clientGuidMode ? WIRE_MODE_PLAIN : compatibleWireMode;
   if (!/^[a-f0-9]{64}$/u.test(reservationId) || !threadId || !/^[a-f0-9]{64}$/u.test(bodyHash)
     || !/^codex-mirror-[a-f0-9]{32}$/u.test(token) || !rootGuid
     || !wireMode
+    || (clientGuidMode && !canonicalClientGuid(value.guid))
     || !["prepared", "attempting", "accepted", "ambiguous", "dead-letter"].includes(status)
     || !Number.isFinite(Date.parse(preparedAt))) return null;
   return {
@@ -148,6 +170,7 @@ function normalizedDelivery(value) {
     bodyHash,
     token,
     wireMode,
+    clientGuidMode,
     rootGuid,
     status,
     preparedAt,
@@ -156,6 +179,25 @@ function normalizedDelivery(value) {
     deadLetteredAt: Number.isFinite(Date.parse(value.deadLetteredAt || "")) ? value.deadLetteredAt : null,
     guid: clean(value.guid) || null,
   };
+}
+
+function canonicalClientGuid(value) {
+  const guid = clean(value);
+  return /^[A-F0-9]{8}-[A-F0-9]{4}-4[A-F0-9]{3}-[89AB][A-F0-9]{3}-[A-F0-9]{12}$/u.test(guid)
+    ? guid
+    : null;
+}
+
+function allocateClientGuid(factory) {
+  const guid = canonicalClientGuid(String(factory()).toUpperCase());
+  if (!guid) {
+    throw codedError("IMSG_LOCAL_MIRROR_GUID_INVALID", "Could not allocate a canonical user-mirror GUID.", { attempted: false });
+  }
+  return guid;
+}
+
+function isClientGuidDelivery(entry) {
+  return entry?.clientGuidMode === true;
 }
 
 function readState(file, expectedConversationKey = null) {
@@ -286,6 +328,7 @@ export class LocalUserMirrorSender {
     sendTimeoutMs = DEFAULT_SEND_TIMEOUT_MS,
     conversationKey = null,
     imsgClientFactory = null,
+    clientGuidFactory = randomUUID,
     allowUnsafeTestBinary = false,
   } = {}) {
     if (!stateFile || !router) throw new TypeError("LocalUserMirrorSender requires private state and a conversation router.");
@@ -304,6 +347,7 @@ export class LocalUserMirrorSender {
       candidates: [binary],
       sendTimeoutMs: this.sendTimeoutMs,
     }));
+    this.clientGuidFactory = clientGuidFactory;
     this.allowUnsafeTestBinary = allowUnsafeTestBinary;
     this.state = readState(this.stateFile, this.conversationKey);
     this.binary = null;
@@ -394,7 +438,8 @@ export class LocalUserMirrorSender {
       if (!this.binary) await this.#locateBinary();
       const status = (await this.#runJson(["status", "--json"], { timeout: 8_000, maxBuffer: 512 * 1024 }))[0];
       const methods = new Set(Array.isArray(status?.rpc_methods) ? status.rpc_methods : []);
-      if (status?.advanced_features !== true || status?.v2_ready !== true || !methods.has("send.rich")) {
+      if (status?.advanced_features !== true || status?.v2_ready !== true || !methods.has("send.rich.client-guid")
+        || status?.selectors?.clientMessageGuid !== true) {
         return this.#unavailable("ACTIVATION_REQUIRED");
       }
       const account = (await this.#runJson(["account", "--json"], { timeout: 8_000, maxBuffer: 512 * 1024 }))[0];
@@ -535,7 +580,8 @@ export class LocalUserMirrorSender {
     try {
       const status = (await this.#runJson(["status", "--json"], { timeout: 8_000, maxBuffer: 512 * 1024 }))[0];
       const methods = new Set(Array.isArray(status?.rpc_methods) ? status.rpc_methods : []);
-      if (status?.advanced_features !== true || status?.v2_ready !== true || !methods.has("send.rich")) {
+      if (status?.advanced_features !== true || status?.v2_ready !== true || !methods.has("send.rich.client-guid")
+        || status?.selectors?.clientMessageGuid !== true) {
         return this.#unavailable("ACTIVATION_REQUIRED");
       }
       const account = (await this.#runJson(["account", "--json"], { timeout: 8_000, maxBuffer: 512 * 1024 }))[0];
@@ -596,7 +642,7 @@ export class LocalUserMirrorSender {
     const rows = await this.#history().catch(() => []);
     return rows.find((row) => {
       const contextRoot = clean(row?.thread_originator_guid ?? row?.threadOriginatorGuid);
-      const cleanBodyMatches = entry.wireMode !== WIRE_MODE_PLAIN
+      const cleanBodyMatches = (!isClientGuidDelivery(entry) && entry.wireMode === WIRE_MODE_TAGGED)
         || hash("local-user-mirror-body-v1", typeof row?.text === "string" ? row.text : "") === entry.bodyHash;
       return row?.is_from_me === true
         && (requiredGuid ? messageGuid(row) === requiredGuid : containsMarker(row?.text, entry.token))
@@ -667,38 +713,91 @@ export class LocalUserMirrorSender {
       throw codedError("IMSG_LOCAL_MIRROR_CONFLICT", "A local user-mirror delivery id was reused.", { attempted: false });
     }
     if (!entry) {
+      const assignedGuid = allocateClientGuid(this.clientGuidFactory);
       entry = {
         reservationId: key,
         threadId,
         bodyHash,
         token,
+        // The deployed rollback build natively supports plain journal entries.
+        // Keep both the durable envelope and the actual wire body free of the
+        // legacy Unicode compatibility suffix.
         wireMode: WIRE_MODE_PLAIN,
+        clientGuidMode: true,
         rootGuid,
         status: "prepared",
         preparedAt: new Date(this.now()).toISOString(),
         attemptedAt: null,
         acceptedAt: null,
         deadLetteredAt: null,
-        guid: null,
+        // The caller owns the native Messages identity. Persist it before the
+        // bridge write so the receiving profile can suppress the exact echo
+        // even if the RPC response is delayed or the sender crashes.
+        guid: assignedGuid,
       };
       this.#saveDelivery(key, entry);
     }
-    const text = entry.wireMode === WIRE_MODE_TAGGED
+    const receiverReceiptGuid = clean(this.router.userMirrorEchoReceipt?.(key)?.guid);
+    if (!isClientGuidDelivery(entry) && entry.status === "prepared") {
+      const definitivelyUnattempted = !entry.attemptedAt && !entry.acceptedAt
+        && !entry.deadLetteredAt && !entry.guid && !receiverReceiptGuid;
+      if (definitivelyUnattempted) {
+        // A prepared journal is persisted before the router reservation and
+        // before the attempting transition. It is therefore safe to upgrade
+        // this legacy clean/tagged entry without sending it twice. Persist the
+        // new identity first; a restart can then repeat only the reservation
+        // cleanup below, never GUID allocation or dispatch.
+        entry.wireMode = WIRE_MODE_PLAIN;
+        entry.clientGuidMode = true;
+        entry.guid = allocateClientGuid(this.clientGuidFactory);
+        this.#saveDelivery(key, entry);
+      } else if (receiverReceiptGuid) {
+        // A durable receiving-side receipt is proof that the legacy bubble
+        // already arrived. Repair a contradictory prepared journal instead
+        // of risking a second send.
+        entry.guid = receiverReceiptGuid;
+        entry.status = "accepted";
+        entry.acceptedAt ||= new Date(this.now()).toISOString();
+        this.#saveDelivery(key, entry);
+      } else {
+        // Any legacy prepared entry carrying attempt evidence is ambiguous,
+        // regardless of its stale status label. Preserve at-most-once
+        // delivery and let the exact legacy reconciliation path settle it.
+        entry.status = "ambiguous";
+        entry.attemptedAt ||= entry.preparedAt;
+        this.#saveDelivery(key, entry);
+      }
+    }
+    if (entry.status === "prepared" && !entry.attemptedAt) {
+      // An older process may have crashed after reserving its body but before
+      // persisting `attempting`. Rebuild that definitively-unsent
+      // reservation from the now-persisted clean client-GUID entry. Doing this
+      // on every prepared resume makes the two-file migration crash-safe.
+      this.router.releaseUserMirrorEcho(key);
+    }
+    const text = entry.wireMode === WIRE_MODE_TAGGED && !isClientGuidDelivery(entry)
       ? taggedText(intent.text, token)
       : String(intent.text);
-    const receiverReceiptGuid = clean(this.router.userMirrorEchoReceipt?.(key)?.guid);
+    // Client-GUID sends reserve the same clean body that both current and
+    // deployed rollback senders put on the wire. Only true legacy tagged
+    // journals retain marker evidence for their original recovery path.
+    const reservationText = text;
     if (!entry.guid && receiverReceiptGuid) entry.guid = receiverReceiptGuid;
     if (!receiverReceiptGuid && ["attempting", "ambiguous", "dead-letter"].includes(entry.status)) {
       // Re-establish or migrate the body-free receiver reservation before any
       // crash reconciliation. This never sends; it only preserves late-echo
       // suppression if the router restarted between the RPC write and result.
-      this.router.reserveUserMirrorEcho({ reservationId: key, threadId, text, rootGuid });
+      this.router.reserveUserMirrorEcho({ reservationId: key, threadId, text: reservationText, rootGuid });
+    }
+    if (isClientGuidDelivery(entry) && entry.guid
+      && !["prepared", "dead-letter"].includes(entry.status) && !receiverReceiptGuid) {
+      this.router.confirmUserMirrorEcho(key, entry.guid);
     }
     if (entry.status === "accepted") {
       if (entry.guid) {
         const hasDurableReceiverReceipt = receiverReceiptGuid === entry.guid;
         if (!hasDurableReceiverReceipt && !this.router.hasSeenMessageGuid(entry.guid)) {
-          this.router.reserveUserMirrorEcho({ reservationId: key, threadId, text, rootGuid });
+          this.router.reserveUserMirrorEcho({ reservationId: key, threadId, text: reservationText, rootGuid });
         }
         this.router.confirmUserMirrorEcho(key, entry.guid);
         this.router.routeOutboundGuid(entry.guid, threadId);
@@ -729,10 +828,22 @@ export class LocalUserMirrorSender {
       }
     }
 
-    this.router.reserveUserMirrorEcho({ reservationId: key, threadId, text, rootGuid });
+    this.router.reserveUserMirrorEcho({ reservationId: key, threadId, text: reservationText, rootGuid });
+    if (isClientGuidDelivery(entry)) {
+      if (!canonicalClientGuid(entry.guid)) {
+        throw codedError("IMSG_LOCAL_MIRROR_GUID_INVALID", "The persisted user-mirror GUID is invalid.", { attempted: false });
+      }
+    }
     entry.status = "attempting";
     entry.attemptedAt = new Date(this.now()).toISOString();
     this.#saveDelivery(key, entry);
+    if (isClientGuidDelivery(entry) && !this.router.confirmUserMirrorEcho(key, entry.guid)) {
+      // Persist the no-retry boundary before binding the reservation to the
+      // clean client GUID. A rollback that sees `prepared` can still send its
+      // clean legacy body and confirm the bridge-assigned GUID;
+      // once `attempting` is durable, neither version is allowed to resend.
+      throw codedError("IMSG_LOCAL_MIRROR_GUID_INVALID", "The persisted user-mirror GUID could not be reserved.", { attempted: true });
+    }
     let result;
     try {
       const formatting = imsgTransportInternals.nativeFormatting(intent.ranges).slice(0, 512);
@@ -746,6 +857,7 @@ export class LocalUserMirrorSender {
         // suffix and could associate simultaneous equal text with the wrong
         // row. Exact GUID + exact Reply-root verification still follows.
         dd_scan: false,
+        ...(isClientGuidDelivery(entry) ? { client_guid: entry.guid } : {}),
       });
     } catch (error) {
       if (error?.attempted === false) {
@@ -771,11 +883,13 @@ export class LocalUserMirrorSender {
       return { classification: "unavailable", reservationId: key, attempted: false, fallbackSafe: true };
     }
     const returnedGuid = messageGuid(result);
+    if (isClientGuidDelivery(entry) && returnedGuid !== entry.guid) {
+      return this.#unresolvedPart(key, entry);
+    }
     if (returnedGuid) {
-      // Register the bridge-created identity before the slower local-history
-      // proof. This closes the receiver race without accepting the delivery:
-      // exact GUID + exact Reply root can suppress the echo immediately, while
-      // the sender still remains fail-closed until reconciliation below.
+      // Legacy clean sends learn the bridge identity here. Client-GUID sends
+      // already registered their persisted identity before dispatch. Neither
+      // path accepts delivery until exact local-history proof below.
       entry.guid = returnedGuid;
       this.#saveDelivery(key, entry);
       this.router.confirmUserMirrorEcho(key, returnedGuid, { verified: false });

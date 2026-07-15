@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import test from "node:test";
 import { mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import os from "node:os";
@@ -14,6 +15,56 @@ const USER_IDENTITY = "owner@example.com";
 const CHAT_GUID = "iMessage;-;service@example.com";
 const THREAD_ID = "019f57fb-9c0c-7950-935f-597a4e236897";
 const ROOT_GUID = "ROOT-GUID-A";
+
+function testClientGuid(index) {
+  return `00000000-0000-4000-8000-${String(index).padStart(12, "0")}`;
+}
+
+function mirrorBodyHash(body) {
+  return createHash("sha256").update(`local-user-mirror-body-v1\0${body}`).digest("hex");
+}
+
+// Relevant normalization from the deployed e456 mirror reader. Keeping this
+// compatibility reader in the regression proves the current journal survives
+// an actual old-reader parse instead of merely asserting a field name.
+function e456ReadableDelivery(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const wireMode = value.wireMode === "plain"
+    ? "plain"
+    : value.wireMode === undefined || value.wireMode === "tagged"
+      ? "tagged"
+      : null;
+  if (!/^[a-f0-9]{64}$/u.test(String(value.reservationId || ""))
+    || !String(value.threadId || "").trim()
+    || !/^[a-f0-9]{64}$/u.test(String(value.bodyHash || "").toLowerCase())
+    || !/^codex-mirror-[a-f0-9]{32}$/u.test(String(value.token || ""))
+    || !String(value.rootGuid || "").trim()
+    || !wireMode
+    || !["prepared", "attempting", "accepted", "ambiguous", "dead-letter"].includes(String(value.status || "").trim())
+    || !Number.isFinite(Date.parse(String(value.preparedAt || "")))) return null;
+  return {
+    reservationId: String(value.reservationId).trim(),
+    threadId: String(value.threadId).trim(),
+    bodyHash: String(value.bodyHash).trim().toLowerCase(),
+    token: String(value.token).trim(),
+    wireMode,
+    rootGuid: String(value.rootGuid).trim(),
+    status: String(value.status).trim(),
+    preparedAt: String(value.preparedAt).trim(),
+    attemptedAt: Number.isFinite(Date.parse(String(value.attemptedAt || ""))) ? value.attemptedAt : null,
+    acceptedAt: Number.isFinite(Date.parse(String(value.acceptedAt || ""))) ? value.acceptedAt : null,
+    deadLetteredAt: Number.isFinite(Date.parse(String(value.deadLetteredAt || ""))) ? value.deadLetteredAt : null,
+    guid: String(value.guid || "").trim() || null,
+  };
+}
+
+// Exact wire-body selection used by the deployed e456 sender after its fixed
+// journal normalizer has stripped fields it does not know.
+function e456WireText(entry, body) {
+  return entry?.wireMode === "tagged"
+    ? localUserMirrorInternals.taggedText(body, entry.token)
+    : String(body);
+}
 
 function jsonLines(values) {
   return `${(Array.isArray(values) ? values : [values]).map((value) => JSON.stringify(value)).join("\n")}\n`;
@@ -64,11 +115,13 @@ function fakeImsg(options = {}) {
   let historyCalls = 0;
   let searchCalls = 0;
   let clientStopCalls = 0;
+  let clientGuidSequence = 0;
   const sentRows = [];
   const status = options.status || {
     advanced_features: true,
     v2_ready: true,
-    rpc_methods: ["send.rich"],
+    selectors: { clientMessageGuid: true },
+    rpc_methods: ["send.rich", "send.rich.client-guid"],
   };
   const account = options.account || { account_login: USER_IDENTITY };
   const chats = options.chats || [directChat()];
@@ -111,7 +164,7 @@ function fakeImsg(options = {}) {
       richCalls.push(call);
       const result = await (options.onSendRich
         ? options.onSendRich({ params, call, sendSequence })
-        : { ok: true, guid: `MIRROR-GUID-${sendSequence}` });
+        : { ok: true, guid: params.client_guid });
       const guid = result?.guid ?? result?.message_guid ?? result?.messageGuid;
       if (guid && options.persistSentRows !== false) {
         const override = typeof options.sentRow === "function"
@@ -148,6 +201,7 @@ function fakeImsg(options = {}) {
     get historyCalls() { return historyCalls; },
     get searchCalls() { return searchCalls; },
     get clientStopCalls() { return clientStopCalls; },
+    clientGuidFactory: () => testClientGuid(++clientGuidSequence),
     sendCalls() { return richCalls; },
   };
 }
@@ -166,6 +220,7 @@ function createSender({
     router,
     execFileImpl: fake.execFileImpl,
     imsgClientFactory: fake.imsgClientFactory,
+    clientGuidFactory: fake.clientGuidFactory,
     binaryCandidates: ["/test/bin/imsg"],
     allowUnsafeTestBinary: true,
     now: clock.now,
@@ -248,6 +303,26 @@ test("pins only a root-proven direct external iMessage chat and rejects unrelate
       assert.equal(item.fake.sendCalls().length, 0);
     });
   }
+});
+
+test("a newer helper cannot authorize user mirrors through a legacy RPC binary", async () => {
+  const fake = fakeImsg({
+    status: {
+      advanced_features: true,
+      v2_ready: true,
+      selectors: { clientMessageGuid: true },
+      rpc_methods: ["send.rich"],
+    },
+  });
+  const item = fixture({ fake });
+  const status = await initialize(item.sender);
+  assert.equal(status.available, false);
+  assert.equal(status.status, "ACTIVATION_REQUIRED");
+  const result = await item.sender.sendMirror(mirror());
+  assert.equal(result.classification, "unavailable");
+  assert.equal(result.attempted, false);
+  assert.equal(fake.sendCalls().length, 0,
+    "the legacy send.rich surface must never receive a caller-owned GUID");
 });
 
 test("canonicalizes the expected local sender alias and fails closed on account or chat-sender mismatch", async (t) => {
@@ -370,6 +445,149 @@ test("discovers a synced header root and sends one clean formatted outgoing repl
   assert.equal(persisted.includes(body), false);
   assert.equal(persisted.includes("/Users/alex/project/app.js:12"), false);
   assert.equal(Object.values(JSON.parse(persisted).deliveries)[0].wireMode, "plain");
+  assert.equal(Object.values(JSON.parse(persisted).deliveries)[0].clientGuidMode, true);
+  assert.equal(send.params.client_guid, testClientGuid(1));
+  const reservation = JSON.parse(readFileSync(item.routerFile, "utf8")).userMirrorEchoes[0];
+  assert.equal(reservation.markerEvidence, false,
+    "a current client-GUID reservation must not retain hidden Unicode evidence");
+});
+
+test("every client-GUID journal status remains readable and at-most-once identifiable to the deployed sender", async () => {
+  const body = "Rollback-compatible clean mirror";
+  const deliveryId = "rollback-compatible-client-guid";
+  const token = localUserMirrorInternals.markerToken(deliveryId, THREAD_ID, 0);
+  const fake = fakeImsg();
+  const item = fixture({ fake });
+  await initialize(item.sender);
+  assert.equal((await item.sender.sendMirror(mirror({ deliveryId, body }))).classification, "accepted");
+  const persisted = Object.values(JSON.parse(readFileSync(item.senderFile, "utf8")).deliveries)[0];
+  assert.equal(persisted.wireMode, "plain");
+  assert.equal(persisted.clientGuidMode, true);
+  assert.equal(persisted.guid, testClientGuid(1));
+
+  for (const status of ["prepared", "attempting", "ambiguous", "accepted", "dead-letter"]) {
+    const candidate = {
+      ...persisted,
+      status,
+      attemptedAt: status === "prepared" ? null : "2026-07-14T12:00:00.000Z",
+      acceptedAt: status === "accepted" ? "2026-07-14T12:00:01.000Z" : null,
+      deadLetteredAt: status === "dead-letter" ? "2026-07-14T12:15:00.000Z" : null,
+    };
+    const rollback = e456ReadableDelivery(candidate);
+    assert.ok(rollback, `${status} must survive the deployed reader`);
+    assert.equal(rollback.status, status);
+    assert.equal(rollback.guid, testClientGuid(1), `${status} retains its at-most-once identity`);
+    assert.equal(rollback.wireMode, "plain");
+    if (status === "prepared") {
+      const rollbackWireText = e456WireText(rollback, body);
+      assert.equal(rollbackWireText, body,
+        "the deployed prepared path must send the same clean body");
+      assert.equal(localUserMirrorInternals.containsMarker(rollbackWireText, token), false);
+      assert.equal([...rollbackWireText].some((character) => {
+        const code = character.codePointAt(0);
+        return code >= 0xe0000 && code <= 0xe007f;
+      }), false, "the deployed prepared path must contain no Tags-block characters");
+    }
+  }
+  assert.equal(fake.sendCalls()[0].params.text, body,
+    "the current sender must not put the rollback compatibility marker on the wire");
+  assert.equal(localUserMirrorInternals.containsMarker(fake.sendCalls()[0].params.text, token), false);
+});
+
+test("a deployed sender can safely take over the exact prepared-reservation rollback window", async () => {
+  const body = "Crash before the no-resend boundary";
+  const deliveryId = "rollback-prepared-reservation";
+  const key = localUserMirrorInternals.deliveryKey(deliveryId, THREAD_ID, 0);
+  const token = localUserMirrorInternals.markerToken(deliveryId, THREAD_ID, 0);
+  const fake = fakeImsg();
+  const item = fixture({ fake });
+  await initialize(item.sender);
+
+  const reserveUserMirrorEcho = item.router.reserveUserMirrorEcho.bind(item.router);
+  let interruptAfterReservation = true;
+  item.router.reserveUserMirrorEcho = (reservation) => {
+    const result = reserveUserMirrorEcho(reservation);
+    if (interruptAfterReservation) {
+      interruptAfterReservation = false;
+      throw Object.assign(new Error("simulated process loss after durable reservation"), {
+        code: "TEST_PROCESS_LOSS",
+      });
+    }
+    return result;
+  };
+  await assert.rejects(
+    item.sender.sendMirror(mirror({ deliveryId, body })),
+    { code: "TEST_PROCESS_LOSS" },
+  );
+  assert.equal(fake.sendCalls().length, 0, "the current bridge was never called");
+
+  const journal = JSON.parse(readFileSync(item.senderFile, "utf8"));
+  const currentEntry = journal.deliveries[key];
+  const rollbackEntry = e456ReadableDelivery(currentEntry);
+  assert.ok(rollbackEntry, "the deployed reader retains the prepared entry");
+  assert.equal(rollbackEntry.status, "prepared");
+  assert.equal("clientGuidMode" in rollbackEntry, false,
+    "the deployed normalizer strips the additive discriminator");
+
+  const durableReservation = JSON.parse(readFileSync(item.routerFile, "utf8"))
+    .userMirrorEchoes.find((echo) => echo.reservationId === key);
+  assert.ok(durableReservation);
+  assert.equal(durableReservation.expectedGuid, null,
+    "prepared rollback state has not crossed the GUID-confirmation boundary");
+  assert.equal(durableReservation.markerEvidence, false);
+
+  // Simulate e456's complete prepared-send sequence against the durable
+  // router file: idempotently reserve its clean body, accept the bridge GUID,
+  // then consume the receiver-side echo by exact GUID + exact Reply root.
+  const rollbackRouter = new LocalConversationRouter({ stateFile: item.routerFile, now: item.clock.now });
+  const rollbackWireText = e456WireText(rollbackEntry, body);
+  assert.equal(rollbackWireText, body);
+  assert.equal(localUserMirrorInternals.containsMarker(rollbackWireText, token), false);
+  assert.equal(rollbackRouter.reserveUserMirrorEcho({
+    reservationId: rollbackEntry.reservationId,
+    threadId: rollbackEntry.threadId,
+    text: rollbackWireText,
+    rootGuid: rollbackEntry.rootGuid,
+  }), key);
+  const rollbackBridgeGuid = "E456-BRIDGE-GUID";
+  assert.equal(rollbackRouter.confirmUserMirrorEcho(key, rollbackBridgeGuid), true);
+  const consumed = rollbackRouter.consumeUserMirrorEcho({
+    id: 4_560,
+    guid: rollbackBridgeGuid,
+    text: rollbackWireText,
+    created_at: "2026-07-14T12:00:01.000Z",
+    thread_originator_guid: ROOT_GUID,
+  });
+  assert.equal(consumed.reservationId, key);
+  assert.equal(consumed.threadId, THREAD_ID);
+  assert.equal(consumed.expectedGuid, rollbackBridgeGuid);
+  assert.equal(rollbackRouter.userMirrorEchoReceipt(key).guid, rollbackBridgeGuid);
+  assert.deepEqual(rollbackRouter.pendingActions(), []);
+
+  // Complete the e456 journal write, then upgrade again. The current reader
+  // must honor the accepted legacy GUID and never emit a second mirror.
+  journal.deliveries[key] = {
+    ...rollbackEntry,
+    status: "accepted",
+    attemptedAt: "2026-07-14T12:00:00.500Z",
+    acceptedAt: "2026-07-14T12:00:01.000Z",
+    guid: rollbackBridgeGuid,
+  };
+  writeFileSync(item.senderFile, `${JSON.stringify(journal, null, 2)}\n`, { mode: 0o600 });
+  const resumedFake = fakeImsg();
+  const resumed = createSender({
+    stateFile: item.senderFile,
+    router: rollbackRouter,
+    fake: resumedFake,
+    clock: item.clock,
+    reconcileTimeoutMs: 1,
+  });
+  await initialize(resumed);
+  const duplicate = await resumed.sendMirror(mirror({ deliveryId, body }));
+  assert.equal(duplicate.classification, "duplicate");
+  assert.deepEqual(duplicate.guids, [rollbackBridgeGuid]);
+  assert.equal(resumedFake.sendCalls().length, 0,
+    "upgrade after the deployed clean send must not mirror twice");
 });
 
 test("never substitutes a different locally visible root for the expected task root", async () => {
@@ -397,7 +615,7 @@ test("accepted sends are delivery-idempotent across sender and router restart", 
   await initialize(item.sender);
   const first = await item.sender.sendMirror(mirror());
   assert.equal(first.classification, "accepted");
-  assert.deepEqual(first.guids, ["MIRROR-GUID-1"]);
+  assert.deepEqual(first.guids, [testClientGuid(1)]);
   assert.equal(fake.sendCalls().length, 1);
 
   const resumedRouter = new LocalConversationRouter({ stateFile: item.routerFile, now: item.clock.now });
@@ -412,9 +630,9 @@ test("accepted sends are delivery-idempotent across sender and router restart", 
   await initialize(resumed);
   const duplicate = await resumed.sendMirror(mirror());
   assert.equal(duplicate.classification, "duplicate");
-  assert.deepEqual(duplicate.guids, ["MIRROR-GUID-1"]);
+  assert.deepEqual(duplicate.guids, [testClientGuid(1)]);
   assert.equal(fake.sendCalls().length, 1);
-  assert.equal(resumedRouter.nativeThread(THREAD_ID).latestGuid, "MIRROR-GUID-1");
+  assert.equal(resumedRouter.nativeThread(THREAD_ID).latestGuid, testClientGuid(1));
 });
 
 test("a durable receiver receipt prevents stale reservation repair after seen-GUID eviction", async () => {
@@ -426,16 +644,16 @@ test("a durable receiver receipt prevents stale reservation repair after seen-GU
   const reservationId = localUserMirrorInternals.deliveryKey("delivery-one", THREAD_ID, 0);
   assert.equal(item.router.consumeUserMirrorEcho({
     id: 650,
-    guid: "MIRROR-GUID-1",
+    guid: testClientGuid(1),
     text: tagged,
     created_at: "2026-07-14T12:00:01.000Z",
     thread_originator_guid: ROOT_GUID,
   }).reservationId, reservationId);
-  assert.equal(item.router.userMirrorEchoReceipt(reservationId).guid, "MIRROR-GUID-1");
+  assert.equal(item.router.userMirrorEchoReceipt(reservationId).guid, testClientGuid(1));
   for (let index = 0; index < 513; index += 1) {
     item.router.discard({ id: 700 + index, guid: `eviction-${index}`, text: "ignored" });
   }
-  assert.equal(item.router.hasSeenMessageGuid("MIRROR-GUID-1"), false);
+  assert.equal(item.router.hasSeenMessageGuid(testClientGuid(1)), false);
 
   const resumedRouter = new LocalConversationRouter({ stateFile: item.routerFile, now: item.clock.now });
   const resumed = createSender({
@@ -449,7 +667,7 @@ test("a durable receiver receipt prevents stale reservation repair after seen-GU
   assert.equal(fake.sendCalls().length, 1);
   assert.equal(resumedRouter.isReservedUserMirrorEcho({
     id: 1_300,
-    guid: "MIRROR-GUID-1",
+    guid: testClientGuid(1),
     text: tagged,
     thread_originator_guid: ROOT_GUID,
   }), false, "the receipt is durable proof that the already-consumed guard must not be recreated");
@@ -485,7 +703,7 @@ test("an accepted sender journal repairs a fresh router ledger and GUID route wi
   const duplicate = await resumed.sendMirror(mirror());
   assert.equal(duplicate.classification, "duplicate");
   assert.equal(fake.sendCalls().length, 1);
-  assert.equal(repairRouter.nativeThread(THREAD_ID).latestGuid, "MIRROR-GUID-1");
+  assert.equal(repairRouter.nativeThread(THREAD_ID).latestGuid, testClientGuid(1));
   assert.equal(repairRouter.consumeUserMirrorEcho({
     id: 700,
     guid: "WRONG-GUID",
@@ -494,10 +712,10 @@ test("an accepted sender journal repairs a fresh router ledger and GUID route wi
   }), null);
   assert.equal(repairRouter.consumeUserMirrorEcho({
     id: 701,
-    guid: "MIRROR-GUID-1",
+    guid: testClientGuid(1),
     text: plain,
     thread_originator_guid: ROOT_GUID,
-  }).expectedGuid, "MIRROR-GUID-1");
+  }).expectedGuid, testClientGuid(1));
 });
 
 test("changing conversation scope clears the pinned chat and accepted delivery journal", async () => {
@@ -536,7 +754,7 @@ test("a genuine same-body message remains actionable while only the exact mirror
   const fake = fakeImsg({
     onSendRich: ({ params }) => {
       mirrorText = params.text;
-      return { ok: true, guid: "MIRROR-GUID" };
+      return { ok: true, guid: params.client_guid };
     },
   });
   const item = fixture({ fake });
@@ -558,62 +776,56 @@ test("a genuine same-body message remains actionable while only the exact mirror
 
   const echo = item.router.consumeUserMirrorEcho({
     id: 502,
-    guid: "MIRROR-GUID",
+    guid: testClientGuid(1),
     text: mirrorText,
     created_at: "2026-07-14T12:00:02.000Z",
     thread_originator_guid: ROOT_GUID,
   });
   assert.equal(echo.threadId, THREAD_ID);
-  assert.equal(echo.guid, "MIRROR-GUID");
+  assert.equal(echo.guid, testClientGuid(1));
   assert.equal(item.router.lastRowId, 502);
-  assert.equal(item.router.nativeThread(THREAD_ID).latestGuid, "MIRROR-GUID");
+  assert.equal(item.router.nativeThread(THREAD_ID).latestGuid, testClientGuid(1));
 });
 
-test("registers a clean send GUID before local verification and exact-GUID suppression wins the race", async () => {
+test("registers the caller-owned GUID before dispatch so an immediate echo cannot become a prompt", async () => {
   let item;
   let candidate;
-  let sendReturned = false;
-  let observedBeforeVerification = false;
   const fake = fakeImsg({
-    history: () => {
-      if (sendReturned && !observedBeforeVerification) {
-        assert.equal(item.router.nativeThread(THREAD_ID).latestGuid, ROOT_GUID,
-          "a best-effort bridge GUID must not become a durable route before proof");
-        const state = JSON.parse(readFileSync(item.routerFile, "utf8"));
-        assert.equal(state.userMirrorEchoes[0].guidVerified, false);
-        const consumed = item.router.consumeUserMirrorEcho(candidate);
-        assert.equal(consumed.threadId, THREAD_ID);
-        assert.equal(consumed.expectedGuid, "EARLY-ECHO-GUID");
-        observedBeforeVerification = true;
-      }
-      return [rootRow()];
-    },
     onSendRich: ({ params }) => {
       candidate = {
         id: 601,
-        guid: "EARLY-ECHO-GUID",
+        guid: params.client_guid,
         text: params.text,
         created_at: "2026-07-14T12:00:01.000Z",
         thread_originator_guid: ROOT_GUID,
       };
-      assert.equal(item.router.consumeUserMirrorEcho(candidate), null);
-      assert.equal(item.router.isReservedUserMirrorEcho(candidate), false);
-      assert.equal(item.router.provisionalUserMirrorEcho(candidate).threadId, THREAD_ID);
-      sendReturned = true;
-      return { ok: true, guid: "EARLY-ECHO-GUID" };
+      const consumed = item.router.consumeUserMirrorEcho(candidate);
+      assert.equal(consumed.threadId, THREAD_ID);
+      assert.equal(consumed.expectedGuid, params.client_guid);
+      assert.equal(item.router.provisionalUserMirrorEcho(candidate), null);
+      return { ok: true, guid: params.client_guid };
     },
   });
   item = fixture({ fake });
   await initialize(item.sender);
+  const confirmUserMirrorEcho = item.router.confirmUserMirrorEcho.bind(item.router);
+  let statusAtFirstGuidConfirmation = null;
+  item.router.confirmUserMirrorEcho = (...args) => {
+    statusAtFirstGuidConfirmation ||= Object.values(
+      JSON.parse(readFileSync(item.senderFile, "utf8")).deliveries,
+    )[0]?.status || null;
+    return confirmUserMirrorEcho(...args);
+  };
   const result = await item.sender.sendMirror(mirror({ body: "Race the result" }));
   assert.equal(result.classification, "accepted");
-  assert.equal(observedBeforeVerification, true);
+  assert.equal(statusAtFirstGuidConfirmation, "attempting",
+    "the durable no-resend boundary must precede exact-GUID reservation");
   assert.equal(item.router.consumeUserMirrorEcho(candidate), null);
   assert.equal(item.router.lastRowId, 601);
   assert.deepEqual(item.router.pendingActions(), []);
 });
 
-test("a marker-normalized no-GUID response remains ambiguous and cannot promote a body-only candidate", async () => {
+test("a no-GUID response remains ambiguous while its exact caller-owned echo is still suppressed", async () => {
   let item;
   let delivered = false;
   const fake = fakeImsg({
@@ -622,7 +834,7 @@ test("a marker-normalized no-GUID response remains ambiguous and cannot promote 
         rootRow(),
         {
           id: 6_101,
-          guid: "NORMALIZED-NO-GUID",
+          guid: testClientGuid(1),
           chat_id: 42,
           chat_guid: CHAT_GUID,
           is_from_me: true,
@@ -635,12 +847,12 @@ test("a marker-normalized no-GUID response remains ambiguous and cannot promote 
     onSendRich: ({ params }) => {
       const candidate = {
         id: 6_102,
-        guid: "NORMALIZED-NO-GUID",
+        guid: params.client_guid,
         text: "Normalized before bridge result",
         created_at: "2026-07-14T12:00:01.000Z",
         thread_originator_guid: ROOT_GUID,
       };
-      assert.equal(item.router.provisionalUserMirrorEcho(candidate).threadId, THREAD_ID);
+      assert.equal(item.router.consumeUserMirrorEcho(candidate).threadId, THREAD_ID);
       delivered = true;
       assert.equal(localUserMirrorInternals.containsMarker(params.text,
         localUserMirrorInternals.markerToken("normalized-no-guid", THREAD_ID, 0)), false);
@@ -657,7 +869,7 @@ test("a marker-normalized no-GUID response remains ambiguous and cannot promote 
   assert.deepEqual(result.guids, []);
   assert.equal(item.router.userMirrorEchoReceipt(
     localUserMirrorInternals.deliveryKey("normalized-no-guid", THREAD_ID, 0),
-  ), null);
+  ).guid, testClientGuid(1));
   assert.deepEqual(item.router.pendingActions(), []);
   assert.equal(fake.sendCalls().length, 1);
 });
@@ -773,6 +985,8 @@ test("a pre-upgrade tagged journal still reconciles without resending", async ()
   const journal = JSON.parse(readFileSync(item.senderFile, "utf8"));
   const [key] = Object.keys(journal.deliveries);
   delete journal.deliveries[key].wireMode;
+  delete journal.deliveries[key].clientGuidMode;
+  journal.deliveries[key].guid = null;
   journal.deliveries[key].status = "attempting";
   writeFileSync(item.senderFile, `${JSON.stringify(journal, null, 2)}\n`, { mode: 0o600 });
   legacyCommitted = true;
@@ -802,7 +1016,269 @@ test("a pre-upgrade tagged journal still reconciles without resending", async ()
   assert.equal(fake.sendCalls().length, 1);
 });
 
-test("an unverified accepted GUID is later reconciled by exact GUID, body, and root", async () => {
+test("a definitively-unsent legacy prepared journal is upgraded to a clean persisted client GUID", async () => {
+  const body = "Legacy prepared mirror";
+  const deliveryId = "legacy-prepared-journal";
+  const key = localUserMirrorInternals.deliveryKey(deliveryId, THREAD_ID, 0);
+  const token = localUserMirrorInternals.markerToken(deliveryId, THREAD_ID, 0);
+  const tagged = localUserMirrorInternals.taggedText(body, token);
+  const fake = fakeImsg();
+  const item = fixture({ fake });
+  await initialize(item.sender);
+
+  const state = JSON.parse(readFileSync(item.senderFile, "utf8"));
+  state.deliveries[key] = {
+    reservationId: key,
+    threadId: THREAD_ID,
+    bodyHash: mirrorBodyHash(body),
+    token,
+    // Missing wireMode is the pre-upgrade tagged format.
+    rootGuid: ROOT_GUID,
+    status: "prepared",
+    preparedAt: "2026-07-14T12:00:00.000Z",
+    attemptedAt: null,
+    acceptedAt: null,
+    deadLetteredAt: null,
+    guid: null,
+  };
+  writeFileSync(item.senderFile, `${JSON.stringify(state, null, 2)}\n`, { mode: 0o600 });
+  // Simulate a crash after the old sender reserved its tagged body but before
+  // it persisted `attempting`. No bridge write can have happened yet.
+  item.router.reserveUserMirrorEcho({
+    reservationId: key,
+    threadId: THREAD_ID,
+    text: tagged,
+    rootGuid: ROOT_GUID,
+  });
+
+  const resumed = createSender({
+    stateFile: item.senderFile,
+    router: item.router,
+    fake,
+    clock: item.clock,
+    reconcileTimeoutMs: 1,
+  });
+  await initialize(resumed);
+  const result = await resumed.sendMirror(mirror({ deliveryId, body }));
+  assert.equal(result.classification, "accepted");
+  assert.deepEqual(result.guids, [testClientGuid(1)]);
+  assert.equal(fake.sendCalls().length, 1);
+  assert.equal(fake.sendCalls()[0].params.client_guid, testClientGuid(1));
+  assert.equal(fake.sendCalls()[0].params.text, body);
+  assert.equal(localUserMirrorInternals.containsMarker(fake.sendCalls()[0].params.text, token), false);
+
+  const migrated = JSON.parse(readFileSync(item.senderFile, "utf8")).deliveries[key];
+  assert.equal(migrated.wireMode, "plain");
+  assert.equal(migrated.clientGuidMode, true);
+  assert.equal(migrated.guid, testClientGuid(1));
+  assert.equal(migrated.status, "accepted");
+});
+
+test("a rollback rewrite after a definitely-unsent failure restores clean client-GUID mode", async () => {
+  const body = "Resume after rollback rejected the send";
+  const deliveryId = "rollback-definitely-unsent-rewrite";
+  const key = localUserMirrorInternals.deliveryKey(deliveryId, THREAD_ID, 0);
+  const originalFake = fakeImsg({
+    onSendRich: () => ({ classification: "unsupported", retrySafe: true }),
+  });
+  const item = fixture({ fake: originalFake });
+  await initialize(item.sender);
+  const unavailable = await item.sender.sendMirror(mirror({ deliveryId, body }));
+  assert.equal(unavailable.classification, "unavailable");
+  assert.equal(unavailable.attempted, false);
+
+  const state = JSON.parse(readFileSync(item.senderFile, "utf8"));
+  const assignedGuid = state.deliveries[key].guid;
+  assert.equal(assignedGuid, testClientGuid(1));
+  assert.equal(state.deliveries[key].status, "prepared");
+  assert.equal(state.deliveries[key].attemptedAt, null);
+  state.deliveries[key] = e456ReadableDelivery(state.deliveries[key]);
+  assert.equal("clientGuidMode" in state.deliveries[key], false,
+    "e456 rewrites only fields known to its fixed journal schema");
+  writeFileSync(item.senderFile, `${JSON.stringify(state, null, 2)}\n`, { mode: 0o600 });
+
+  let unexpectedGuidAllocations = 0;
+  const resumedFake = fakeImsg();
+  resumedFake.clientGuidFactory = () => {
+    unexpectedGuidAllocations += 1;
+    return testClientGuid(9);
+  };
+  const resumed = createSender({
+    stateFile: item.senderFile,
+    router: item.router,
+    fake: resumedFake,
+    clock: item.clock,
+    reconcileTimeoutMs: 1,
+  });
+  await initialize(resumed);
+  const accepted = await resumed.sendMirror(mirror({ deliveryId, body }));
+  assert.equal(accepted.classification, "accepted");
+  assert.equal(unexpectedGuidAllocations, 0,
+    "the canonical GUID surviving the rollback rewrite is reused");
+  assert.equal(resumedFake.sendCalls().length, 1);
+  assert.equal(resumedFake.sendCalls()[0].params.client_guid, assignedGuid);
+  assert.equal(resumedFake.sendCalls()[0].params.text, body);
+  const restored = JSON.parse(readFileSync(item.senderFile, "utf8")).deliveries[key];
+  assert.equal(restored.wireMode, "plain");
+  assert.equal(restored.clientGuidMode, true);
+  assert.equal(restored.guid, assignedGuid);
+  assert.equal(restored.status, "accepted");
+});
+
+test("a restart after migration persistence rebuilds the stale tagged reservation without allocating another GUID", async () => {
+  const body = "Resume an interrupted journal migration";
+  const deliveryId = "interrupted-legacy-migration";
+  const key = localUserMirrorInternals.deliveryKey(deliveryId, THREAD_ID, 0);
+  const token = localUserMirrorInternals.markerToken(deliveryId, THREAD_ID, 0);
+  const tagged = localUserMirrorInternals.taggedText(body, token);
+  const persistedGuid = "11111111-1111-4111-8111-111111111111";
+  const fake = fakeImsg();
+  const item = fixture({ fake });
+  await initialize(item.sender);
+
+  const state = JSON.parse(readFileSync(item.senderFile, "utf8"));
+  state.deliveries[key] = {
+    reservationId: key,
+    threadId: THREAD_ID,
+    bodyHash: mirrorBodyHash(body),
+    token,
+    wireMode: "client-guid",
+    rootGuid: ROOT_GUID,
+    status: "prepared",
+    preparedAt: "2026-07-14T12:00:00.000Z",
+    attemptedAt: null,
+    acceptedAt: null,
+    deadLetteredAt: null,
+    guid: persistedGuid,
+  };
+  writeFileSync(item.senderFile, `${JSON.stringify(state, null, 2)}\n`, { mode: 0o600 });
+  item.router.reserveUserMirrorEcho({
+    reservationId: key,
+    threadId: THREAD_ID,
+    text: tagged,
+    rootGuid: ROOT_GUID,
+  });
+
+  const resumed = createSender({
+    stateFile: item.senderFile,
+    router: item.router,
+    fake,
+    clock: item.clock,
+    reconcileTimeoutMs: 1,
+  });
+  await initialize(resumed);
+  const result = await resumed.sendMirror(mirror({ deliveryId, body }));
+  assert.equal(result.classification, "accepted");
+  assert.deepEqual(result.guids, [persistedGuid]);
+  assert.equal(fake.sendCalls().length, 1);
+  assert.equal(fake.sendCalls()[0].params.client_guid, persistedGuid,
+    "the post-crash resume must reuse the identity already committed to the journal");
+  assert.equal(fake.sendCalls()[0].params.text, body);
+  const normalized = JSON.parse(readFileSync(item.senderFile, "utf8")).deliveries[key];
+  assert.equal(normalized.wireMode, "plain");
+  assert.equal(normalized.clientGuidMode, true);
+});
+
+test("an earlier tagged client-GUID journal is normalized to plain before resume", async () => {
+  const body = "Resume an earlier tagged client-GUID entry";
+  const deliveryId = "earlier-tagged-client-guid";
+  const key = localUserMirrorInternals.deliveryKey(deliveryId, THREAD_ID, 0);
+  const token = localUserMirrorInternals.markerToken(deliveryId, THREAD_ID, 0);
+  const assignedGuid = "22222222-2222-4222-8222-222222222222";
+  const fake = fakeImsg();
+  const item = fixture({ fake });
+  await initialize(item.sender);
+
+  const state = JSON.parse(readFileSync(item.senderFile, "utf8"));
+  state.deliveries[key] = {
+    reservationId: key,
+    threadId: THREAD_ID,
+    bodyHash: mirrorBodyHash(body),
+    token,
+    wireMode: "tagged",
+    clientGuidMode: true,
+    rootGuid: ROOT_GUID,
+    status: "prepared",
+    preparedAt: "2026-07-14T12:00:00.000Z",
+    attemptedAt: null,
+    acceptedAt: null,
+    deadLetteredAt: null,
+    guid: assignedGuid,
+  };
+  writeFileSync(item.senderFile, `${JSON.stringify(state, null, 2)}\n`, { mode: 0o600 });
+  item.router.reserveUserMirrorEcho({
+    reservationId: key,
+    threadId: THREAD_ID,
+    text: localUserMirrorInternals.taggedText(body, token),
+    rootGuid: ROOT_GUID,
+  });
+
+  const resumed = createSender({
+    stateFile: item.senderFile,
+    router: item.router,
+    fake,
+    clock: item.clock,
+    reconcileTimeoutMs: 1,
+  });
+  await initialize(resumed);
+  const result = await resumed.sendMirror(mirror({ deliveryId, body }));
+  assert.equal(result.classification, "accepted");
+  assert.equal(fake.sendCalls().length, 1);
+  assert.equal(fake.sendCalls()[0].params.client_guid, assignedGuid);
+  assert.equal(fake.sendCalls()[0].params.text, body);
+  assert.equal(localUserMirrorInternals.containsMarker(fake.sendCalls()[0].params.text, token), false);
+
+  const normalized = JSON.parse(readFileSync(item.senderFile, "utf8")).deliveries[key];
+  assert.equal(normalized.wireMode, "plain",
+    "all client-GUID generations must converge to the no-Unicode envelope");
+  assert.equal(normalized.clientGuidMode, true);
+  const reservation = JSON.parse(readFileSync(item.routerFile, "utf8"))
+    .userMirrorEchoes.find((echo) => echo.reservationId === key);
+  assert.equal(reservation.markerEvidence, false,
+    "the stale tagged reservation must be rebuilt from the clean body");
+});
+
+test("legacy attempt evidence is never resent even when its stale journal status says prepared", async () => {
+  const body = "Possibly dispatched legacy mirror";
+  const deliveryId = "legacy-stale-prepared-status";
+  const key = localUserMirrorInternals.deliveryKey(deliveryId, THREAD_ID, 0);
+  const token = localUserMirrorInternals.markerToken(deliveryId, THREAD_ID, 0);
+  const fake = fakeImsg({ history: [rootRow()] });
+  const item = fixture({ fake, reconcileTimeoutMs: 1 });
+  await initialize(item.sender);
+
+  const state = JSON.parse(readFileSync(item.senderFile, "utf8"));
+  state.deliveries[key] = {
+    reservationId: key,
+    threadId: THREAD_ID,
+    bodyHash: mirrorBodyHash(body),
+    token,
+    wireMode: "plain",
+    rootGuid: ROOT_GUID,
+    status: "prepared",
+    preparedAt: "2026-07-14T11:59:59.000Z",
+    attemptedAt: "2026-07-14T12:00:00.000Z",
+    acceptedAt: null,
+    deadLetteredAt: null,
+    guid: null,
+  };
+  writeFileSync(item.senderFile, `${JSON.stringify(state, null, 2)}\n`, { mode: 0o600 });
+
+  const resumed = createSender({
+    stateFile: item.senderFile,
+    router: item.router,
+    fake,
+    clock: item.clock,
+    reconcileTimeoutMs: 1,
+  });
+  await initialize(resumed);
+  const result = await resumed.sendMirror(mirror({ deliveryId, body }));
+  assert.equal(result.classification, "ambiguous");
+  assert.equal(fake.sendCalls().length, 0, "attempt evidence forbids replay");
+  assert.equal(JSON.parse(readFileSync(item.senderFile, "utf8")).deliveries[key].status, "ambiguous");
+});
+
+test("a caller-owned GUID is later reconciled by exact GUID, body, and root", async () => {
   const firstFake = fakeImsg({
     sentRow: { thread_originator_guid: "WRONG-ROOT", reply_to_guid: "WRONG-ROOT" },
   });
@@ -812,14 +1288,14 @@ test("an unverified accepted GUID is later reconciled by exact GUID, body, and r
   assert.equal((await item.sender.sendMirror(request)).classification, "ambiguous");
   assert.equal(firstFake.sendCalls().length, 1);
   const journal = JSON.parse(readFileSync(item.senderFile, "utf8"));
-  assert.equal(Object.values(journal.deliveries)[0].guid, "MIRROR-GUID-1");
+  assert.equal(Object.values(journal.deliveries)[0].guid, testClientGuid(1));
 
   const secondFake = fakeImsg({
     history: [
       rootRow(),
       {
         id: 9_001,
-        guid: "MIRROR-GUID-1",
+        guid: testClientGuid(1),
         chat_id: 42,
         chat_guid: CHAT_GUID,
         is_from_me: true,
@@ -840,9 +1316,9 @@ test("an unverified accepted GUID is later reconciled by exact GUID, body, and r
   await initialize(resumed);
   const recovered = await resumed.sendMirror(request);
   assert.equal(recovered.classification, "duplicate");
-  assert.deepEqual(recovered.guids, ["MIRROR-GUID-1"]);
+  assert.deepEqual(recovered.guids, [testClientGuid(1)]);
   assert.equal(secondFake.sendCalls().length, 0);
-  assert.equal(resumedRouter.nativeThread(THREAD_ID).latestGuid, "MIRROR-GUID-1");
+  assert.equal(resumedRouter.nativeThread(THREAD_ID).latestGuid, testClientGuid(1));
 });
 
 test("a crash-bound attempting entry never resends and unresolved ambiguity dead-letters visibly after fifteen minutes", async () => {
@@ -887,13 +1363,13 @@ test("a crash-bound attempting entry never resends and unresolved ambiguity dead
 
   const late = {
     id: 77_001,
-    guid: "VERY-LATE-ECHO",
+    guid: testClientGuid(1),
     text: "Potentially committed once",
     created_at: "2026-07-14T12:00:01.000Z",
     thread_originator_guid: ROOT_GUID,
   };
-  assert.equal(resumedRouter.provisionalUserMirrorEcho(late)?.threadId, THREAD_ID,
-    "a late-observed row created inside the send window remains quarantined after dead-lettering");
+  assert.equal(resumedRouter.consumeUserMirrorEcho(late)?.threadId, THREAD_ID,
+    "the persisted caller-owned GUID suppresses a very late committed echo exactly");
   assert.equal(readFileSync(item.senderFile, "utf8").includes("Potentially committed once"), false);
 });
 
@@ -942,9 +1418,9 @@ test("long Unicode mirrors use bounded clean native multipart replies", async ()
 
 test("multipart delivery continues after one part becomes ambiguous and never retries that part blindly", async () => {
   const fake = fakeImsg({
-    onSendRich: ({ sendSequence }) => {
+    onSendRich: ({ sendSequence, params }) => {
       if (sendSequence === 1) throw Object.assign(new Error("connection closed after write"), { attempted: true });
-      return { ok: true, guid: `MIRROR-GUID-${sendSequence}` };
+      return { ok: true, guid: params.client_guid };
     },
   });
   const item = fixture({ fake, reconcileTimeoutMs: 1 });
@@ -954,7 +1430,7 @@ test("multipart delivery continues after one part becomes ambiguous and never re
   const result = await item.sender.sendMirror(request);
   assert.equal(result.classification, "ambiguous");
   assert.equal(result.parts, 3);
-  assert.deepEqual(result.guids, ["MIRROR-GUID-2", "MIRROR-GUID-3"]);
+  assert.deepEqual(result.guids, [testClientGuid(2), testClientGuid(3)]);
   assert.equal(fake.sendCalls().length, 3);
   assert.deepEqual(fake.sendCalls().map((call) => call.params.text.match(/^\((\d+)\/(\d+)\)/u)?.slice(1)), [
     ["1", "3"],
@@ -964,6 +1440,6 @@ test("multipart delivery continues after one part becomes ambiguous and never re
 
   const retried = await item.sender.sendMirror(request);
   assert.equal(retried.classification, "ambiguous");
-  assert.deepEqual(retried.guids, ["MIRROR-GUID-2", "MIRROR-GUID-3"]);
+  assert.deepEqual(retried.guids, [testClientGuid(2), testClientGuid(3)]);
   assert.equal(fake.sendCalls().length, 3);
 });

@@ -3,8 +3,17 @@ import { createHash } from "node:crypto";
 import { writePrivateJson } from "./config.mjs";
 import { servicePaths } from "./paths.mjs";
 
+const ADMISSION_ORDER_COMPATIBILITY = 1;
+
 function emptyStore() {
-  return { version: 3, nextAdmissionOrder: 1, jobs: Object.create(null) };
+  // Keep the durable envelope at v2 so the previously active deployment can
+  // read it during a transactional rollback. Admission ordering is additive.
+  return {
+    version: 2,
+    admissionOrderCompatibility: ADMISSION_ORDER_COMPATIBILITY,
+    nextAdmissionOrder: 1,
+    jobs: Object.create(null),
+  };
 }
 
 function validAdmissionOrder(value) {
@@ -12,18 +21,23 @@ function validAdmissionOrder(value) {
   return Number.isSafeInteger(order) && order > 0 ? order : null;
 }
 
-function upgradeLegacyStore(value) {
+function materializeAdmissionOrder(value) {
   let admissionOrder = 1;
   const jobs = Object.create(null);
   // Object property order is the durable insertion order used by the v1/v2
   // store. Materialize it once so equal Messages timestamps remain ordered
   // after every subsequent restart.
   for (const [id, job] of Object.entries(value.jobs)) {
-    jobs[id] = job && typeof job === "object"
+    jobs[id] = job && typeof job === "object" && !Array.isArray(job)
       ? { ...job, admissionOrder: admissionOrder++ }
       : job;
   }
-  return { version: 3, nextAdmissionOrder: admissionOrder, jobs };
+  return {
+    version: 2,
+    admissionOrderCompatibility: ADMISSION_ORDER_COMPATIBILITY,
+    nextAdmissionOrder: admissionOrder,
+    jobs,
+  };
 }
 
 function readStore() {
@@ -44,23 +58,46 @@ function readStore() {
   ) {
     throw Object.assign(new Error("Claimed-run state has an unsupported format."), { code: "INVALID_RUN_STATE" });
   }
-  // Older versions relied on timestamps (and, accidentally, object order) for
-  // FIFO decisions. Normalize that insertion order in memory so read-only
-  // commands remain side-effect free; the next intentional update persists it.
-  if (value.version < 3) return upgradeLegacyStore(value);
+  // Older v2 files and all v1 files lack admission metadata. Materialize their
+  // durable insertion order in memory; the next intentional update persists
+  // it without changing the rollback-readable v2 envelope.
   const orders = Object.values(value.jobs).map((job) => validAdmissionOrder(job?.admissionOrder));
   const uniqueOrders = new Set(orders.filter(Boolean));
   const nextAdmissionOrder = validAdmissionOrder(value.nextAdmissionOrder);
   const maximumOrder = orders.length ? Math.max(0, ...orders.filter(Boolean)) : 0;
-  if (
-    orders.some((order) => order === null)
-    || uniqueOrders.size !== orders.length
-    || !nextAdmissionOrder
-    || nextAdmissionOrder <= maximumOrder
-  ) {
+  const compatibilityMarker = Number(value.admissionOrderCompatibility) === ADMISSION_ORDER_COMPATIBILITY;
+  const hasAdmissionMetadata = Object.hasOwn(value, "nextAdmissionOrder")
+    || orders.some((order) => order !== null);
+  const validOrderState = !orders.some((order) => order === null)
+    && uniqueOrders.size === orders.length
+    && nextAdmissionOrder
+    && nextAdmissionOrder > maximumOrder;
+  // Version 3 was written by the immediately preceding unreleased build.
+  // Validate its strict ordering metadata, but normalize it in memory to the
+  // rollback-readable v2 envelope for the next intentional state update.
+  if (value.version === 3) {
+    if (!validOrderState) {
+      throw Object.assign(new Error("Claimed-run state has an invalid admission order."), { code: "INVALID_RUN_STATE" });
+    }
+    return {
+      ...value,
+      version: 2,
+      admissionOrderCompatibility: ADMISSION_ORDER_COMPATIBILITY,
+    };
+  }
+  if (value.version === 1 || !hasAdmissionMetadata) return materializeAdmissionOrder(value);
+  // The deployed v2 writer preserves unknown top-level keys but reconstructs
+  // any job it touches. The compatibility marker therefore distinguishes a
+  // legitimate downgrade round-trip (some per-job orders disappeared) from a
+  // markerless partially edited/corrupt file. Object order is exactly the
+  // durable ordering the deployed writer retained and appended to.
+  if (compatibilityMarker && !validOrderState) return materializeAdmissionOrder(value);
+  if (!validOrderState) {
     throw Object.assign(new Error("Claimed-run state has an invalid admission order."), { code: "INVALID_RUN_STATE" });
   }
-  return value;
+  return compatibilityMarker
+    ? value
+    : { ...value, admissionOrderCompatibility: ADMISSION_ORDER_COMPATIBILITY };
 }
 
 function writeStore(store) {

@@ -1,0 +1,1208 @@
+diff --git a/Sources/IMsgCore/IMsgBridgeProtocol.swift b/Sources/IMsgCore/IMsgBridgeProtocol.swift
+index adedaf2..f8c6140 100644
+--- a/Sources/IMsgCore/IMsgBridgeProtocol.swift
++++ b/Sources/IMsgCore/IMsgBridgeProtocol.swift
+@@ -31,7 +31,8 @@ public enum IMsgBridgeProtocol {
+ 
+   public static func defaultResponseTimeout(for action: BridgeAction) -> TimeInterval {
+     switch action {
+-    case .sendMessage, .sendRichLink, .sendMultipart, .sendAttachment, .sendSticker, .sendPoll,
++    case .sendMessage, .sendMessageWithGUID, .sendRichLink, .sendMultipart, .sendAttachment,
++      .sendSticker, .sendPoll,
+       .sendPollVote, .sendPollUnvote, .sendReaction, .createChat, .shareNickname:
+       return defaultSendResponseTimeout
+     default:
+@@ -62,6 +63,10 @@ public enum BridgeAction: String, Sendable, CaseIterable {
+ 
+   // Send
+   case sendMessage = "send-message"
++  // Downgrade-safe send used when the caller must own the message identity.
++  // Older injected helpers reject this verb instead of silently ignoring the
++  // requested GUID and sending an uncorrelatable message.
++  case sendMessageWithGUID = "send-message-with-guid"
+   case sendRichLink = "send-rich-link"
+   case sendMultipart = "send-multipart"
+   case sendAttachment = "send-attachment"
+diff --git a/Sources/IMsgCore/MessageStore+SentMessages.swift b/Sources/IMsgCore/MessageStore+SentMessages.swift
+index e0cacde..91243c7 100644
+--- a/Sources/IMsgCore/MessageStore+SentMessages.swift
++++ b/Sources/IMsgCore/MessageStore+SentMessages.swift
+@@ -2,6 +2,61 @@ import Foundation
+ import SQLite
+ 
+ extension MessageStore {
++  public func messageExists(guid: String) throws -> Bool {
++    let value = guid.trimmingCharacters(in: .whitespacesAndNewlines)
++    guard !value.isEmpty else { return false }
++    return try withConnection { db in
++      let rows = try db.prepareRowIterator(
++        "SELECT 1 AS present FROM message WHERE guid = ? LIMIT 1",
++        bindings: [value]
++      )
++      return try rows.failableNext() != nil
++    }
++  }
++
++  public func messageMatchesCallerOwnedSend(
++    guid: String,
++    text: String,
++    chatID: Int64,
++    threadOriginatorGUID: String?
++  ) throws -> Bool {
++    let expectedGUID = guid.trimmingCharacters(in: .whitespacesAndNewlines)
++    guard !expectedGUID.isEmpty, chatID > 0,
++      schema.hasThreadOriginatorGUIDColumn
++    else {
++      return false
++    }
++
++    let selection = MessageRowSelection(store: self, includeChatID: true)
++    let sql = """
++      SELECT \(selection.selectList)
++      FROM message m
++      JOIN chat_message_join cmj ON m.ROWID = cmj.message_id
++      LEFT JOIN handle h ON m.handle_id = h.ROWID
++      WHERE m.guid = ?
++        AND cmj.chat_id = ?
++        AND m.is_from_me = 1
++      LIMIT 1
++      """
++    return try withConnection { db in
++      let rows = try db.prepareRowIterator(sql, bindings: [expectedGUID, chatID])
++      guard let row = try rows.failableNext() else { return false }
++      let decoded = try decodeMessageRow(
++        row,
++        columns: selection.columns,
++        fallbackChatID: chatID
++      )
++      let expectedRoot = normalizeAssociatedGUID(
++        threadOriginatorGUID?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
++      )
++      let actualRoot = normalizeAssociatedGUID(decoded.threadOriginatorGUID)
++      return decoded.chatID == chatID
++        && decoded.isFromMe
++        && decoded.text == text
++        && actualRoot == expectedRoot
++    }
++  }
++
+   public func chatInfo(
+     matchingExactTarget target: String,
+     preferredServices: [String] = []
+diff --git a/Sources/IMsgHelper/IMsgInjected.m b/Sources/IMsgHelper/IMsgInjected.m
+index a7ae796..1a0e82f 100644
+--- a/Sources/IMsgHelper/IMsgInjected.m
++++ b/Sources/IMsgHelper/IMsgInjected.m
+@@ -301,11 +301,13 @@ static BOOL ensureSecureDirectory(NSString *path, NSError **error) {
+ static BOOL gHasRetractMessagePart = NO;         // retractMessagePart:
+ static BOOL gHasSendMessageReason = NO;          // sendMessage:reason:
+ static BOOL gHasCustomEmojiReaction = NO;        // instantMessageWithAssociatedMessageContent:...associatedMessageEmoji:...
++static BOOL gHasClientMessageGUIDReplyConstructor = NO; // reply type 100 + caller-owned guid
+ 
+ static BOOL pollPayloadMessageInitializerAvailable(void);
+ static BOOL pollVoteMessageInitializerAvailable(void);
+ static NSDictionary *nicknameSharingSelectorStatus(void);
+ static BOOL urlPreviewMessageInitializerAvailable(void);
++static BOOL clientMessageGUIDReplyConstructorAvailable(void);
+ 
+ static SEL customEmojiReactionSelector(void) {
+     return NSSelectorFromString(
+@@ -340,9 +342,12 @@ static void probeSelectors(void) {
+             @selector(sendMessage:reason:)];
+     }
+     gHasCustomEmojiReaction = customEmojiReactionInitializerAvailable();
+-    NSLog(@"[imsg-bridge] Selector probes: editItemTranslation=%d editItem=%d editLegacy=%d retract=%d sendReason=%d customEmoji=%d",
++    gHasClientMessageGUIDReplyConstructor =
++        clientMessageGUIDReplyConstructorAvailable();
++    NSLog(@"[imsg-bridge] Selector probes: editItemTranslation=%d editItem=%d editLegacy=%d retract=%d sendReason=%d customEmoji=%d clientGuidReply=%d",
+           gHasEditMessageItemTranslation, gHasEditMessageItem, gHasEditMessage,
+-          gHasRetractMessagePart, gHasSendMessageReason, gHasCustomEmojiReaction);
++          gHasRetractMessagePart, gHasSendMessageReason, gHasCustomEmojiReaction,
++          gHasClientMessageGUIDReplyConstructor);
+ }
+ 
+ #pragma mark - Forward Declarations for IMCore Classes
+@@ -980,6 +985,45 @@ static BOOL stickerTransferSelectorsAvailable(void) {
+             @"registerTransferWithDaemon:")];
+ }
+ 
++static NSString *canonicalClientMessageGuid(id value) {
++    if (![value isKindOfClass:[NSString class]]) return nil;
++    NSString *raw = (NSString *)value;
++    if (raw.length != 36) return nil;
++    NSUUID *uuid = [[NSUUID alloc] initWithUUIDString:raw];
++    NSString *canonical = uuid.UUIDString;
++    if (!canonical.length || ![canonical isEqualToString:raw]) return nil;
++    if ([raw characterAtIndex:14] != '4') return nil;
++    unichar variant = [raw characterAtIndex:19];
++    if (!(variant == '8' || variant == '9' || variant == 'A' || variant == 'B')) return nil;
++    return canonical;
++}
++
++static NSMutableOrderedSet<NSString *> *claimedClientMessageGuids(void) {
++    static NSMutableOrderedSet<NSString *> *claimed;
++    static dispatch_once_t onceToken;
++    dispatch_once(&onceToken, ^{
++        claimed = [NSMutableOrderedSet orderedSet];
++    });
++    return claimed;
++}
++
++static BOOL claimClientMessageGuid(NSString *guid) {
++    NSMutableOrderedSet<NSString *> *claimed = claimedClientMessageGuids();
++    @synchronized (claimed) {
++        if ([claimed containsObject:guid]) return NO;
++        [claimed addObject:guid];
++        while (claimed.count > 4096) [claimed removeObjectAtIndex:0];
++        return YES;
++    }
++}
++
++static void releaseClientMessageGuid(NSString *guid) {
++    NSMutableOrderedSet<NSString *> *claimed = claimedClientMessageGuids();
++    @synchronized (claimed) {
++        [claimed removeObject:guid];
++    }
++}
++
+ static NSDictionary* handleStatus(NSInteger requestId, NSDictionary *params) {
+     Class registryClass = NSClassFromString(@"IMChatRegistry");
+     BOOL hasRegistry = (registryClass != nil);
+@@ -1054,6 +1098,7 @@ static BOOL stickerTransferSelectorsAvailable(void) {
+                 && stickerAssociatedMessage),
+         @"urlPreviewMessage": @(urlPreviewMessageInitializerAvailable()),
+         @"sendRichLinkAction": @YES,
++        @"clientMessageGuid": @(gHasClientMessageGUIDReplyConstructor),
+         @"customEmojiReaction": @(gHasCustomEmojiReaction),
+         @"pollUpdateMessage": @(pollVoteMessageInitializerAvailable()),
+         @"deleteChat": @(hasRegistry &&
+@@ -1455,7 +1500,8 @@ static id constructIMMessageViaItem(NSAttributedString *attributedText,
+                                     NSRange associatedMessageRange,
+                                     NSDictionary *summaryInfo,
+                                     NSArray *fileTransferGuids,
+-                                    BOOL isAudioMessage) {
++                                    BOOL isAudioMessage,
++                                    NSString *clientMessageGuid) {
+     Class IMMessageClass = NSClassFromString(@"IMMessage");
+     Class IMMessageItemClass = NSClassFromString(@"IMMessageItem");
+     if (!IMMessageClass || !IMMessageItemClass) return nil;
+@@ -1472,7 +1518,9 @@ static id constructIMMessageViaItem(NSAttributedString *attributedText,
+     NSDate *now = [NSDate date];
+     NSArray *transferGuids = fileTransferGuids ?: @[];
+     NSError *err = nil;
+-    NSString *guid = [[NSUUID UUID] UUIDString];
++    NSString *guid = clientMessageGuid.length
++        ? clientMessageGuid
++        : [[NSUUID UUID] UUIDString];
+     // BlueBubblesHelper-verified flag set: 0x100005 (FromMe | Finished |
+     // 0x100000 finalize bit) for normal text+attachment, 0x10000d when a
+     // subject is set, 0x300005 for audio messages. The earlier `0x5`
+@@ -2898,7 +2946,8 @@ static id buildIMMessage(NSAttributedString *body,
+                          NSDictionary *summaryInfo,
+                          NSArray *fileTransferGuids,
+                          BOOL isAudioMessage,
+-                         BOOL ddScan) {
++                         BOOL ddScan,
++                         NSString *clientMessageGuid) {
+     // Reactions take a different code path entirely (macOS 26 init below) —
+     // the IMMessageItem-first construction can't carry associated-message
+     // fields atomically, and post-init setters don't survive the wrap.
+@@ -2918,7 +2967,8 @@ static id buildIMMessage(NSAttributedString *body,
+                                                 associatedMessageRange,
+                                                 summaryInfo,
+                                                 fileTransferGuids,
+-                                                isAudioMessage);
++                                                isAudioMessage,
++                                                clientMessageGuid);
+         if (viaItem) return viaItem;
+     }
+     // Legacy fallback for older macOS that doesn't expose the
+@@ -2952,7 +3002,8 @@ static id buildIMMessage(NSAttributedString *body,
+             [inv setArgument:&fileTransferGuids atIndex:6];
+             [inv setArgument:&flags atIndex:7];
+             [inv setArgument:&nilObj atIndex:8];           // error
+-            [inv setArgument:&nilObj atIndex:9];           // guid
++            id messageGuid = clientMessageGuid.length ? clientMessageGuid : nilObj;
++            [inv setArgument:&messageGuid atIndex:9];      // guid
+             [inv setArgument:&nilObj atIndex:10];          // subject (string)
+             [inv setArgument:&associatedMessageGuid atIndex:11];
+             [inv setArgument:&associatedMessageType atIndex:12];
+@@ -2993,7 +3044,8 @@ static id buildIMMessage(NSAttributedString *body,
+             [inv setArgument:&fileTransferGuids atIndex:6];
+             [inv setArgument:&flags atIndex:7];
+             [inv setArgument:&nilObj atIndex:8];        // error
+-            [inv setArgument:&nilObj atIndex:9];        // guid
++            id messageGuid = clientMessageGuid.length ? clientMessageGuid : nilObj;
++            [inv setArgument:&messageGuid atIndex:9];   // guid
+             [inv setArgument:&nilObj atIndex:10];       // subject (string form)
+             [inv setArgument:&nilObj atIndex:11];       // balloonBundleID
+             [inv setArgument:&nilObj atIndex:12];       // payloadData
+@@ -3041,7 +3093,8 @@ static id buildIMMessage(NSAttributedString *body,
+         [inv setArgument:&fileTransferGuids atIndex:6];
+         [inv setArgument:&flags atIndex:7];
+         [inv setArgument:&nilObj atIndex:8];           // error
+-        [inv setArgument:&nilObj atIndex:9];           // guid
++        id messageGuid = clientMessageGuid.length ? clientMessageGuid : nilObj;
++        [inv setArgument:&messageGuid atIndex:9];      // guid
+         [inv setArgument:&nilObj atIndex:10];          // subject string
+         [inv setArgument:&nilObj atIndex:11];          // balloonBundleID
+         [inv setArgument:&nilObj atIndex:12];          // payloadData
+@@ -3079,7 +3132,8 @@ static id buildIMMessage(NSAttributedString *body,
+         [inv setArgument:&fileTransferGuids atIndex:6];
+         [inv setArgument:&flags atIndex:7];
+         [inv setArgument:&nilObj atIndex:8];           // error
+-        [inv setArgument:&nilObj atIndex:9];           // guid
++        id messageGuid = clientMessageGuid.length ? clientMessageGuid : nilObj;
++        [inv setArgument:&messageGuid atIndex:9];      // guid
+         [inv setArgument:&nilObj atIndex:10];          // subject string
+         [inv setArgument:&nilObj atIndex:11];          // balloonBundleID
+         [inv setArgument:&nilObj atIndex:12];          // payloadData
+@@ -3097,6 +3151,10 @@ static id buildIMMessage(NSAttributedString *body,
+     // must fail closed instead of reporting a successful text-only send.
+     if (hasAttachment) return nil;
+ 
++    // The simplest initializer cannot carry a caller-owned GUID. Fail closed
++    // instead of dispatching a message the caller cannot correlate exactly.
++    if (clientMessageGuid.length) return nil;
++
+     // Last resort: simplest 2-arg initializer if the long form isn't available.
+     SEL simple = @selector(initWithText:flags:);
+     if ([msg respondsToSelector:simple]) {
+@@ -3118,6 +3176,58 @@ static id buildIMMessage(NSAttributedString *body,
+     return nil;
+ }
+ 
++/// Probe the exact constructor shape used by service mirrors: a reply
++/// association (type 100) plus a caller-owned GUID. This constructs an
++/// in-memory message only; it never resolves a chat or dispatches the object.
++/// Merely finding a plain-message GUID initializer is insufficient because
++/// every service mirror carries reply metadata.
++static BOOL clientMessageGUIDReplyConstructorAvailable(void) {
++    @autoreleasepool {
++        @try {
++            NSString *clientMessageGuid = @"00000000-0000-4000-8000-000000000001";
++            NSString *associatedMessageGuid =
++                @"p:0/00000000-0000-4000-8000-000000000002";
++            long long associatedMessageType = 100;
++            NSAttributedString *body = [[NSAttributedString alloc]
++                initWithString:@"imsg capability probe"];
++            NSRange associatedMessageRange = NSMakeRange(0, body.length);
++            id message = buildIMMessage(body,
++                                        nil,
++                                        nil,
++                                        nil,
++                                        nil,
++                                        associatedMessageGuid,
++                                        associatedMessageType,
++                                        associatedMessageRange,
++                                        nil,
++                                        @[],
++                                        NO,
++                                        NO,
++                                        clientMessageGuid);
++            if (!message
++                || ![message respondsToSelector:@selector(guid)]
++                || ![message respondsToSelector:@selector(associatedMessageGUID)]
++                || ![message respondsToSelector:@selector(associatedMessageType)]
++                || ![message respondsToSelector:@selector(associatedMessageRange)]) {
++                return NO;
++            }
++            NSString *actualGuid = [(IMMessage *)message guid];
++            NSString *actualAssociatedGuid =
++                [(IMMessage *)message associatedMessageGUID];
++            long long actualAssociatedType =
++                [(IMMessage *)message associatedMessageType];
++            NSRange actualAssociatedRange =
++                [(IMMessage *)message associatedMessageRange];
++            return [actualGuid isEqualToString:clientMessageGuid]
++                && [actualAssociatedGuid isEqualToString:associatedMessageGuid]
++                && actualAssociatedType == associatedMessageType
++                && NSEqualRanges(actualAssociatedRange, associatedMessageRange);
++        } @catch (NSException *exception) {
++            return NO;
++        }
++    }
++}
++
+ /// Look up a chat item by message guid. Tries BlueBubblesHelper's
+ /// block-based `loadMessageWithGUID:completionBlock:` first — that path
+ /// works for messages older than what's currently loaded into the live
+@@ -3674,6 +3784,7 @@ static BOOL validateRichLinkPreviewImage(NSDictionary *image,
+     id ddScanValue = params[@"ddScan"];
+     id attributedBodyValue = params[@"attributedBody"];
+     id textFormattingValue = params[@"textFormatting"];
++    id clientMessageGuidValue = params[@"clientMessageGuid"];
+     if (![chatGuidValue isKindOfClass:[NSString class]] ||
+         (messageValue && ![messageValue isKindOfClass:[NSString class]]) ||
+         (effectIdValue && ![effectIdValue isKindOfClass:[NSString class]]) ||
+@@ -3684,7 +3795,8 @@ static BOOL validateRichLinkPreviewImage(NSDictionary *image,
+         (partIndexValue && !richLinkIntegerNumber(partIndexValue)) ||
+         (ddScanValue && ![ddScanValue isKindOfClass:[NSNumber class]]) ||
+         (attributedBodyValue && ![attributedBodyValue isKindOfClass:[NSString class]]) ||
+-        (textFormattingValue && ![textFormattingValue isKindOfClass:[NSArray class]])) {
++        (textFormattingValue && ![textFormattingValue isKindOfClass:[NSArray class]]) ||
++        (clientMessageGuidValue && ![clientMessageGuidValue isKindOfClass:[NSString class]])) {
+         return errorResponse(requestId, @"Invalid send-message parameter types");
+     }
+ 
+@@ -3700,8 +3812,12 @@ static BOOL validateRichLinkPreviewImage(NSDictionary *image,
+     BOOL ddScan = [ddScanNum boolValue];
+     NSString *attributedBodyB64 = attributedBodyValue;
+     NSArray *textFormatting = textFormattingValue;
++    NSString *clientMessageGuid = canonicalClientMessageGuid(clientMessageGuidValue);
+ 
+     if (!chatGuid.length) return errorResponse(requestId, @"Missing chatGuid");
++    if (clientMessageGuidValue && !clientMessageGuid) {
++        return errorResponse(requestId, @"Invalid clientMessageGuid");
++    }
+     if (!message) message = @"";
+     if (richLinkPreview &&
+         (effectId.length || subject.length || selectedMessageGuid.length || partIndex != 0 ||
+@@ -3857,13 +3973,25 @@ static BOOL validateRichLinkPreviewImage(NSDictionary *image,
+                                        /*summaryInfo*/ nil,
+                                        /*fileTransferGuids*/ @[],
+                                        /*isAudio*/ NO,
+-                                       ddScan);
++                                       ddScan,
++                                       clientMessageGuid);
+         }
+         if (!imMessage) {
+             removeRichLinkPreviewSnapshot(richLinkSnapshotPath);
+             richLinkSnapshotPath = nil;
+             return errorResponse(requestId, @"Could not construct IMMessage");
+         }
++        if (clientMessageGuid.length) {
++            NSString *constructedGuid = [imMessage respondsToSelector:@selector(guid)]
++                ? [imMessage performSelector:@selector(guid)]
++                : nil;
++            if (![constructedGuid isEqualToString:clientMessageGuid]) {
++                removeRichLinkPreviewSnapshot(richLinkSnapshotPath);
++                richLinkSnapshotPath = nil;
++                return errorResponse(requestId,
++                    @"Constructed IMMessage did not preserve clientMessageGuid");
++            }
++        }
+         if (richLinkTransfer) {
+             NSString *registrationError = nil;
+             if (!registerPreparedTransfer(richLinkTransfer, &registrationError)) {
+@@ -3911,7 +4039,9 @@ static BOOL validateRichLinkPreviewImage(NSDictionary *image,
+         }
+ 
+         // Best-effort messageGuid; not always available immediately.
+-        NSString *guid = lastSentMessageGuid(chat);
++        NSString *guid = clientMessageGuid.length
++            ? clientMessageGuid
++            : lastSentMessageGuid(chat);
+         NSMutableDictionary *response = [@{
+             @"chatGuid": chatGuid,
+             @"messageGuid": guid ?: @"",
+@@ -3955,7 +4085,8 @@ static id buildPollReplyFallbackIMMessage(NSAttributedString *body,
+                                summaryInfo,
+                                @[],
+                                NO,
+-                               NO);
++                               NO,
++                               nil);
+     if (!result) {
+         setPollConstructionStage(outConstructionStage,
+                                  IMsgPollConstructionStageFallbackMessageNil);
+@@ -4467,7 +4598,7 @@ static id buildPollVoteIMMessage(NSAttributedString *body,
+                                       parentItem,
+                                       selectedMessageGuid, associatedType,
+                                       NSMakeRange(0, body.length),
+-                                      nil, @[], NO, NO);
++                                      nil, @[], NO, NO, nil);
+         if (!imMessage) {
+             return errorResponse(requestId, @"Could not construct multipart IMMessage");
+         }
+@@ -5386,7 +5517,7 @@ static BOOL registerPreparedTransfer(IMFileTransfer *transfer, NSString **outErr
+                                       parentItem,
+                                       selectedMessageGuid, associatedType,
+                                       NSMakeRange(0, body.length), nil,
+-                                      @[transferGuid], isAudio, NO);
++                                      @[transferGuid], isAudio, NO, nil);
+         if (!imMessage) {
+             return errorResponse(requestId, @"Could not build IMMessage with attachment");
+         }
+@@ -5621,7 +5752,7 @@ static void cleanupPreparedStickerPaths(NSString *snapshotPath,
+                                       nil,
+                                       associatedRef, associatedType,
+                                       targetRange, summaryInfo,
+-                                      @[transferGuid], NO, NO);
++                                      @[transferGuid], NO, NO, nil);
+         if (!imMessage) {
+             cleanupPreparedStickerPaths(snapshotPath, activePath);
+             return errorResponse(requestId, @"Could not build sticker IMMessage");
+@@ -5828,7 +5959,7 @@ static void cleanupPreparedStickerPaths(NSString *snapshotPath,
+                                        associatedType,
+                                        targetRange,
+                                        summary,
+-                                       @[], NO, NO);
++                                       @[], NO, NO, nil);
+         }
+         if (!imMessage) {
+             return errorResponse(requestId, customEmoji.length
+@@ -6404,7 +6535,7 @@ static void cleanupPreparedStickerPaths(NSString *snapshotPath,
+             id imMessage = buildIMMessage(body, nil, nil, nil, nil,
+                                           nil, 0,
+                                           NSMakeRange(0, body.length),
+-                                          nil, @[], NO, NO);
++                                          nil, @[], NO, NO, nil);
+             if (imMessage) {
+                 dispatchIMMessageInChat(chat, imMessage, nil, nil);
+                 messageGuid = lastSentMessageGuid(chat);
+@@ -6826,12 +6957,51 @@ static BOOL waitForNicknameControllerLoad(id controller, NSTimeInterval timeout)
+     }
+     // v2 actions
+     if ([action isEqualToString:@"send-message"]) {
++        if (params[@"clientMessageGuid"]) {
++            return errorResponse(legacyId,
++                @"clientMessageGuid requires send-message-with-guid");
++        }
+         if (params[@"richLinkPreview"] || params[@"richLinkURL"]) {
+             return errorResponse(legacyId, @"Use send-rich-link for URL previews");
+         }
+         return handleSendMessage(legacyId, params);
+     }
++    if ([action isEqualToString:@"send-message-with-guid"]) {
++        if (!gHasClientMessageGUIDReplyConstructor) {
++            return errorResponse(legacyId,
++                @"send-message-with-guid is unavailable: no reply-capable GUID constructor");
++        }
++        if (params[@"richLinkPreview"] || params[@"richLinkURL"]) {
++            return errorResponse(legacyId,
++                @"send-message-with-guid does not support URL previews");
++        }
++        id clientGuidDDScanValue = params[@"ddScan"];
++        if (clientGuidDDScanValue
++            && ![clientGuidDDScanValue isKindOfClass:[NSNumber class]]) {
++            return errorResponse(legacyId,
++                @"send-message-with-guid requires a boolean ddScan value");
++        }
++        if ([clientGuidDDScanValue boolValue]) {
++            return errorResponse(legacyId,
++                @"send-message-with-guid requires ddScan=false");
++        }
++        NSString *clientMessageGuid = canonicalClientMessageGuid(params[@"clientMessageGuid"]);
++        if (!clientMessageGuid) {
++            return errorResponse(legacyId,
++                @"send-message-with-guid requires a canonical uppercase UUIDv4");
++        }
++        if (!claimClientMessageGuid(clientMessageGuid)) {
++            return errorResponse(legacyId, @"clientMessageGuid was already claimed");
++        }
++        NSDictionary *response = handleSendMessage(legacyId, params);
++        if (![response[@"success"] boolValue]) releaseClientMessageGuid(clientMessageGuid);
++        return response;
++    }
+     if ([action isEqualToString:@"send-rich-link"]) {
++        if (params[@"clientMessageGuid"]) {
++            return errorResponse(legacyId,
++                @"clientMessageGuid is not supported with rich links");
++        }
+         if (![params[@"richLinkPreview"] isKindOfClass:[NSDictionary class]]) {
+             return errorResponse(legacyId, @"Missing rich-link descriptor");
+         }
+diff --git a/Sources/imsg/RPCServer+BridgeMessageHandlers.swift b/Sources/imsg/RPCServer+BridgeMessageHandlers.swift
+index 8455061..92bb2d3 100644
+--- a/Sources/imsg/RPCServer+BridgeMessageHandlers.swift
++++ b/Sources/imsg/RPCServer+BridgeMessageHandlers.swift
+@@ -4,22 +4,68 @@ import IMsgCore
+ 
+ extension RPCServer {
+   func handleSendRich(params: [String: Any], id: Any?) async throws {
++    guard !params.keys.contains("client_guid") else {
++      throw RPCError.invalidParams(
++        "client_guid requires the send.rich.client-guid method"
++      )
++    }
++    try await handleSendRich(params: params, id: id, clientGUID: nil)
++  }
++
++  func handleSendRichWithClientGUID(params: [String: Any], id: Any?) async throws {
++    guard let clientGUID = try rpcClientGUIDParam(params) else {
++      throw RPCError.invalidParams(
++        "send.rich.client-guid requires client_guid"
++      )
++    }
++    try await handleSendRich(params: params, id: id, clientGUID: clientGUID)
++  }
++
++  private func handleSendRich(
++    params: [String: Any],
++    id: Any?,
++    clientGUID: String?
++  ) async throws {
+     let retiredRichLinkKeys = ["link", "rich_link", "richLink", "rich_link_url"]
+     if let key = retiredRichLinkKeys.first(where: { params.keys.contains($0) }) {
+       throw RPCError.invalidParams("\(key) is not supported; pass url without rich-link modifiers")
+     }
+     if params.keys.contains("url") {
++      if clientGUID != nil {
++        throw RPCError.invalidParams("client_guid is not supported with url")
++      }
+       try await handleSendRichLink(params: params, id: id)
+       return
+     }
+     let chatGUID = try await resolveChatGUIDParam(params)
+     let text = stringParam(params["text"]) ?? stringParam(params["message"]) ?? ""
++    if clientGUID != nil {
++      for key in ["dd_scan", "ddScan"] where params.keys.contains(key) {
++        guard let value = params[key] as? Bool else {
++          throw RPCError.invalidParams(
++            "\(key) must be a boolean for send.rich.client-guid"
++          )
++        }
++        guard !value else {
++          throw RPCError.invalidParams(
++            "dd_scan must be false for send.rich.client-guid"
++          )
++        }
++      }
++    }
++    let requestedDDScan = boolParam(params["dd_scan"] ?? params["ddScan"])
+     var bridgeParams: [String: Any] = [
+       "chatGuid": chatGUID,
+       "message": text,
+       "partIndex": intParam(params["part_index"] ?? params["partIndex"]) ?? 0,
+-      "ddScan": boolParam(params["dd_scan"] ?? params["ddScan"]) ?? true,
++      "ddScan": clientGUID == nil ? (requestedDDScan ?? true) : false,
+     ]
++    if let clientGUID {
++      guard !(try store.messageExists(guid: clientGUID)) else {
++        throw RPCError.invalidParams("client_guid is already present in Messages")
++      }
++      bridgeParams["clientMessageGuid"] = clientGUID
++    }
+     if let effect = stringParam(params["effect_id"] ?? params["effectId"] ?? params["effect"]),
+       !effect.isEmpty
+     {
+@@ -38,7 +84,10 @@ extension RPCServer {
+     }
+ 
+     let sentAt = Date()
+-    let data = try await invokeBridge(action: .sendMessage, params: bridgeParams)
++    let data = try await invokeBridge(
++      action: clientGUID == nil ? .sendMessage : .sendMessageWithGUID,
++      params: bridgeParams
++    )
+     var result: [String: Any] = ["ok": true]
+     if let queued = data["queued"] as? Bool {
+       result["queued"] = queued
+@@ -52,7 +101,29 @@ extension RPCServer {
+       service: .auto,
+       chatGUID: chatGUID
+     )
+-    if data["queued"] as? Bool == true,
++    if let clientGUID {
++      guard data["messageGuid"] as? String == clientGUID else {
++        throw RPCError.internalError("bridge did not preserve client_guid")
++      }
++      guard let chatID else {
++        throw RPCError.internalError(
++          "client_guid dispatch target could not be verified; delivery state is ambiguous"
++        )
++      }
++      let expectation = ClientGUIDPersistenceExpectation(
++        guid: clientGUID,
++        text: text,
++        chatID: chatID,
++        threadOriginatorGUID: bridgeParams["selectedMessageGuid"] as? String
++      )
++      guard try await confirmClientGUIDPersistence(store, expectation) else {
++        throw RPCError.internalError(
++          "client_guid dispatch was not confirmed in Messages before timeout; delivery state is ambiguous"
++        )
++      }
++      result["guid"] = clientGUID
++      result["message_id"] = clientGUID
++    } else if data["queued"] as? Bool == true,
+       !text.isEmpty,
+       let sentMessage = try? await resolveSentMessage(store, options, chatID, sentAt),
+       !sentMessage.guid.isEmpty
+@@ -497,6 +568,20 @@ func rpcMessageGUIDParam(_ params: [String: Any]) -> String? {
+   return trimmed.isEmpty ? nil : trimmed
+ }
+ 
++func rpcClientGUIDParam(_ params: [String: Any]) throws -> String? {
++  guard params.keys.contains("client_guid") else { return nil }
++  guard let raw = params["client_guid"] as? String,
++    raw.utf8.count == 36,
++    let uuid = UUID(uuidString: raw),
++    uuid.uuidString == raw,
++    raw[raw.index(raw.startIndex, offsetBy: 14)] == "4",
++    "89AB".contains(raw[raw.index(raw.startIndex, offsetBy: 19)])
++  else {
++    throw RPCError.invalidParams("client_guid must be a canonical uppercase UUIDv4")
++  }
++  return raw
++}
++
+ func normalizeBridgeReactionType(_ raw: String, remove: Bool = false) throws -> String {
+   let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+   var value = trimmed.lowercased()
+diff --git a/Sources/imsg/RPCServer.swift b/Sources/imsg/RPCServer.swift
+index cb3ee6e..61ce091 100644
+--- a/Sources/imsg/RPCServer.swift
++++ b/Sources/imsg/RPCServer.swift
+@@ -13,6 +13,18 @@ typealias BridgeInvoker = (
+   _ params: [String: Any]
+ ) async throws -> [String: Any]
+ 
++struct ClientGUIDPersistenceExpectation: Sendable {
++  let guid: String
++  let text: String
++  let chatID: Int64
++  let threadOriginatorGUID: String?
++}
++
++typealias ClientGUIDPersistenceVerifier = (
++  _ store: MessageStore,
++  _ expectation: ClientGUIDPersistenceExpectation
++) async throws -> Bool
++
+ typealias AttachmentStager = (_ path: String) throws -> String
+ typealias StickerStager = (_ path: String) throws -> PreparedStickerAsset
+ 
+@@ -38,6 +50,7 @@ let kSupportedRPCMethods: [String] = [
+   "watch.unsubscribe",
+   "send",
+   "send.rich",
++  "send.rich.client-guid",
+   "send.attachment",
+   "send.sticker",
+   "messages.scheduled",
+@@ -75,6 +88,7 @@ final class RPCServer {
+   let verbose: Bool
+   let sendMessage: (MessageSendOptions) throws -> Void
+   let resolveSentMessage: SentMessageResolver
++  let confirmClientGUIDPersistence: ClientGUIDPersistenceVerifier
+   let bridgeInvoker: BridgeInvoker
+   let stageAttachment: AttachmentStager
+   let stageSticker: StickerStager
+@@ -90,6 +104,8 @@ final class RPCServer {
+     output: RPCOutput = RPCWriter(),
+     sendMessage: @escaping (MessageSendOptions) throws -> Void = { try MessageSender().send($0) },
+     resolveSentMessage: @escaping SentMessageResolver = RPCServer.resolveSentMessage,
++    confirmClientGUIDPersistence: @escaping ClientGUIDPersistenceVerifier =
++      RPCServer.confirmClientGUIDPersistence,
+     invokeBridge: @escaping BridgeInvoker = { action, params in
+       try await IMsgBridgeClient.shared.invoke(action: action, params: params)
+     },
+@@ -116,6 +132,7 @@ final class RPCServer {
+     self.output = output
+     self.sendMessage = sendMessage
+     self.resolveSentMessage = resolveSentMessage
++    self.confirmClientGUIDPersistence = confirmClientGUIDPersistence
+     self.bridgeInvoker = invokeBridge
+     self.stageAttachment = stageAttachment
+     self.stageSticker = stageSticker
+@@ -176,6 +193,8 @@ final class RPCServer {
+         try await handleSend(params: params, id: id)
+       case "send.rich":
+         try await handleSendRich(params: params, id: id)
++      case "send.rich.client-guid":
++        try await handleSendRichWithClientGUID(params: params, id: id)
+       case "send.attachment":
+         try await handleSendAttachment(params: params, id: id)
+       case "send.sticker":
+@@ -271,4 +290,23 @@ final class RPCServer {
+       sentAt: sentAt
+     )
+   }
++
++  static func confirmClientGUIDPersistence(
++    store: MessageStore,
++    expectation: ClientGUIDPersistenceExpectation
++  ) async throws -> Bool {
++    for _ in 0..<100 {
++      try Task.checkCancellation()
++      if try store.messageMatchesCallerOwnedSend(
++        guid: expectation.guid,
++        text: expectation.text,
++        chatID: expectation.chatID,
++        threadOriginatorGUID: expectation.threadOriginatorGUID
++      ) {
++        return true
++      }
++      try await Task.sleep(nanoseconds: 50_000_000)
++    }
++    return false
++  }
+ }
+diff --git a/Tests/IMsgCoreTests/IMsgBridgeProtocolTests.swift b/Tests/IMsgCoreTests/IMsgBridgeProtocolTests.swift
+index e82539d..8fb283e 100644
+--- a/Tests/IMsgCoreTests/IMsgBridgeProtocolTests.swift
++++ b/Tests/IMsgCoreTests/IMsgBridgeProtocolTests.swift
+@@ -8,6 +8,7 @@ struct IMsgBridgeProtocolTests {
+   @Test
+   func actionRawValuesMatchDylibVocabulary() {
+     #expect(BridgeAction.sendMessage.rawValue == "send-message")
++    #expect(BridgeAction.sendMessageWithGUID.rawValue == "send-message-with-guid")
+     #expect(BridgeAction.sendSticker.rawValue == "send-sticker")
+     #expect(BridgeAction.sendRichLink.rawValue == "send-rich-link")
+     #expect(BridgeAction.sendPoll.rawValue == "send-poll")
+@@ -94,6 +95,7 @@ struct IMsgBridgeProtocolTests {
+ 
+     for action in [
+       BridgeAction.sendMessage,
++      .sendMessageWithGUID,
+       .sendRichLink,
+       .sendMultipart,
+       .sendAttachment,
+diff --git a/Tests/IMsgCoreTests/MessageStoreSentMessageTests.swift b/Tests/IMsgCoreTests/MessageStoreSentMessageTests.swift
+index c4c3c62..233770c 100644
+--- a/Tests/IMsgCoreTests/MessageStoreSentMessageTests.swift
++++ b/Tests/IMsgCoreTests/MessageStoreSentMessageTests.swift
+@@ -4,6 +4,78 @@ import Testing
+ 
+ @testable import IMsgCore
+ 
++@Test
++func callerOwnedSendConfirmationRequiresExactGuidBodyChatAndRoot() throws {
++  let db = try Connection(.inMemory)
++  try MessageDatabaseFixture.createSchema(
++    db,
++    options: MessageDatabaseFixture.SchemaOptions(
++      includeReactionColumns: true,
++      includeThreadOriginatorGUID: true
++    )
++  )
++  try db.run(
++    """
++    INSERT INTO chat(ROWID, chat_identifier, guid, display_name, service_name)
++    VALUES (1, '+123', 'iMessage;-;+123', 'Direct', 'iMessage')
++    """
++  )
++  try db.run("INSERT INTO handle(ROWID, id) VALUES (1, 'me@icloud.com')")
++  try db.run(
++    """
++    INSERT INTO message(
++      ROWID, handle_id, text, guid, associated_message_guid,
++      associated_message_type, thread_originator_guid, date, is_from_me, service
++    )
++    VALUES (1, 1, 'clean', '12345678-1234-4ABC-8DEF-1234567890AB',
++            NULL, NULL, 'thread-root', 1, 1, 'iMessage')
++    """
++  )
++  try db.run("INSERT INTO chat_message_join(chat_id, message_id) VALUES (1, 1)")
++  let store = try MessageStore(connection: db, path: ":memory:")
++
++  #expect(
++    try store.messageMatchesCallerOwnedSend(
++      guid: "12345678-1234-4ABC-8DEF-1234567890AB",
++      text: "clean",
++      chatID: 1,
++      threadOriginatorGUID: "thread-root"
++    )
++  )
++  #expect(
++    try store.messageMatchesCallerOwnedSend(
++      guid: "12345678-1234-4ABC-8DEF-1234567890AB",
++      text: "clean",
++      chatID: 1,
++      threadOriginatorGUID: "p:0/thread-root"
++    )
++  )
++  #expect(
++    !(try store.messageMatchesCallerOwnedSend(
++      guid: "12345678-1234-4ABC-8DEF-1234567890AB",
++      text: "different",
++      chatID: 1,
++      threadOriginatorGUID: "thread-root"
++    ))
++  )
++  #expect(
++    !(try store.messageMatchesCallerOwnedSend(
++      guid: "12345678-1234-4ABC-8DEF-1234567890AB",
++      text: "clean",
++      chatID: 2,
++      threadOriginatorGUID: "thread-root"
++    ))
++  )
++  #expect(
++    !(try store.messageMatchesCallerOwnedSend(
++      guid: "12345678-1234-4ABC-8DEF-1234567890AB",
++      text: "clean",
++      chatID: 1,
++      threadOriginatorGUID: "wrong-root"
++    ))
++  )
++}
++
+ @Test
+ func latestSentMessageMatchesNewestOutgoingTextInChat() throws {
+   let db = try makeSentMessageDatabase()
+diff --git a/Tests/imsgTests/BridgeCommandRegistrationTests.swift b/Tests/imsgTests/BridgeCommandRegistrationTests.swift
+index 5f4749b..0cd5c60 100644
+--- a/Tests/imsgTests/BridgeCommandRegistrationTests.swift
++++ b/Tests/imsgTests/BridgeCommandRegistrationTests.swift
+@@ -135,6 +135,9 @@ func injectedHelperHardensRichLinkImageTransfer() throws {
+       #"![params[@"richLinkPreview"] isKindOfClass:[NSDictionary class]]"#))
+   #expect(dispatchBody.contains(#"@"Missing rich-link descriptor""#))
+   #expect(dispatchBody.components(separatedBy: "return handleSendMessage").count == 3)
++  #expect(dispatchBody.contains(#"[action isEqualToString:@"send-message-with-guid"]"#))
++  #expect(dispatchBody.contains(#"claimClientMessageGuid(clientMessageGuid)"#))
++  #expect(dispatchBody.contains(#"clientMessageGuid requires send-message-with-guid"#))
+ 
+   // Rich-link preparation must not synchronously invoke the private data
+   // detector controller on Messages' main loop.
+@@ -143,6 +146,100 @@ func injectedHelperHardensRichLinkImageTransfer() throws {
+   #expect(!source.contains("waitUntilDone:YES"))
+ }
+ 
++@Test
++func injectedHelperPreservesCallerOwnedGuidBeforeDispatch() throws {
++  let testFile = URL(fileURLWithPath: #filePath)
++  let repoRoot =
++    testFile
++    .deletingLastPathComponent()
++    .deletingLastPathComponent()
++    .deletingLastPathComponent()
++  let helper = repoRoot.appendingPathComponent("Sources/IMsgHelper/IMsgInjected.m")
++  let source = stripObjectiveCComments(try String(contentsOf: helper, encoding: .utf8))
++  let constructBody = try #require(
++    functionBody(named: "constructIMMessageViaItem", in: source))
++  let buildBody = try #require(functionBody(named: "buildIMMessage", in: source))
++  let capabilityBody = try #require(
++    functionBody(named: "clientMessageGUIDReplyConstructorAvailable", in: source))
++  let probeBody = try #require(functionBody(named: "probeSelectors", in: source))
++  let statusBody = try #require(functionBody(named: "handleStatus", in: source))
++  let sendBody = try #require(functionBody(named: "handleSendMessage", in: source))
++  let dispatchBody = try #require(functionBody(named: "dispatchAction", in: source))
++
++  #expect(constructBody.contains("clientMessageGuid.length"))
++  #expect(constructBody.contains("NSString *guid = clientMessageGuid.length"))
++  #expect(constructBody.contains("? clientMessageGuid"))
++  #expect(constructBody.contains(": [[NSUUID UUID] UUIDString]"))
++  #expect(buildBody.contains("if (clientMessageGuid.length) return nil"))
++  #expect(capabilityBody.contains("buildIMMessage"))
++  #expect(capabilityBody.contains("long long associatedMessageType = 100"))
++  #expect(
++    capabilityBody.contains(
++      "NSRange associatedMessageRange = NSMakeRange(0, body.length)"))
++  #expect(capabilityBody.contains("actualGuid isEqualToString:clientMessageGuid"))
++  #expect(
++    capabilityBody.contains(
++      "actualAssociatedGuid isEqualToString:associatedMessageGuid"))
++  #expect(capabilityBody.contains("actualAssociatedType == associatedMessageType"))
++  #expect(
++    capabilityBody.contains(
++      "NSEqualRanges(actualAssociatedRange, associatedMessageRange)"))
++  #expect(!capabilityBody.contains("dispatchIMMessageInChat"))
++  #expect(probeBody.contains("gHasClientMessageGUIDReplyConstructor ="))
++  #expect(probeBody.contains("clientMessageGUIDReplyConstructorAvailable()"))
++  #expect(
++    statusBody.contains(
++      #"@"clientMessageGuid": @(gHasClientMessageGUIDReplyConstructor)"#))
++  #expect(!statusBody.contains(#"@"clientMessageGuid": @YES"#))
++  #expect(sendBody.contains("canonicalClientMessageGuid(clientMessageGuidValue)"))
++  let constructedCheck = try #require(
++    sendBody.range(of: "Constructed IMMessage did not preserve clientMessageGuid"))
++  let dispatch = try #require(sendBody.range(of: "dispatchIMMessageInChat(chat, imMessage"))
++  #expect(constructedCheck.lowerBound < dispatch.lowerBound)
++
++  let guardedAction = try #require(
++    dispatchBody.range(of: #"[action isEqualToString:@"send-message-with-guid"]"#))
++  let synchronousOnly = try #require(
++    dispatchBody.range(of: #"send-message-with-guid requires ddScan=false"#))
++  let capabilityGuard = try #require(
++    dispatchBody.range(
++      of: #"send-message-with-guid is unavailable: no reply-capable GUID constructor"#))
++  let typedDDScan = try #require(
++    dispatchBody.range(of: "![clientGuidDDScanValue isKindOfClass:[NSNumber class]]"))
++  let claim = try #require(
++    dispatchBody.range(of: "claimClientMessageGuid(clientMessageGuid)"))
++  let send = try #require(
++    dispatchBody.range(of: "return response", range: claim.lowerBound..<dispatchBody.endIndex))
++  #expect(guardedAction.lowerBound < claim.lowerBound)
++  #expect(capabilityGuard.lowerBound < claim.lowerBound)
++  #expect(typedDDScan.lowerBound < claim.lowerBound)
++  #expect(synchronousOnly.lowerBound < claim.lowerBound)
++  #expect(claim.lowerBound < send.lowerBound)
++  #expect(dispatchBody.contains("releaseClientMessageGuid(clientMessageGuid)"))
++  #expect(dispatchBody.contains("requires a boolean ddScan value"))
++}
++
++@Test
++func clientGuidPersistencePollingUsesFixedBoundedAttempts() throws {
++  let testFile = URL(fileURLWithPath: #filePath)
++  let repoRoot =
++    testFile
++    .deletingLastPathComponent()
++    .deletingLastPathComponent()
++    .deletingLastPathComponent()
++  let server = repoRoot.appendingPathComponent("Sources/imsg/RPCServer.swift")
++  let source = try String(contentsOf: server, encoding: .utf8)
++  let definition = try #require(
++    source.range(of: "static func confirmClientGUIDPersistence"))
++  let verifierBody = String(source[definition.lowerBound...])
++
++  #expect(verifierBody.contains("for _ in 0..<100"))
++  #expect(verifierBody.contains("Task.checkCancellation()"))
++  #expect(verifierBody.contains("Task.sleep(nanoseconds: 50_000_000)"))
++  #expect(verifierBody.contains("messageMatchesCallerOwnedSend"))
++  #expect(!verifierBody.contains("Date()"))
++}
++
+ @Test
+ func injectedHelperConstructsCustomEmojiReactionsAtomically() throws {
+   let testFile = URL(fileURLWithPath: #filePath)
+diff --git a/Tests/imsgTests/CommandTestDatabase.swift b/Tests/imsgTests/CommandTestDatabase.swift
+index d4bb51a..ca52e28 100644
+--- a/Tests/imsgTests/CommandTestDatabase.swift
++++ b/Tests/imsgTests/CommandTestDatabase.swift
+@@ -64,6 +64,23 @@ enum CommandTestDatabase {
+     )
+   }
+ 
++  static func makeStoreForRPC(existingMessageGUID: String) throws -> MessageStore {
++    let db = try Connection(.inMemory)
++    try createSchema(
++      db,
++      includeChatHandleJoin: true,
++      includeReactionColumns: true
++    )
++    try seedRPCChat(db)
++    try db.run("UPDATE message SET guid = ? WHERE ROWID = 5", existingMessageGUID)
++    return try MessageStore(
++      connection: db,
++      path: ":memory:",
++      hasAttributedBody: false,
++      hasReactionColumns: true
++    )
++  }
++
+   static func makeStoreForRPCDirectChat() throws -> MessageStore {
+     let db = try Connection(.inMemory)
+     try createSchema(db, includeChatHandleJoin: true)
+diff --git a/Tests/imsgTests/RPCBridgeMessageHandlersTests.swift b/Tests/imsgTests/RPCBridgeMessageHandlersTests.swift
+index abe43b1..8b91d5c 100644
+--- a/Tests/imsgTests/RPCBridgeMessageHandlersTests.swift
++++ b/Tests/imsgTests/RPCBridgeMessageHandlersTests.swift
+@@ -26,6 +26,7 @@ func rpcStatusAdvertisesBridgeMessageMethods() {
+ 
+   for method in [
+     "send.rich",
++    "send.rich.client-guid",
+     "send.attachment",
+     "send.sticker",
+     "poll.send",
+@@ -293,6 +294,217 @@ func rpcSendRichInvokesBridgeWithResolvedChat() async throws {
+   #expect(result?["guid"] as? String == "rich-guid")
+ }
+ 
++@Test
++func rpcSendRichRejectsClientGuidSmugglingAndDedicatedMethodRequiresIt() async throws {
++  let store = try CommandTestDatabase.makeStoreForRPC()
++  let output = TestRPCOutput()
++  var calls = 0
++  let server = RPCServer(
++    store: store,
++    verbose: false,
++    output: output,
++    invokeBridge: { _, _ in
++      calls += 1
++      return [:]
++    }
++  )
++
++  await server.handleLineForTesting(
++    #"{"jsonrpc":"2.0","id":"smuggle","method":"send.rich","params":{"chat_id":1,"text":"clean","client_guid":"12345678-1234-4ABC-8DEF-1234567890AB"}}"#
++  )
++  #expect(calls == 0)
++  #expect((output.errors.first?["error"] as? [String: Any])?["code"] as? Int == -32602)
++  #expect(
++    ((output.errors.first?["error"] as? [String: Any])?["data"] as? String)?
++      .contains("send.rich.client-guid") == true
++  )
++
++  await server.handleLineForTesting(
++    #"{"jsonrpc":"2.0","id":"missing","method":"send.rich.client-guid","params":{"chat_id":1,"text":"clean"}}"#
++  )
++  #expect(calls == 0)
++  #expect((output.errors.last?["error"] as? [String: Any])?["code"] as? Int == -32602)
++  #expect(
++    ((output.errors.last?["error"] as? [String: Any])?["data"] as? String)?
++      .contains("requires client_guid") == true
++  )
++}
++
++@Test
++func rpcClientGuidSendPreservesCallerOwnedMessageGuidAndConfirmsPersistence() async throws {
++  let store = try CommandTestDatabase.makeStoreForRPC(
++    existingMessageGUID: "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA"
++  )
++  let output = TestRPCOutput()
++  let clientGUID = "12345678-1234-4ABC-8DEF-1234567890AB"
++  var capturedAction: BridgeAction?
++  var capturedParams: [String: Any] = [:]
++  var verifierCalled = false
++  var persistenceGUID: String?
++  let server = RPCServer(
++    store: store,
++    verbose: false,
++    output: output,
++    resolveSentMessage: { _, _, _, _ in
++      verifierCalled = true
++      return nil
++    },
++    confirmClientGUIDPersistence: { _, expectation in
++      persistenceGUID = expectation.guid
++      #expect(expectation.text == "clean")
++      #expect(expectation.chatID == 1)
++      #expect(expectation.threadOriginatorGUID == "parent-guid")
++      return true
++    },
++    invokeBridge: { action, params in
++      capturedAction = action
++      capturedParams = params
++      return ["messageGuid": clientGUID, "queued": false]
++    }
++  )
++
++  await server.handleLineForTesting(
++    #"{"jsonrpc":"2.0","id":"owned","method":"send.rich.client-guid","params":{"chat_id":1,"text":"clean","reply_to":"parent-guid","client_guid":"12345678-1234-4ABC-8DEF-1234567890AB"}}"#
++  )
++
++  #expect(capturedAction == .sendMessageWithGUID)
++  #expect(capturedParams["clientMessageGuid"] as? String == clientGUID)
++  #expect(capturedParams["selectedMessageGuid"] as? String == "parent-guid")
++  #expect(capturedParams["ddScan"] as? Bool == false)
++  #expect(!verifierCalled)
++  #expect(persistenceGUID == clientGUID)
++  let result = output.responses.first?["result"] as? [String: Any]
++  #expect(result?["queued"] as? Bool == false)
++  #expect(result?["guid"] as? String == clientGUID)
++  #expect(result?["message_id"] as? String == clientGUID)
++}
++
++@Test
++func rpcClientGuidSendReportsAmbiguousFailureWhenPersistenceIsNotConfirmed() async throws {
++  let store = try CommandTestDatabase.makeStoreForRPC(
++    existingMessageGUID: "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA"
++  )
++  let output = TestRPCOutput()
++  let clientGUID = "12345678-1234-4ABC-8DEF-1234567890AB"
++  var bridgeCalls = 0
++  var persistenceChecks = 0
++  let server = RPCServer(
++    store: store,
++    verbose: false,
++    output: output,
++    confirmClientGUIDPersistence: { _, expectation in
++      persistenceChecks += 1
++      #expect(expectation.guid == clientGUID)
++      #expect(expectation.text == "clean")
++      #expect(expectation.chatID == 1)
++      #expect(expectation.threadOriginatorGUID == nil)
++      return false
++    },
++    invokeBridge: { _, _ in
++      bridgeCalls += 1
++      return ["messageGuid": clientGUID, "queued": false]
++    }
++  )
++
++  await server.handleLineForTesting(
++    #"{"jsonrpc":"2.0","id":"ambiguous","method":"send.rich.client-guid","params":{"chat_id":1,"text":"clean","client_guid":"12345678-1234-4ABC-8DEF-1234567890AB"}}"#
++  )
++
++  #expect(bridgeCalls == 1)
++  #expect(persistenceChecks == 1)
++  #expect(output.responses.isEmpty)
++  #expect((output.errors.first?["error"] as? [String: Any])?["code"] as? Int == -32603)
++  #expect(
++    ((output.errors.first?["error"] as? [String: Any])?["data"] as? String)?
++      .contains("delivery state is ambiguous") == true
++  )
++}
++
++@Test
++func rpcClientGuidSendRejectsInvalidOrMismatchedCallerOwnedMessageGuid() async throws {
++  let store = try CommandTestDatabase.makeStoreForRPC(
++    existingMessageGUID: "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA"
++  )
++  let output = TestRPCOutput()
++  var calls = 0
++  let server = RPCServer(
++    store: store,
++    verbose: false,
++    output: output,
++    invokeBridge: { _, _ in
++      calls += 1
++      return ["messageGuid": "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA"]
++    }
++  )
++
++  await server.handleLineForTesting(
++    #"{"jsonrpc":"2.0","id":"bad","method":"send.rich.client-guid","params":{"chat_id":1,"text":"clean","client_guid":"12345678-1234-4abc-8def-1234567890ab"}}"#
++  )
++  #expect(calls == 0)
++  #expect((output.errors.first?["error"] as? [String: Any])?["code"] as? Int == -32602)
++
++  for (id, field) in [
++    ("null", #""dd_scan":null"#),
++    ("array", #""ddScan":[]"#),
++    ("object", #""dd_scan":{}"#),
++    ("string", #""ddScan":"false""#),
++  ] {
++    await server.handleLineForTesting(
++      #"{"jsonrpc":"2.0","id":"\#(id)","method":"send.rich.client-guid","params":{"chat_id":1,"text":"clean","client_guid":"12345678-1234-4ABC-8DEF-1234567890AB",\#(field)}}"#
++    )
++    #expect(calls == 0)
++    #expect((output.errors.last?["error"] as? [String: Any])?["code"] as? Int == -32602)
++    #expect(
++      ((output.errors.last?["error"] as? [String: Any])?["data"] as? String)?
++        .contains("must be a boolean") == true
++    )
++  }
++
++  await server.handleLineForTesting(
++    #"{"jsonrpc":"2.0","id":"deferred","method":"send.rich.client-guid","params":{"chat_id":1,"text":"clean","client_guid":"12345678-1234-4ABC-8DEF-1234567890AB","dd_scan":true}}"#
++  )
++  #expect(calls == 0)
++  #expect((output.errors.last?["error"] as? [String: Any])?["code"] as? Int == -32602)
++  #expect(
++    ((output.errors.last?["error"] as? [String: Any])?["data"] as? String)?
++      .contains("dd_scan must be false") == true
++  )
++
++  await server.handleLineForTesting(
++    #"{"jsonrpc":"2.0","id":"mismatch","method":"send.rich.client-guid","params":{"chat_id":1,"text":"clean","client_guid":"12345678-1234-4ABC-8DEF-1234567890AB"}}"#
++  )
++  #expect(calls == 1)
++  #expect((output.errors.last?["error"] as? [String: Any])?["code"] as? Int == -32603)
++}
++
++@Test
++func rpcClientGuidSendRejectsGuidAlreadyPresentInMessages() async throws {
++  let clientGUID = "12345678-1234-4ABC-8DEF-1234567890AB"
++  let store = try CommandTestDatabase.makeStoreForRPC(existingMessageGUID: clientGUID)
++  let output = TestRPCOutput()
++  var calls = 0
++  let server = RPCServer(
++    store: store,
++    verbose: false,
++    output: output,
++    invokeBridge: { _, _ in
++      calls += 1
++      return [:]
++    }
++  )
++
++  await server.handleLineForTesting(
++    #"{"jsonrpc":"2.0","id":"duplicate","method":"send.rich.client-guid","params":{"chat_id":1,"text":"clean","client_guid":"12345678-1234-4ABC-8DEF-1234567890AB"}}"#
++  )
++
++  #expect(calls == 0)
++  #expect((output.errors.first?["error"] as? [String: Any])?["code"] as? Int == -32602)
++  #expect(
++    ((output.errors.first?["error"] as? [String: Any])?["data"] as? String)?
++      .contains("already present") == true
++  )
++}
++
+ @Test
+ func rpcSendRichSuppressesQueuedBridgeGuid() async throws {
+   let store = try CommandTestDatabase.makeStoreForRPC()

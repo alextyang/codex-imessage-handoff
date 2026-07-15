@@ -1,0 +1,1243 @@
+diff --git a/Sources/IMsgHelper/IMsgInjected.m b/Sources/IMsgHelper/IMsgInjected.m
+index 07208dc..a7ae796 100644
+--- a/Sources/IMsgHelper/IMsgInjected.m
++++ b/Sources/IMsgHelper/IMsgInjected.m
+@@ -300,28 +300,49 @@ static BOOL ensureSecureDirectory(NSString *path, NSError **error) {
+ static BOOL gHasEditMessage = NO;                // editMessage:atPartIndex:withNewPartText:backwardCompatabilityText:
+ static BOOL gHasRetractMessagePart = NO;         // retractMessagePart:
+ static BOOL gHasSendMessageReason = NO;          // sendMessage:reason:
++static BOOL gHasCustomEmojiReaction = NO;        // instantMessageWithAssociatedMessageContent:...associatedMessageEmoji:...
+ 
+ static BOOL pollPayloadMessageInitializerAvailable(void);
+ static BOOL pollVoteMessageInitializerAvailable(void);
+ static NSDictionary *nicknameSharingSelectorStatus(void);
+ static BOOL urlPreviewMessageInitializerAvailable(void);
+ 
++static SEL customEmojiReactionSelector(void) {
++    return NSSelectorFromString(
++        @"instantMessageWithAssociatedMessageContent:associatedMessageGUID:"
++         "associatedMessageType:associatedMessageRange:associatedMessageEmoji:"
++         "messageSummaryInfo:threadIdentifier:");
++}
++
++static BOOL customEmojiReactionInitializerAvailable(void) {
++    Class messageClass = NSClassFromString(@"IMMessage");
++    SEL selector = customEmojiReactionSelector();
++    NSMethodSignature *signature = messageClass
++        ? [messageClass methodSignatureForSelector:selector]
++        : nil;
++    return messageClass
++        && [messageClass respondsToSelector:selector]
++        && signature.numberOfArguments == 9;
++}
++
+ static void probeSelectors(void) {
+     Class chatClass = NSClassFromString(@"IMChat");
+-    if (!chatClass) return;
+-    gHasEditMessageItemTranslation = [chatClass instancesRespondToSelector:
+-        @selector(editMessageItem:atPartIndex:withNewPartText:newPartTranslation:backwardCompatabilityText:)];
+-    gHasEditMessageItem = [chatClass instancesRespondToSelector:
+-        @selector(editMessageItem:atPartIndex:withNewPartText:backwardCompatabilityText:)];
+-    gHasEditMessage = [chatClass instancesRespondToSelector:
+-        @selector(editMessage:atPartIndex:withNewPartText:backwardCompatabilityText:)];
+-    gHasRetractMessagePart = [chatClass instancesRespondToSelector:
+-        @selector(retractMessagePart:)];
+-    gHasSendMessageReason = [chatClass instancesRespondToSelector:
+-        @selector(sendMessage:reason:)];
+-    NSLog(@"[imsg-bridge] Selector probes: editItemTranslation=%d editItem=%d editLegacy=%d retract=%d sendReason=%d",
++    if (chatClass) {
++        gHasEditMessageItemTranslation = [chatClass instancesRespondToSelector:
++            @selector(editMessageItem:atPartIndex:withNewPartText:newPartTranslation:backwardCompatabilityText:)];
++        gHasEditMessageItem = [chatClass instancesRespondToSelector:
++            @selector(editMessageItem:atPartIndex:withNewPartText:backwardCompatabilityText:)];
++        gHasEditMessage = [chatClass instancesRespondToSelector:
++            @selector(editMessage:atPartIndex:withNewPartText:backwardCompatabilityText:)];
++        gHasRetractMessagePart = [chatClass instancesRespondToSelector:
++            @selector(retractMessagePart:)];
++        gHasSendMessageReason = [chatClass instancesRespondToSelector:
++            @selector(sendMessage:reason:)];
++    }
++    gHasCustomEmojiReaction = customEmojiReactionInitializerAvailable();
++    NSLog(@"[imsg-bridge] Selector probes: editItemTranslation=%d editItem=%d editLegacy=%d retract=%d sendReason=%d customEmoji=%d",
+           gHasEditMessageItemTranslation, gHasEditMessageItem, gHasEditMessage,
+-          gHasRetractMessagePart, gHasSendMessageReason);
++          gHasRetractMessagePart, gHasSendMessageReason, gHasCustomEmojiReaction);
+ }
+ 
+ #pragma mark - Forward Declarations for IMCore Classes
+@@ -396,6 +417,10 @@ - (NSString *)threadIdentifier;
+ - (void)_updateText:(NSAttributedString *)attributedText;
+ - (void)setThreadIdentifier:(NSString *)threadIdentifier;
+ - (void)setThreadOriginator:(id)originator;
++- (NSString *)associatedMessageGUID;
++- (long long)associatedMessageType;
++- (NSRange)associatedMessageRange;
++- (NSString *)associatedMessageEmoji;
+ + (id)messageFromIMMessageItem:(id)item sender:(id)sender subject:(id)subject;
+ @end
+ 
+@@ -768,7 +793,7 @@ static id findChat(NSString *identifier) {
+ static NSDictionary* handleTyping(NSInteger requestId, NSDictionary *params) {
+     NSString *handle = params[@"handle"];
+     NSNumber *state = params[@"typing"] ?: params[@"state"];
+-    debugLog(@"handleTyping: enter handle=%@ state=%@ params=%@", handle, state, params);
++    debugLog(@"handleTyping: request received state=%d", [state boolValue]);
+ 
+     if (!handle) {
+         return errorResponse(requestId, @"Missing required parameter: handle");
+@@ -778,7 +803,7 @@ static id findChat(NSString *identifier) {
+     id chat = findChat(handle);
+ 
+     if (!chat) {
+-        debugLog(@"handleTyping: chat not found for %@", handle);
++        debugLog(@"handleTyping: chat not found");
+         return errorResponse(requestId,
+             [NSString stringWithFormat:@"Chat not found: %@", handle]);
+     }
+@@ -824,10 +849,9 @@ static id findChat(NSString *identifier) {
+             }
+         }
+ 
+-        debugLog(@"handleTyping: chat class=%@ guid=%@ ident=%@ supportsTyping=%d alreadyTyping=%d "
+-                 @"acctService=%@ acctActive=%d acctLoggedIn=%d target=%d",
+-                 chatClass, chatGUID, chatIdent, supportsTyping, isCurrentlyTyping,
+-                 acctService, acctActive, acctLoggedIn, typing);
++        debugLog(@"handleTyping: supportsTyping=%d alreadyTyping=%d accountActive=%d "
++                 @"accountLoggedIn=%d target=%d",
++                 supportsTyping, isCurrentlyTyping, acctActive, acctLoggedIn, typing);
+ 
+         NSLog(@"[imsg-bridge] Chat found: class=%@, guid=%@, identifier=%@, supportsTyping=%@",
+               chatClass, chatGUID, chatIdent, supportsTyping ? @"YES" : @"NO");
+@@ -860,10 +884,10 @@ static id findChat(NSString *identifier) {
+             });
+         }
+ 
+-        debugLog(@"handleTyping: setLocalUserIsTyping: not available on chat class=%@", chatClass);
++        debugLog(@"handleTyping: setLocalUserIsTyping unavailable");
+         return errorResponse(requestId, @"setLocalUserIsTyping: method not available");
+     } @catch (NSException *exception) {
+-        debugLog(@"handleTyping: exception=%@", exception.reason);
++        debugLog(@"handleTyping: exception");
+         return errorResponse(requestId,
+             [NSString stringWithFormat:@"Failed to set typing: %@", exception.reason]);
+     }
+@@ -871,7 +895,7 @@ static id findChat(NSString *identifier) {
+ 
+ static NSDictionary* handleRead(NSInteger requestId, NSDictionary *params) {
+     NSString *handle = params[@"handle"];
+-    debugLog(@"handleRead: enter handle=%@ params=%@", handle, params);
++    debugLog(@"handleRead: request received");
+ 
+     if (!handle) {
+         return errorResponse(requestId, @"Missing required parameter: handle");
+@@ -880,7 +904,7 @@ static id findChat(NSString *identifier) {
+     id chat = findChat(handle);
+ 
+     if (!chat) {
+-        debugLog(@"handleRead: chat not found for %@", handle);
++        debugLog(@"handleRead: chat not found");
+         return errorResponse(requestId,
+             [NSString stringWithFormat:@"Chat not found: %@", handle]);
+     }
+@@ -897,8 +921,8 @@ static id findChat(NSString *identifier) {
+ 
+     @try {
+         SEL readSel = @selector(markAllMessagesAsRead);
+-        debugLog(@"handleRead: chat class=%@ unreadBefore=%lu hasUnread=%d responds=%d",
+-                 chatClass, (unsigned long)unreadBefore, hadUnread,
++        debugLog(@"handleRead: unreadBefore=%lu hasUnread=%d responds=%d",
++                 (unsigned long)unreadBefore, hadUnread,
+                  [chat respondsToSelector:readSel]);
+         if ([chat respondsToSelector:readSel]) {
+             [chat performSelector:readSel];
+@@ -921,7 +945,7 @@ static id findChat(NSString *identifier) {
+             return errorResponse(requestId, @"markAllMessagesAsRead method not available");
+         }
+     } @catch (NSException *exception) {
+-        debugLog(@"handleRead: exception=%@", exception.reason);
++        debugLog(@"handleRead: exception");
+         return errorResponse(requestId,
+             [NSString stringWithFormat:@"Failed to mark as read: %@", exception.reason]);
+     }
+@@ -1030,6 +1054,7 @@ static BOOL stickerTransferSelectorsAvailable(void) {
+                 && stickerAssociatedMessage),
+         @"urlPreviewMessage": @(urlPreviewMessageInitializerAvailable()),
+         @"sendRichLinkAction": @YES,
++        @"customEmojiReaction": @(gHasCustomEmojiReaction),
+         @"pollUpdateMessage": @(pollVoteMessageInitializerAvailable()),
+         @"deleteChat": @(hasRegistry &&
+             [registryClass instancesRespondToSelector:NSSelectorFromString(@"deleteChat:")]),
+@@ -1043,7 +1068,7 @@ static BOOL stickerTransferSelectorsAvailable(void) {
+         @"chat_count": @(chatCount),
+         @"typing_available": @(hasRegistry),
+         @"read_available": @(hasRegistry),
+-        @"custom_emoji_tapbacks": @YES,
++        @"custom_emoji_tapbacks": @(gHasCustomEmojiReaction),
+         @"bridge_version": @2,
+         @"v2_ready": @(rpcInboxTimer != nil),
+         @"attachment_metadata": @YES,
+@@ -1581,8 +1606,7 @@ static id constructIMMessageViaItem(NSAttributedString *attributedText,
+             beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.05]];
+     }
+     if (!parent) {
+-        debugLog(@"deriveThreadIdentifier: parent did not load within 3s for %@",
+-                 parentGuid);
++        debugLog(@"deriveThreadIdentifier: parent did not load within timeout");
+         return nil;
+     }
+     if (outParentMessage) *outParentMessage = parent;
+@@ -1633,8 +1657,7 @@ static id constructIMMessageViaItem(NSAttributedString *attributedText,
+         NSString *existingIdentifier =
+             [parent performSelector:@selector(threadIdentifier)];
+         if (existingIdentifier.length > 0) {
+-            debugLog(@"deriveThreadIdentifier: parent=%@ existing=%@",
+-                     parentGuid, existingIdentifier);
++            debugLog(@"deriveThreadIdentifier: reused existing identifier");
+             return existingIdentifier;
+         }
+     }
+@@ -1646,8 +1669,7 @@ static id constructIMMessageViaItem(NSAttributedString *attributedText,
+         return nil;
+     }
+     NSString *result = fn(chatItem);
+-    debugLog(@"deriveThreadIdentifier: parent=%@ result=%@",
+-             parentGuid, result ?: @"(nil)");
++    debugLog(@"deriveThreadIdentifier: generated=%d", result.length > 0);
+     return result;
+ }
+ 
+@@ -2249,55 +2271,84 @@ static unsigned long long flagsForMessagePayload(NSAttributedString *subject,
+                                                  NSArray *fileTransferGuids,
+                                                  BOOL isAudioMessage);
+ 
+-static id buildIMMessage(NSAttributedString *body,
+-                         NSAttributedString *subject,
+-                         NSString *effectId,
+-                         NSString *threadIdentifier,
+-                         id threadOriginator,
+-                         NSString *associatedMessageGuid,
+-                         long long associatedMessageType,
+-                         NSRange associatedMessageRange,
+-                         NSDictionary *summaryInfo,
+-                         NSArray *fileTransferGuids,
+-                         BOOL isAudioMessage,
+-                         BOOL ddScan);
++typedef NS_ENUM(NSInteger, IMsgPollConstructionStage) {
++    IMsgPollConstructionStageNone = 0,
++    IMsgPollConstructionStageMessageClassMissing,
++    IMsgPollConstructionStageBalloonIdentifierEmpty,
++    IMsgPollConstructionStageLegacyItemAllocationNil,
++    IMsgPollConstructionStageLegacyItemInitializerNil,
++    IMsgPollConstructionStageLegacyWrapperNil,
++    IMsgPollConstructionStageAtomicInitializerUnavailable,
++    IMsgPollConstructionStageAtomicAllocationNil,
++    IMsgPollConstructionStageAtomicInitializerNil,
++    IMsgPollConstructionStageReplyThreadSetterUnavailable,
++    IMsgPollConstructionStageFallbackMessageNil,
++    IMsgPollConstructionStageFallbackBalloonSetterUnavailable,
++    IMsgPollConstructionStageFallbackPayloadSetterUnavailable,
++};
+ 
+-static void setBalloonConstructionFailure(NSString **outFailureCode,
+-                                          NSString *failureCode) {
+-    if (outFailureCode) *outFailureCode = failureCode;
++static NSString *pollConstructionStageCode(IMsgPollConstructionStage stage) {
++    switch (stage) {
++        case IMsgPollConstructionStageNone:
++            return @"IMSG_POLL_CONSTRUCT_NONE";
++        case IMsgPollConstructionStageMessageClassMissing:
++            return @"IMSG_POLL_CONSTRUCT_MESSAGE_CLASS_MISSING";
++        case IMsgPollConstructionStageBalloonIdentifierEmpty:
++            return @"IMSG_POLL_CONSTRUCT_BALLOON_ID_EMPTY";
++        case IMsgPollConstructionStageLegacyItemAllocationNil:
++            return @"IMSG_POLL_CONSTRUCT_LEGACY_ITEM_ALLOC_NIL";
++        case IMsgPollConstructionStageLegacyItemInitializerNil:
++            return @"IMSG_POLL_CONSTRUCT_LEGACY_ITEM_INIT_NIL";
++        case IMsgPollConstructionStageLegacyWrapperNil:
++            return @"IMSG_POLL_CONSTRUCT_LEGACY_WRAP_NIL";
++        case IMsgPollConstructionStageAtomicInitializerUnavailable:
++            return @"IMSG_POLL_CONSTRUCT_ATOMIC_INITIALIZER_UNAVAILABLE";
++        case IMsgPollConstructionStageAtomicAllocationNil:
++            return @"IMSG_POLL_CONSTRUCT_ATOMIC_ALLOC_NIL";
++        case IMsgPollConstructionStageAtomicInitializerNil:
++            return @"IMSG_POLL_CONSTRUCT_ATOMIC_INIT_NIL";
++        case IMsgPollConstructionStageReplyThreadSetterUnavailable:
++            return @"IMSG_POLL_CONSTRUCT_REPLY_THREAD_SETTER_UNAVAILABLE";
++        case IMsgPollConstructionStageFallbackMessageNil:
++            return @"IMSG_POLL_CONSTRUCT_FALLBACK_MESSAGE_NIL";
++        case IMsgPollConstructionStageFallbackBalloonSetterUnavailable:
++            return @"IMSG_POLL_CONSTRUCT_FALLBACK_BALLOON_SETTER_UNAVAILABLE";
++        case IMsgPollConstructionStageFallbackPayloadSetterUnavailable:
++            return @"IMSG_POLL_CONSTRUCT_FALLBACK_PAYLOAD_SETTER_UNAVAILABLE";
++    }
++    return @"IMSG_POLL_CONSTRUCT_UNKNOWN";
++}
++
++static void setPollConstructionStage(IMsgPollConstructionStage *outStage,
++                                     IMsgPollConstructionStage stage) {
++    if (outStage) *outStage = stage;
++}
++
++static NSArray<id> *messageAndBackingItemTargets(id message) {
++    if (!message) return @[];
++    SEL itemSelector = NSSelectorFromString(@"_imMessageItem");
++    if ([message respondsToSelector:itemSelector]) {
++        @try {
++            id item = [message performSelector:itemSelector];
++            if (item && item != message) return @[item, message];
++        } @catch (__unused NSException *exception) {}
++    }
++    return @[message];
+ }
+ 
+-static BOOL stampBalloonMetadataOnMessage(id message,
+-                                          NSString *balloonID,
+-                                          NSData *payloadData,
+-                                          NSDictionary *summaryInfo) {
+-    if (!message) return NO;
+-    NSMutableArray *targets = [NSMutableArray arrayWithObject:message];
+-    SEL itemSel = NSSelectorFromString(@"_imMessageItem");
+-    if ([message respondsToSelector:itemSel]) {
++static BOOL applyThreadIdentifierToMessageAndBacking(id message,
++                                                     NSString *threadIdentifier) {
++    if (!message || !threadIdentifier.length) return NO;
++    BOOL applied = NO;
++    for (id target in messageAndBackingItemTargets(message)) {
++        if (![target respondsToSelector:@selector(setThreadIdentifier:)]) continue;
+         @try {
+-            id item = [message performSelector:itemSel];
+-            if (item) [targets insertObject:item atIndex:0];
+-        } @catch (__unused NSException *e) {}
+-    }
+-    BOOL balloonStamped = NO;
+-    BOOL payloadStamped = NO;
+-    for (id target in targets) {
+-        if ([target respondsToSelector:@selector(setBalloonBundleID:)]) {
+-            [target performSelector:@selector(setBalloonBundleID:) withObject:balloonID];
+-            balloonStamped = YES;
+-        }
+-        if ([target respondsToSelector:@selector(setPayloadData:)]) {
+-            [target performSelector:@selector(setPayloadData:) withObject:payloadData];
+-            payloadStamped = YES;
+-        }
+-        if (summaryInfo
+-            && [target respondsToSelector:@selector(setMessageSummaryInfo:)]) {
+-            [target performSelector:@selector(setMessageSummaryInfo:)
+-                         withObject:summaryInfo];
+-        }
++            [target performSelector:@selector(setThreadIdentifier:)
++                         withObject:threadIdentifier];
++            applied = YES;
++        } @catch (__unused NSException *exception) {}
+     }
+-    return balloonStamped && payloadStamped;
++    return applied;
+ }
+ 
+ static id buildBalloonIMMessage(NSString *balloonID,
+@@ -2310,16 +2361,18 @@ static id buildBalloonIMMessage(NSString *balloonID,
+                                 NSString *threadOriginatorGUID,
+                                 NSString *threadOriginatorPart,
+                                 id parentItem,
+-                                NSString **outFailureCode) {
+-    if (outFailureCode) *outFailureCode = nil;
++                                IMsgPollConstructionStage *outConstructionStage) {
++    setPollConstructionStage(outConstructionStage, IMsgPollConstructionStageNone);
+     Class messageClass = NSClassFromString(@"IMMessage");
+     if (!messageClass) {
+-        setBalloonConstructionFailure(outFailureCode, @"missing-class");
++        setPollConstructionStage(outConstructionStage,
++                                 IMsgPollConstructionStageMessageClassMissing);
+         debugLog(@"buildBalloonIMMessage: missing IMMessage class");
+         return nil;
+     }
+     if (!balloonID.length) {
+-        setBalloonConstructionFailure(outFailureCode, @"empty-balloon");
++        setPollConstructionStage(outConstructionStage,
++                                 IMsgPollConstructionStageBalloonIdentifierEmpty);
+         debugLog(@"buildBalloonIMMessage: empty balloon identifier");
+         return nil;
+     }
+@@ -2344,7 +2397,8 @@ static id buildBalloonIMMessage(NSString *balloonID,
+ 
+         id item = [itemClass alloc];
+         if (!item) {
+-            setBalloonConstructionFailure(outFailureCode, @"legacy-item-alloc");
++            setPollConstructionStage(outConstructionStage,
++                                     IMsgPollConstructionStageLegacyItemAllocationNil);
+             debugLog(@"buildBalloonIMMessage: reply item allocation failed");
+             return nil;
+         }
+@@ -2374,7 +2428,8 @@ static id buildBalloonIMMessage(NSString *balloonID,
+         [iinv retainArguments];
+         item = invokeReturningObject(iinv);
+         if (!item) {
+-            setBalloonConstructionFailure(outFailureCode, @"legacy-item-init");
++            setPollConstructionStage(outConstructionStage,
++                                     IMsgPollConstructionStageLegacyItemInitializerNil);
+             debugLog(@"buildBalloonIMMessage: reply item initializer returned nil");
+             return nil;
+         }
+@@ -2427,7 +2482,8 @@ static id buildBalloonIMMessage(NSString *balloonID,
+         [winv retainArguments];
+         id wrapped = invokeReturningObject(winv);
+         if (!wrapped) {
+-            setBalloonConstructionFailure(outFailureCode, @"legacy-wrap");
++            setPollConstructionStage(outConstructionStage,
++                                     IMsgPollConstructionStageLegacyWrapperNil);
+             debugLog(@"buildBalloonIMMessage: legacy reply item wrapper returned nil");
+             return nil;
+         }
+@@ -2445,12 +2501,19 @@ static id buildBalloonIMMessage(NSString *balloonID,
+ 
+     SEL sel = @selector(initWithSender:time:text:messageSubject:fileTransferGUIDs:flags:error:guid:subject:balloonBundleID:payloadData:expressiveSendStyleID:threadIdentifier:scheduleType:scheduleState:messageSummaryInfo:);
+     if (![messageClass instancesRespondToSelector:sel]) {
+-        setBalloonConstructionFailure(outFailureCode, @"atomic-selector");
++        setPollConstructionStage(outConstructionStage,
++                                 IMsgPollConstructionStageAtomicInitializerUnavailable);
+         debugLog(@"buildBalloonIMMessage: atomic payload initializer unavailable");
+         return nil;
+     }
+ 
+     id msg = [[messageClass alloc] init];
++    if (!msg) {
++        setPollConstructionStage(outConstructionStage,
++                                 IMsgPollConstructionStageAtomicAllocationNil);
++        debugLog(@"buildBalloonIMMessage: atomic message allocation returned nil");
++        return nil;
++    }
+     NSMethodSignature *sig = [messageClass instanceMethodSignatureForSelector:sel];
+     NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
+     [inv setSelector:sel];
+@@ -2485,51 +2548,18 @@ static id buildBalloonIMMessage(NSString *balloonID,
+     [inv retainArguments];
+     id result = invokeReturningObject(inv);
+     if (!result) {
+-        if (replyToGUID.length) {
+-            id fallback = buildIMMessage(body,
+-                                         nil,
+-                                         nil,
+-                                         messageThreadIdentifier,
+-                                         parentItem,
+-                                         nil,
+-                                         0,
+-                                         NSMakeRange(0, 0),
+-                                         summaryInfo,
+-                                         @[],
+-                                         NO,
+-                                         NO);
+-            if (stampBalloonMetadataOnMessage(fallback,
+-                                              balloonID,
+-                                              payloadData,
+-                                              summaryInfo)) {
+-                debugLog(@"buildBalloonIMMessage: ordinary reply fallback succeeded");
+-                return fallback;
+-            }
+-        }
+-        setBalloonConstructionFailure(outFailureCode, @"atomic-init-nil");
+-        debugLog(@"buildBalloonIMMessage: %@ payload initializer returned nil",
+-                 replyToGUID.length ? @"reply" : @"top-level");
++        setPollConstructionStage(outConstructionStage,
++                                 IMsgPollConstructionStageAtomicInitializerNil);
++        debugLog(@"buildBalloonIMMessage: payload initializer returned nil reply=%d",
++                 replyToGUID.length > 0);
+         return nil;
+     }
+     if (replyToGUID.length && messageThreadIdentifier.length) {
+-        BOOL threadIdentifierApplied = NO;
+-        if ([result respondsToSelector:@selector(setThreadIdentifier:)]) {
+-            [result performSelector:@selector(setThreadIdentifier:)
+-                         withObject:messageThreadIdentifier];
+-            threadIdentifierApplied = YES;
+-        }
+-        SEL itemSel = NSSelectorFromString(@"_imMessageItem");
+-        if (!threadIdentifierApplied && [result respondsToSelector:itemSel]) {
+-            @try {
+-                id resultItem = [result performSelector:itemSel];
+-                if ([resultItem respondsToSelector:@selector(setThreadIdentifier:)]) {
+-                    [resultItem performSelector:@selector(setThreadIdentifier:)
+-                                     withObject:messageThreadIdentifier];
+-                    threadIdentifierApplied = YES;
+-                }
+-            } @catch (__unused NSException *e) {}
+-        }
+-        if (!threadIdentifierApplied) {
++        if (!applyThreadIdentifierToMessageAndBacking(result,
++                                                      messageThreadIdentifier)) {
++            setPollConstructionStage(
++                outConstructionStage,
++                IMsgPollConstructionStageReplyThreadSetterUnavailable);
+             debugLog(@"buildBalloonIMMessage: reply thread setter unavailable");
+         } else {
+             debugLog(@"buildBalloonIMMessage: atomic reply construction succeeded");
+@@ -2548,7 +2578,7 @@ static id buildPollIMMessage(NSAttributedString *body,
+                              NSString *threadOriginatorGUID,
+                              NSString *threadOriginatorPart,
+                              id parentItem,
+-                             NSString **outFailureCode) {
++                             IMsgPollConstructionStage *outConstructionStage) {
+     return buildBalloonIMMessage(pollsBalloonBundleIdentifier(),
+                                  body,
+                                  payloadData,
+@@ -2559,7 +2589,7 @@ static id buildPollIMMessage(NSAttributedString *body,
+                                  threadOriginatorGUID,
+                                  threadOriginatorPart,
+                                  parentItem,
+-                                 outFailureCode);
++                                 outConstructionStage);
+ }
+ 
+ static NSString *urlPreviewBalloonBundleIdentifier(void) {
+@@ -2608,8 +2638,7 @@ static BOOL replaceURLPreviewImagesWithAttachmentSubstitute(LPLinkMetadata *meta
+             NSArray *installed = [metadata valueForKey:@"_contentImages"];
+             if ([installed containsObject:substitute]) return YES;
+         } @catch (NSException *ignored) {
+-            debugLog(@"rich-link: could not install image substitute: %@",
+-                     ignored.reason ?: exception.reason ?: @"unknown");
++            debugLog(@"rich-link: could not install image substitute");
+         }
+     }
+     return NO;
+@@ -2791,6 +2820,65 @@ static unsigned long long flagsForAssociatedMessagePayload(NSAttributedString *s
+     return flagsForMessagePayload(subject, fileTransferGuids, isAudioMessage);
+ }
+ 
++/// Custom emoji reactions must carry the emoji atomically. The ordinary
++/// associated-message initializers do not accept `associatedMessageEmoji`,
++/// and setting it after construction is not preserved by IMCore's wrapper.
++static id buildCustomEmojiReactionIMMessage(NSAttributedString *body,
++                                            NSString *associatedMessageGuid,
++                                            long long associatedMessageType,
++                                            NSRange associatedMessageRange,
++                                            NSString *associatedMessageEmoji,
++                                            NSDictionary *summaryInfo,
++                                            NSString *threadIdentifier) {
++    if (!body.length || !associatedMessageGuid.length || !associatedMessageEmoji.length) {
++        return nil;
++    }
++    if (associatedMessageType != 2006 && associatedMessageType != 3006) {
++        return nil;
++    }
++
++    Class messageClass = NSClassFromString(@"IMMessage");
++    SEL selector = customEmojiReactionSelector();
++    if (!gHasCustomEmojiReaction || !messageClass
++        || ![messageClass respondsToSelector:selector]) {
++        return nil;
++    }
++    NSMethodSignature *signature = [messageClass methodSignatureForSelector:selector];
++    if (signature.numberOfArguments != 9) return nil;
++
++    NSInvocation *invocation = [NSInvocation invocationWithMethodSignature:signature];
++    [invocation setSelector:selector];
++    [invocation setTarget:messageClass];
++    [invocation setArgument:&body atIndex:2];
++    [invocation setArgument:&associatedMessageGuid atIndex:3];
++    [invocation setArgument:&associatedMessageType atIndex:4];
++    [invocation setArgument:&associatedMessageRange atIndex:5];
++    [invocation setArgument:&associatedMessageEmoji atIndex:6];
++    [invocation setArgument:&summaryInfo atIndex:7];
++    [invocation setArgument:&threadIdentifier atIndex:8];
++    [invocation retainArguments];
++    id result = invokeReturningObject(invocation);
++    if (!result
++        || ![result respondsToSelector:@selector(associatedMessageGUID)]
++        || ![result respondsToSelector:@selector(associatedMessageType)]
++        || ![result respondsToSelector:@selector(associatedMessageRange)]
++        || ![result respondsToSelector:@selector(associatedMessageEmoji)]) {
++        return nil;
++    }
++
++    NSString *actualGuid = [(IMMessage *)result associatedMessageGUID];
++    long long actualType = [(IMMessage *)result associatedMessageType];
++    NSRange actualRange = [(IMMessage *)result associatedMessageRange];
++    NSString *actualEmoji = [(IMMessage *)result associatedMessageEmoji];
++    if (![actualGuid isEqualToString:associatedMessageGuid]
++        || actualType != associatedMessageType
++        || !NSEqualRanges(actualRange, associatedMessageRange)
++        || ![actualEmoji isEqualToString:associatedMessageEmoji]) {
++        return nil;
++    }
++    return result;
++}
++
+ /// Build an IMMessage suitable for `[chat sendMessage:]`. Handles plain text,
+ /// optional subject, optional effect (`com.apple.MobileSMS.expressivesend.*`),
+ /// optional reply target (`selectedMessageGuid`), and ddScan flag.
+@@ -2872,8 +2960,7 @@ static id buildIMMessage(NSAttributedString *body,
+             [inv setArgument:&summaryInfo atIndex:14];
+             [inv retainArguments];
+             id result = invokeReturningObject(inv);
+-            debugLog(@"buildIMMessage: reaction via macos26Sel result=%@",
+-                     result ? NSStringFromClass([result class]) : @"(nil)");
++            debugLog(@"buildIMMessage: reaction constructor returned=%d", result != nil);
+             if (result) {
+                 if (threadIdentifier
+                     && [result respondsToSelector:@selector(setThreadIdentifier:)]) {
+@@ -2887,8 +2974,7 @@ static id buildIMMessage(NSAttributedString *body,
+         // Legacy 17-arg form for older macOS.
+         SEL sel = @selector(initIMMessageWithSender:time:text:messageSubject:fileTransferGUIDs:flags:error:guid:subject:balloonBundleID:payloadData:expressiveSendStyleID:associatedMessageGUID:associatedMessageType:associatedMessageRange:messageSummaryInfo:);
+         BOOL responds = [messageClass instancesRespondToSelector:sel];
+-        debugLog(@"buildIMMessage: reaction path; long-init responds=%d type=%lld guid=%@",
+-                 responds, associatedMessageType, associatedMessageGuid);
++        debugLog(@"buildIMMessage: reaction path longInitializer=%d", responds);
+         id msg = [messageClass alloc];
+         if ([msg respondsToSelector:sel]) {
+             unsigned long long flags = flagsForAssociatedMessagePayload(subject,
+@@ -3662,8 +3748,8 @@ static BOOL validateRichLinkPreviewImage(NSDictionary *image,
+         threadIdentifier = deriveThreadIdentifier(selectedMessageGuid,
+                                                   &parentMessage,
+                                                   &parentItem);
+-        debugLog(@"handleSendMessage: parent=%@ threadId=%@",
+-                 selectedMessageGuid, threadIdentifier ?: @"(none)");
++        debugLog(@"handleSendMessage: reply=%d thread=%d",
++                 selectedMessageGuid.length > 0, threadIdentifier.length > 0);
+     } else {
+         clearThreadContextForChat(chat, nil);
+     }
+@@ -3716,8 +3802,7 @@ static BOOL validateRichLinkPreviewImage(NSDictionary *image,
+                     [fileTransferGuids addObject:transferGuid];
+                     debugLog(@"rich-link: prepared hidden preview transfer");
+                 } else {
+-                    debugLog(@"rich-link: hidden preview unavailable (%@); using metadata-only card",
+-                             prepErr ?: @"unknown");
++                    debugLog(@"rich-link: hidden preview unavailable; using metadata-only card");
+                     removeRichLinkPreviewSnapshot(richLinkSnapshotPath);
+                     richLinkSnapshotPath = nil;
+                     richLinkTransfer = nil;
+@@ -3845,6 +3930,75 @@ static BOOL validateRichLinkPreviewImage(NSDictionary *image,
+     }
+ }
+ 
++/// Reply polls use the same associated-message initializer as ordinary replies
++/// when the payload-bearing atomic initializer is unavailable. Stamp the Polls
++/// balloon metadata on both the message and its backing item, matching the
++/// proven poll-vote path. Summary metadata is also re-applied where supported;
++/// it was already supplied atomically to buildIMMessage.
++static id buildPollReplyFallbackIMMessage(NSAttributedString *body,
++                                          NSData *payloadData,
++                                          NSDictionary *summaryInfo,
++                                          NSString *threadIdentifier,
++                                          NSString *replyToGUID,
++                                          id parentItem,
++                                          IMsgPollConstructionStage *outConstructionStage) {
++    setPollConstructionStage(outConstructionStage, IMsgPollConstructionStageNone);
++    NSRange associatedRange = NSMakeRange(0, body.length);
++    id result = buildIMMessage(body,
++                               nil,
++                               nil,
++                               threadIdentifier,
++                               parentItem,
++                               replyToGUID,
++                               100,
++                               associatedRange,
++                               summaryInfo,
++                               @[],
++                               NO,
++                               NO);
++    if (!result) {
++        setPollConstructionStage(outConstructionStage,
++                                 IMsgPollConstructionStageFallbackMessageNil);
++        return nil;
++    }
++
++    BOOL balloonStamped = NO;
++    BOOL payloadStamped = NO;
++    NSString *balloonID = pollsBalloonBundleIdentifier();
++    for (id target in messageAndBackingItemTargets(result)) {
++        @try {
++            if ([target respondsToSelector:@selector(setBalloonBundleID:)]) {
++                [target performSelector:@selector(setBalloonBundleID:)
++                             withObject:balloonID];
++                balloonStamped = YES;
++            }
++            if ([target respondsToSelector:@selector(setPayloadData:)]) {
++                [target performSelector:@selector(setPayloadData:)
++                             withObject:payloadData];
++                payloadStamped = YES;
++            }
++            if (summaryInfo
++                && [target respondsToSelector:@selector(setMessageSummaryInfo:)]) {
++                [target performSelector:@selector(setMessageSummaryInfo:)
++                             withObject:summaryInfo];
++            }
++        } @catch (__unused NSException *exception) {}
++    }
++    if (!balloonStamped) {
++        setPollConstructionStage(
++            outConstructionStage,
++            IMsgPollConstructionStageFallbackBalloonSetterUnavailable);
++        return nil;
++    }
++    if (!payloadStamped) {
++        setPollConstructionStage(
++            outConstructionStage,
++            IMsgPollConstructionStageFallbackPayloadSetterUnavailable);
++        return nil;
++    }
++    return result;
++}
++
+ /// `send-poll`: construct a native Messages Polls extension balloon and send
+ /// it via IMCore. Payload shape mirrors Apple's Polls extension envelope:
+ /// archived layout metadata plus a data URL carrying the JSON poll definition.
+@@ -3911,8 +4065,8 @@ static BOOL validateRichLinkPreviewImage(NSDictionary *image,
+                                                   &parentItem);
+         parentChatItem = loadParentFirstChatItem(selectedMessageGuid, NULL);
+         threadOriginatorPart = threadOriginatorPartForChatItem(parentChatItem ?: parentItem);
+-        debugLog(@"handleSendPoll: parent=%@ threadId=%@",
+-                 selectedMessageGuid, threadIdentifier ?: @"(none)");
++        debugLog(@"handleSendPoll: reply=%d thread=%d",
++                 selectedMessageGuid.length > 0, threadIdentifier.length > 0);
+         if (!threadIdentifier.length || !parentMessage || !parentItem) {
+             return errorResponse(requestId,
+                 [NSString stringWithFormat:
+@@ -3923,7 +4077,8 @@ static BOOL validateRichLinkPreviewImage(NSDictionary *image,
+     }
+ 
+     @try {
+-        NSString *constructionFailure = nil;
++        IMsgPollConstructionStage primaryConstructionStage =
++            IMsgPollConstructionStageNone;
+         id imMessage = buildPollIMMessage(body,
+                                           payloadData,
+                                           summary,
+@@ -3932,23 +4087,45 @@ static BOOL validateRichLinkPreviewImage(NSDictionary *image,
+                                           threadOriginatorGUID,
+                                           threadOriginatorPart,
+                                           parentItem,
+-                                          &constructionFailure);
++                                          &primaryConstructionStage);
++        BOOL usedReplyFallback = NO;
++        if (!imMessage && replyToGUID.length) {
++            IMsgPollConstructionStage fallbackConstructionStage =
++                IMsgPollConstructionStageNone;
++            imMessage = buildPollReplyFallbackIMMessage(
++                body,
++                payloadData,
++                summary,
++                threadIdentifier,
++                replyToGUID,
++                parentItem,
++                &fallbackConstructionStage);
++            usedReplyFallback = imMessage != nil;
++            if (!imMessage) {
++                IMsgPollConstructionStage reportStage =
++                    primaryConstructionStage != IMsgPollConstructionStageNone
++                        ? primaryConstructionStage : fallbackConstructionStage;
++                return errorResponse(
++                    requestId,
++                    [NSString stringWithFormat:
++                        @"Could not construct poll IMMessage [%@]",
++                        pollConstructionStageCode(reportStage)]);
++            }
++        }
+         if (!imMessage) {
+-            NSString *failure = constructionFailure.length
+-                ? constructionFailure : @"unknown";
+-            return errorResponse(requestId,
++            return errorResponse(
++                requestId,
+                 [NSString stringWithFormat:
+-                    @"Could not construct poll IMMessage [%@]", failure]);
++                    @"Could not construct poll IMMessage [%@]",
++                    pollConstructionStageCode(primaryConstructionStage)]);
+         }
+         if (parentMessage
+             && [imMessage respondsToSelector:@selector(setThreadOriginator:)]) {
+             [imMessage performSelector:@selector(setThreadOriginator:)
+                             withObject:parentMessage];
+         }
+-        if (threadIdentifier
+-            && [imMessage respondsToSelector:@selector(setThreadIdentifier:)]) {
+-            [imMessage performSelector:@selector(setThreadIdentifier:)
+-                            withObject:threadIdentifier];
++        if (threadIdentifier.length) {
++            applyThreadIdentifierToMessageAndBacking(imMessage, threadIdentifier);
+         }
+         applyThreadOriginatorGUIDHints(imMessage,
+                                        selectedMessageGuid,
+@@ -3962,7 +4139,7 @@ static BOOL validateRichLinkPreviewImage(NSDictionary *image,
+             [optionPayloads addObject:@{@"id": identifier, @"text": options[i]}];
+         }
+ 
+-        return successResponse(requestId, @{
++        NSMutableDictionary *response = [@{
+             @"chatGuid": chatGuid,
+             @"messageGuid": guid ?: @"",
+             @"poll": @{
+@@ -3973,7 +4150,19 @@ static BOOL validateRichLinkPreviewImage(NSDictionary *image,
+                 @"sessionIdentifier": sessionIdentifier ?: @""
+             },
+             @"balloonBundleID": pollsBalloonBundleIdentifier()
+-        });
++        } mutableCopy];
++        if (replyToGUID.length) {
++            response[@"constructionPath"] = usedReplyFallback
++                ? @"ordinary-reply-fallback"
++                : (primaryConstructionStage ==
++                        IMsgPollConstructionStageReplyThreadSetterUnavailable
++                    ? @"atomic-dispatch-context" : @"atomic");
++            if (primaryConstructionStage != IMsgPollConstructionStageNone) {
++                response[@"constructionStage"] =
++                    pollConstructionStageCode(primaryConstructionStage);
++            }
++        }
++        return successResponse(requestId, response);
+     } @catch (NSException *exception) {
+         return errorResponse(requestId,
+             [NSString stringWithFormat:@"send-poll failed: %@", exception.reason]);
+@@ -4269,8 +4458,8 @@ static id buildPollVoteIMMessage(NSAttributedString *body,
+             threadIdentifier = deriveThreadIdentifier(selectedMessageGuid,
+                                                       &parentMessage,
+                                                       &parentItem);
+-            debugLog(@"handleSendMultipart: parent=%@ threadId=%@",
+-                     selectedMessageGuid, threadIdentifier ?: @"(none)");
++            debugLog(@"handleSendMultipart: reply=%d thread=%d",
++                     selectedMessageGuid.length > 0, threadIdentifier.length > 0);
+         } else {
+             clearThreadContextForChat(chat, nil);
+         }
+@@ -4947,8 +5136,8 @@ static BOOL configurePreviewPayloadTransfer(IMFileTransfer *transfer,
+             // Take a strong reference immediately — invocation returns an
+             // unretained pointer that ARC may release before the next use.
+             NSString *persistentPath = raw;
+-            debugLog(@"prepareOutgoingTransfer: persistentPath=%@ filename=%@",
+-                     persistentPath ?: @"(nil)", fn);
++            debugLog(@"prepareOutgoingTransfer: persistent path available=%d",
++                     persistentPath.length > 0);
+ 
+             NSError *legacyErr = nil;
+             BOOL legacyStaged = NO;
+@@ -5018,13 +5207,9 @@ static BOOL configurePreviewPayloadTransfer(IMFileTransfer *transfer,
+                 // transfer pointing at its original localURL and let
+                 // registerTransferWithDaemon: pick it up directly.
+                 if (legacyErr) {
+-                    debugLog(@"prepareOutgoingTransfer: legacy path %@ unusable (%@); "
+-                             @"keeping original localURL=%@ for registerTransferWithDaemon",
+-                             persistentPath ?: @"(nil)", legacyErr.localizedDescription,
+-                             originalURL.path);
++                    debugLog(@"prepareOutgoingTransfer: legacy path unavailable; using original URL");
+                 } else {
+-                    debugLog(@"prepareOutgoingTransfer: no persistent path; keeping "
+-                             @"original localURL=%@", originalURL.path);
++                    debugLog(@"prepareOutgoingTransfer: no persistent path; using original URL");
+                 }
+             }
+         }
+@@ -5191,8 +5376,8 @@ static BOOL registerPreparedTransfer(IMFileTransfer *transfer, NSString **outErr
+             threadIdentifier = deriveThreadIdentifier(selectedMessageGuid,
+                                                       &parentMessage,
+                                                       &parentItem);
+-            debugLog(@"handleSendAttachment: parent=%@ threadId=%@",
+-                     selectedMessageGuid, threadIdentifier ?: @"(none)");
++            debugLog(@"handleSendAttachment: reply=%d thread=%d",
++                     selectedMessageGuid.length > 0, threadIdentifier.length > 0);
+         } else {
+             clearThreadContextForChat(chat, nil);
+         }
+@@ -5506,6 +5691,10 @@ static void cleanupPreparedStickerPaths(NSString *snapshotPath,
+         return errorResponse(requestId,
+             [NSString stringWithFormat:@"Unknown reactionType: %@", reactionType]);
+     }
++    if (customEmoji.length && !gHasCustomEmojiReaction) {
++        return errorResponse(requestId,
++            @"Custom emoji reactions are unavailable on this macOS version");
++    }
+ 
+     // BlueBubblesHelper-verified format for tapbacks:
+     // associatedMessageGUID = `p:<partIndex>/<parent-guid>`. Without the
+@@ -5576,9 +5765,8 @@ static void cleanupPreparedStickerPaths(NSString *snapshotPath,
+     // imagent silently dropped the reaction.
+     NSDictionary *summary = @{ @"amc": @1,
+                                @"ams": parentText ?: @"" };
+-    debugLog(@"handleSendReaction: type=%lld range={%lu,%lu}",
+-             associatedType,
+-             (unsigned long)targetRange.location, (unsigned long)targetRange.length);
++    debugLog(@"handleSendReaction: constructed target range length=%lu",
++             (unsigned long)targetRange.length);
+ 
+     // One-shot probe: list every IMMessage class method that mentions
+     // "associated" or "instant" so we can see what reaction constructors
+@@ -5594,7 +5782,7 @@ static void cleanupPreparedStickerPaths(NSString *snapshotPath,
+             const char *name = sel_getName(method_getName(pm[i]));
+             if (strstr(name, "ersistent") || strstr(name, "ttachment")
+                 || strstr(name, "ransfer") || strstr(name, "ath")) {
+-                debugLog(@"  -[IMDPersistentAttachmentController %s]", name);
++                debugLog(@"handleSendReaction: matching attachment selector found");
+             }
+         }
+         if (pm) free(pm);
+@@ -5605,7 +5793,7 @@ static void cleanupPreparedStickerPaths(NSString *snapshotPath,
+             const char *name = sel_getName(method_getName(m[i]));
+             if (strstr(name, "ssociated") || strstr(name, "nstantMessage")
+                 || strstr(name, "eaction") || strstr(name, "knowledgment")) {
+-                debugLog(@"  +[IMMessage %s]", name);
++                debugLog(@"handleSendReaction: matching message selector found");
+             }
+         }
+         if (m) free(m);
+@@ -5617,21 +5805,35 @@ static void cleanupPreparedStickerPaths(NSString *snapshotPath,
+             const char *name = sel_getName(method_getName(im[i]));
+             if (strstr(name, "ssociated") || strstr(name, "ummary")
+                 || strstr(name, "ssociatedMessage")) {
+-                debugLog(@"  -[IMMessageItem %s]", name);
++                debugLog(@"handleSendReaction: matching message-item selector found");
+             }
+         }
+         if (im) free(im);
+     });
+     @try {
+-        id imMessage = buildIMMessage(body, nil, nil, nil,
+-                                      nil,
+-                                      associatedRef,
+-                                      associatedType,
+-                                      targetRange,
+-                                      summary,
+-                                      @[], NO, NO);
++        id imMessage = nil;
++        if (customEmoji.length) {
++            imMessage = buildCustomEmojiReactionIMMessage(body,
++                                                          associatedRef,
++                                                          associatedType,
++                                                          targetRange,
++                                                          customEmoji,
++                                                          summary,
++                                                          nil);
++        } else {
++            // Standard tapbacks retain the proven associated-message path.
++            imMessage = buildIMMessage(body, nil, nil, nil,
++                                       nil,
++                                       associatedRef,
++                                       associatedType,
++                                       targetRange,
++                                       summary,
++                                       @[], NO, NO);
++        }
+         if (!imMessage) {
+-            return errorResponse(requestId, @"Could not build reaction IMMessage");
++            return errorResponse(requestId, customEmoji.length
++                ? @"Could not build custom emoji reaction IMMessage"
++                : @"Could not build reaction IMMessage");
+         }
+         [chat performSelector:@selector(sendMessage:) withObject:imMessage];
+         debugLog(@"handleSendReaction: dispatched");
+@@ -5869,7 +6071,7 @@ static void cleanupPreparedStickerPaths(NSString *snapshotPath,
+ 
+ static NSDictionary *handleStartTyping(NSInteger requestId, NSDictionary *params) {
+     NSString *chatGuid = params[@"chatGuid"];
+-    debugLog(@"handleStartTyping: chatGuid=%@", chatGuid);
++    debugLog(@"handleStartTyping: request received");
+     if (!chatGuid.length) return errorResponse(requestId, @"Missing chatGuid");
+     IMChat *chat = resolveChatByGuid(chatGuid);
+     if (!chat) {
+@@ -5882,26 +6084,25 @@ static void cleanupPreparedStickerPaths(NSString *snapshotPath,
+     }
+     @try { [chat setLocalUserIsTyping:YES]; }
+     @catch (NSException *ex) {
+-        debugLog(@"handleStartTyping: exception=%@", ex.reason);
++        debugLog(@"handleStartTyping: exception");
+         return errorResponse(requestId, ex.reason ?: @"failed");
+     }
+     if ([chat respondsToSelector:@selector(isCurrentlyTyping)]) {
+         afterT = ((BOOL (*)(id, SEL))objc_msgSend)(chat, @selector(isCurrentlyTyping));
+     }
+-    debugLog(@"handleStartTyping: setLocalUserIsTyping:YES beforeIsTyping=%d afterIsTyping=%d "
+-             @"chatClass=%@", beforeT, afterT, NSStringFromClass([chat class]));
++    debugLog(@"handleStartTyping: before=%d after=%d", beforeT, afterT);
+     return successResponse(requestId, @{@"chatGuid": chatGuid, @"typing": @YES});
+ }
+ 
+ static NSDictionary *handleStopTyping(NSInteger requestId, NSDictionary *params) {
+     NSString *chatGuid = params[@"chatGuid"];
+-    debugLog(@"handleStopTyping: chatGuid=%@", chatGuid);
++    debugLog(@"handleStopTyping: request received");
+     if (!chatGuid.length) return errorResponse(requestId, @"Missing chatGuid");
+     IMChat *chat = resolveChatByGuid(chatGuid);
+     if (!chat) return errorResponse(requestId, @"Chat not found");
+     @try { [chat setLocalUserIsTyping:NO]; }
+     @catch (NSException *ex) {
+-        debugLog(@"handleStopTyping: exception=%@", ex.reason);
++        debugLog(@"handleStopTyping: exception");
+         return errorResponse(requestId, ex.reason ?: @"failed");
+     }
+     return successResponse(requestId, @{@"chatGuid": chatGuid, @"typing": @NO});
+@@ -6876,13 +7077,11 @@ static void processV2InboxFile(NSString *uuid) {
+             // file in place for a later scan instead of risking duplicate work.
+             if (claimErrno != ENOENT) {
+                 NSLog(@"[imsg-bridge v2] Could not claim %@ (errno=%d)", inPath, claimErrno);
+-                debugLog(@"v2 claim failed id=%@ pid=%d errno=%d",
+-                         uuid, getpid(), claimErrno);
++                debugLog(@"v2 claim failed errno=%d", claimErrno);
+             }
+             return;
+         }
+-        debugLog(@"v2 claimed id=%@ pid=%d process=%@",
+-                 uuid, getpid(), [[NSProcessInfo processInfo] processName]);
++        debugLog(@"v2 request claimed");
+ 
+         NSError *err = nil;
+         NSData *body = [NSData dataWithContentsOfFile:claimPath options:0 error:&err];
+@@ -6954,8 +7153,7 @@ static void cleanupOrphanedV2Claims(NSArray *entries) {
+         }
+         if (shouldRemove) {
+             [fm removeItemAtPath:path error:nil];
+-            debugLog(@"v2 removed orphan claim=%@ owner_pid=%d",
+-                     name, (int)ownerPID);
++            debugLog(@"v2 removed orphan claim");
+         }
+     }
+ }
+@@ -7027,8 +7225,7 @@ static void bridgeBootstrap(void) {
+             initFilePaths();
+             NSLog(@"[imsg-bridge] Dylib injected into %@",
+                   [[NSProcessInfo processInfo] processName]);
+-            debugLog(@"bootstrap starting in process=%@ pid=%d",
+-                     [[NSProcessInfo processInfo] processName], getpid());
++            debugLog(@"bootstrap starting");
+ 
+             // Connect to IMDaemon for full IMCore access
+             Class daemonClass = NSClassFromString(@"IMDaemonController");
+diff --git a/Sources/imsg/RPCServer+BridgeMessageHandlers.swift b/Sources/imsg/RPCServer+BridgeMessageHandlers.swift
+index c8829aa..8455061 100644
+--- a/Sources/imsg/RPCServer+BridgeMessageHandlers.swift
++++ b/Sources/imsg/RPCServer+BridgeMessageHandlers.swift
+@@ -241,6 +241,29 @@ extension RPCServer {
+     if let poll = data["poll"] as? [String: Any] {
+       result["poll"] = poll
+     }
++    if let constructionPath = data["constructionPath"] as? String,
++      ["atomic", "atomic-dispatch-context", "ordinary-reply-fallback"].contains(constructionPath)
++    {
++      result["construction_path"] = constructionPath
++    }
++    if let constructionStage = data["constructionStage"] as? String,
++      [
++        "IMSG_POLL_CONSTRUCT_MESSAGE_CLASS_MISSING",
++        "IMSG_POLL_CONSTRUCT_BALLOON_ID_EMPTY",
++        "IMSG_POLL_CONSTRUCT_LEGACY_ITEM_ALLOC_NIL",
++        "IMSG_POLL_CONSTRUCT_LEGACY_ITEM_INIT_NIL",
++        "IMSG_POLL_CONSTRUCT_LEGACY_WRAP_NIL",
++        "IMSG_POLL_CONSTRUCT_ATOMIC_INITIALIZER_UNAVAILABLE",
++        "IMSG_POLL_CONSTRUCT_ATOMIC_ALLOC_NIL",
++        "IMSG_POLL_CONSTRUCT_ATOMIC_INIT_NIL",
++        "IMSG_POLL_CONSTRUCT_REPLY_THREAD_SETTER_UNAVAILABLE",
++        "IMSG_POLL_CONSTRUCT_FALLBACK_MESSAGE_NIL",
++        "IMSG_POLL_CONSTRUCT_FALLBACK_BALLOON_SETTER_UNAVAILABLE",
++        "IMSG_POLL_CONSTRUCT_FALLBACK_PAYLOAD_SETTER_UNAVAILABLE",
++      ].contains(constructionStage)
++    {
++      result["construction_stage"] = constructionStage
++    }
+ 
+     // Messages never renders the poll title on the balloon, so send the question
+     // (or an explicit `comment` override) as a PLAIN caption message right after
+@@ -504,7 +527,8 @@ func normalizeBridgeReactionType(_ raw: String, remove: Bool = false) throws ->
+     let emojiPresentation = scalars.contains { $0.properties.isEmojiPresentation }
+     let emojiSequence = scalars.count > 1 && scalars.contains { $0.properties.isEmoji }
+     guard value.count == 1, emojiPresentation || emojiSequence,
+-      let encoded = value.data(using: .utf8)?.base64EncodedString(), !encoded.isEmpty else {
++      let encoded = value.data(using: .utf8)?.base64EncodedString(), !encoded.isEmpty
++    else {
+       throw RPCError.invalidParams(
+         "unsupported tapback reaction \(raw); use one emoji or a standard tapback"
+       )
+diff --git a/Tests/imsgTests/BridgeCommandRegistrationTests.swift b/Tests/imsgTests/BridgeCommandRegistrationTests.swift
+index f08c44f..5f4749b 100644
+--- a/Tests/imsgTests/BridgeCommandRegistrationTests.swift
++++ b/Tests/imsgTests/BridgeCommandRegistrationTests.swift
+@@ -143,6 +143,106 @@ func injectedHelperHardensRichLinkImageTransfer() throws {
+   #expect(!source.contains("waitUntilDone:YES"))
+ }
+ 
++@Test
++func injectedHelperConstructsCustomEmojiReactionsAtomically() throws {
++  let testFile = URL(fileURLWithPath: #filePath)
++  let repoRoot =
++    testFile
++    .deletingLastPathComponent()
++    .deletingLastPathComponent()
++    .deletingLastPathComponent()
++  let helper = repoRoot.appendingPathComponent("Sources/IMsgHelper/IMsgInjected.m")
++  let source = stripObjectiveCComments(try String(contentsOf: helper, encoding: .utf8))
++  let capabilityBody = try #require(
++    functionBody(named: "customEmojiReactionInitializerAvailable", in: source))
++  let constructorBody = try #require(
++    functionBody(named: "buildCustomEmojiReactionIMMessage", in: source))
++  let reactionBody = try #require(functionBody(named: "handleSendReaction", in: source))
++  let statusBody = try #require(functionBody(named: "handleStatus", in: source))
++
++  #expect(
++    source.contains(
++      "instantMessageWithAssociatedMessageContent:associatedMessageGUID:"
++    ))
++  #expect(source.contains("associatedMessageEmoji:"))
++  #expect(source.contains("messageSummaryInfo:threadIdentifier:"))
++  #expect(capabilityBody.contains("respondsToSelector:selector"))
++  #expect(capabilityBody.contains("signature.numberOfArguments == 9"))
++  #expect(statusBody.contains(#"@"custom_emoji_tapbacks": @(gHasCustomEmojiReaction)"#))
++  #expect(!statusBody.contains(#"@"custom_emoji_tapbacks": @YES"#))
++
++  // Both custom add (2006) and remove (3006) must use the atomic constructor.
++  #expect(constructorBody.contains("associatedMessageType != 2006"))
++  #expect(constructorBody.contains("associatedMessageType != 3006"))
++  #expect(constructorBody.contains("setArgument:&associatedMessageGuid atIndex:3"))
++  #expect(constructorBody.contains("setArgument:&associatedMessageType atIndex:4"))
++  #expect(constructorBody.contains("setArgument:&associatedMessageRange atIndex:5"))
++  #expect(constructorBody.contains("setArgument:&associatedMessageEmoji atIndex:6"))
++
++  // Fail closed unless the returned IMMessage preserves the exact reference,
++  // type, range, and emoji that were passed atomically.
++  #expect(constructorBody.contains("associatedMessageGUID"))
++  #expect(constructorBody.contains("associatedMessageType"))
++  #expect(constructorBody.contains("associatedMessageRange"))
++  #expect(constructorBody.contains("associatedMessageEmoji"))
++  #expect(constructorBody.contains("actualType != associatedMessageType"))
++  #expect(constructorBody.contains("NSEqualRanges(actualRange, associatedMessageRange)"))
++  #expect(constructorBody.contains("isEqualToString:associatedMessageEmoji"))
++
++  #expect(reactionBody.contains("Custom emoji reactions are unavailable"))
++  #expect(reactionBody.contains("buildCustomEmojiReactionIMMessage"))
++  #expect(reactionBody.contains("buildIMMessage(body"))
++}
++
++@Test
++func injectedHelperDiagnosticsAreOptInBoundedAndContentFree() throws {
++  let testFile = URL(fileURLWithPath: #filePath)
++  let repoRoot =
++    testFile
++    .deletingLastPathComponent()
++    .deletingLastPathComponent()
++    .deletingLastPathComponent()
++  let helper = repoRoot.appendingPathComponent("Sources/IMsgHelper/IMsgInjected.m")
++  let source = stripObjectiveCComments(try String(contentsOf: helper, encoding: .utf8))
++  let enabledBody = try #require(functionBody(named: "debugLoggingEnabled", in: source))
++  let loggerBody = try #require(functionBody(named: "debugLog", in: source))
++
++  #expect(enabledBody.contains(#"getenv("IMSG_BRIDGE_DEBUG")"#))
++  #expect(source.contains("kDebugLogRotateBytes = 256 * 1024"))
++  #expect(loggerBody.contains("fileSize] >= kDebugLogRotateBytes"))
++  #expect(loggerBody.contains("moveItemAtPath:kDebugLogFile"))
++  let debugCallLines = source.split(separator: "\n").filter { $0.contains("debugLog(@\"") }
++  for forbidden in [
++    "handle=%@", "params=%@", "guid=%@", "parent=%@", "path=%@", "body=%@",
++    "id=%@", "process=%@", "reason=%@", "exception=%@", "target=%@", "filename=%@",
++    "localURL=%@",
++  ] {
++    #expect(!debugCallLines.contains(where: { $0.contains(forbidden) }))
++  }
++}
++
++@Test
++func injectedHelperRetainsMacOS27EditSelector() throws {
++  let testFile = URL(fileURLWithPath: #filePath)
++  let repoRoot =
++    testFile
++    .deletingLastPathComponent()
++    .deletingLastPathComponent()
++    .deletingLastPathComponent()
++  let helper = repoRoot.appendingPathComponent("Sources/IMsgHelper/IMsgInjected.m")
++  let source = stripObjectiveCComments(try String(contentsOf: helper, encoding: .utf8))
++  let editBody = try #require(functionBody(named: "handleEditMessage", in: source))
++
++  #expect(source.contains("gHasEditMessageItemTranslation"))
++  #expect(source.contains(#"@"editMessageItemTranslation""#))
++  #expect(
++    editBody.contains(
++      "editMessageItem:atPartIndex:withNewPartText:newPartTranslation:backwardCompatabilityText:"
++    ))
++  #expect(editBody.contains("translationArg = nil"))
++  #expect(editBody.contains("compatibilityArgumentIndex = 6"))
++}
++
+ @Test
+ func injectedHelperFindsNestedThreadReplyItems() throws {
+   let testFile = URL(fileURLWithPath: #filePath)
+@@ -254,6 +354,8 @@ func injectedHelperWiresNativePollSend() throws {
+   let sendPollBody = try #require(functionBody(named: "handleSendPoll", in: source))
+   let buildPollBody = try #require(functionBody(named: "buildPollIMMessage", in: source))
+   let buildBalloonBody = try #require(functionBody(named: "buildBalloonIMMessage", in: source))
++  let fallbackBody = try #require(
++    functionBody(named: "buildPollReplyFallbackIMMessage", in: source))
+ 
+   #expect(source.contains("send-poll"))
+   #expect(source.contains("com.apple.messages.Polls"))
+@@ -280,15 +382,10 @@ func injectedHelperWiresNativePollSend() throws {
+     ))
+   #expect(!buildBalloonBody.contains("setArgument:&messageThreadIdentifier atIndex:14"))
+   #expect(buildBalloonBody.contains("setThreadIdentifier:"))
++  #expect(buildBalloonBody.contains("applyThreadIdentifierToMessageAndBacking"))
++  #expect(buildBalloonBody.contains("IMsgPollConstructionStageReplyThreadSetterUnavailable"))
++  #expect(!buildBalloonBody.contains("reply thread setter unavailable\");\n            return nil"))
+   #expect(buildBalloonBody.contains("atomic reply construction succeeded"))
+-  #expect(buildBalloonBody.contains("setBalloonConstructionFailure"))
+-  #expect(buildBalloonBody.contains(#"@"atomic-init-nil""#))
+-  #expect(buildBalloonBody.contains("ordinary reply fallback succeeded"))
+-  #expect(buildBalloonBody.contains("stampBalloonMetadataOnMessage"))
+-  #expect(buildBalloonBody.contains("if (!threadIdentifierApplied)"))
+-  #expect(!buildBalloonBody.contains(
+-    "reply thread setter unavailable\");\n            return nil"
+-  ))
+   #expect(!buildBalloonBody.contains("accountController:itemCreator:"))
+   #expect(buildBalloonBody.contains("if (replyToGUID.length)"))
+   #expect(
+@@ -296,10 +393,19 @@ func injectedHelperWiresNativePollSend() throws {
+       "initWithSender:time:text:messageSubject:fileTransferGUIDs:flags:error:guid:subject:"
+     ))
+   #expect(sendPollBody.contains("pollPayloadMessageInitializerAvailable()"))
+-  #expect(sendPollBody.contains("constructionFailure"))
+-  #expect(sendPollBody.contains("Could not construct poll IMMessage [%@]"))
+   #expect(!sendPollBody.contains(#"selectedMessageGuid.length ? @"" : question"#))
+   #expect(sendPollBody.contains("buildPollCreationPayloadData(question,"))
++  #expect(sendPollBody.contains("primaryConstructionStage"))
++  #expect(sendPollBody.contains("ordinary-reply-fallback"))
++  #expect(sendPollBody.contains("atomic-dispatch-context"))
++  #expect(sendPollBody.contains("pollConstructionStageCode"))
++  #expect(source.contains("IMSG_POLL_CONSTRUCT_ATOMIC_INIT_NIL"))
++  #expect(source.contains("IMSG_POLL_CONSTRUCT_REPLY_THREAD_SETTER_UNAVAILABLE"))
++  #expect(fallbackBody.contains("buildIMMessage"))
++  #expect(fallbackBody.contains("setBalloonBundleID:"))
++  #expect(fallbackBody.contains("setPayloadData:"))
++  #expect(fallbackBody.contains("setMessageSummaryInfo:"))
++  #expect(fallbackBody.contains("messageAndBackingItemTargets"))
+   #expect(sendPollBody.contains(#"@{ @"enc": @YES, @"ust": @YES }"#))
+   #expect(sendPollBody.contains("selectedMessageGuid"))
+   #expect(sendPollBody.contains("deriveThreadIdentifier"))
+diff --git a/Tests/imsgTests/RPCBridgeMessageHandlersTests.swift b/Tests/imsgTests/RPCBridgeMessageHandlersTests.swift
+index 85ed07d..abe43b1 100644
+--- a/Tests/imsgTests/RPCBridgeMessageHandlersTests.swift
++++ b/Tests/imsgTests/RPCBridgeMessageHandlersTests.swift
+@@ -157,6 +157,8 @@ func rpcPollSendInvokesBridgeWithResolvedChat() async throws {
+       calls.append((action, params))
+       return [
+         "messageGuid": "poll-guid",
++        "constructionPath": "atomic-dispatch-context",
++        "constructionStage": "IMSG_POLL_CONSTRUCT_REPLY_THREAD_SETTER_UNAVAILABLE",
+         "poll": [
+           "kind": "created",
+           "event": "imessage.poll.created",
+@@ -186,6 +188,10 @@ func rpcPollSendInvokesBridgeWithResolvedChat() async throws {
+   let result = output.responses.first?["result"] as? [String: Any]
+   #expect(result?["event"] as? String == "imessage.poll.created")
+   #expect(result?["guid"] as? String == "poll-guid")
++  #expect(result?["construction_path"] as? String == "atomic-dispatch-context")
++  #expect(
++    result?["construction_stage"] as? String
++      == "IMSG_POLL_CONSTRUCT_REPLY_THREAD_SETTER_UNAVAILABLE")
+   #expect((result?["poll"] as? [String: Any])?["kind"] as? String == "created")
+ }
+ 
+@@ -543,3 +549,13 @@ func rpcBridgeMessageMethodsResolveDirectChatIdentifierToGUID() async throws {
+ 
+   #expect(capturedParams["chatGuid"] as? String == "iMessage;-;+123")
+ }
++
++@Test
++func customEmojiReactionNormalizationPreservesAddAndRemovePayloads() throws {
++  let emoji = "🎉"
++  let encoded = try #require(emoji.data(using: .utf8)?.base64EncodedString())
++
++  #expect(try normalizeBridgeReactionType(emoji) == "custom:\(encoded)")
++  #expect(try normalizeBridgeReactionType(emoji, remove: true) == "remove-custom:\(encoded)")
++  #expect(try normalizeBridgeReactionType("remove-\(emoji)") == "remove-custom:\(encoded)")
++}

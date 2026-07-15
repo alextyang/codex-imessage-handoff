@@ -45,17 +45,16 @@ credentials, controller enrollment, and device key.
 Codex-authored user messages take one deliberately narrow reverse path: a
 normal-profile `imsg rpc` child sends only rich text to the root-proven direct
 service conversation. The body travels over the child's stdin, never process
-arguments. The shared message GUID and exact native Reply root suppress the
+arguments. Before dispatch, the service persists a canonical UUIDv4 and the
+patched bridge constructs the native `IMMessage` with that exact GUID. The
+receiving profile therefore knows the message identity before any send or
+watch response can race: exact GUID plus exact native Reply root suppresses the
 dedicated-account echo without adding hidden Unicode to the message body. A
-send is accepted only after the normal profile observes that exact GUID with
-the expected native `thread_originator_guid`. The returned GUID is registered
-before the slower local-history proof so the receiver can suppress its exact
-echo immediately. If the incoming bubble wins that race, an exact-root,
-visible-body-hash candidate waits for at most one second by default, with a
-hard two-second cap. Body/root correlation never creates a receipt, consumes a
-reservation, or discards a message; without exact GUID/root confirmation the
-bubble proceeds as genuine user input. Ambiguous writes are reconciled without
-resending; after 15 minutes, a content-free task notice unblocks later output.
+send is accepted only after the normal profile observes that exact GUID, body,
+and `thread_originator_guid`. Legacy tagged journals remain recoverable, while
+new mirrors never use body-only correlation or a timeout-based suppression
+decision. Ambiguous writes are reconciled without resending; after 15 minutes,
+a content-free task notice unblocks later output.
 This sender cannot select recipients, send files or URLs, watch Messages,
 launch/relaunch Messages, or control any Codex process.
 
@@ -80,11 +79,16 @@ start`, switch Desktop to another backend, or signal Desktop-owned processes.
 - An installed Codex build supported by this service. The app version,
   app-server version, signed native device-key module, and module digest are
   pinned and fail closed after an unsupported Codex update.
-- `imsg` with the daemon-safe, custom-emoji tapback, and macOS 27 edit patches
-  in `docs/`, applied in that order, plus the full IMCore bridge enabled.
-- The active Codex profile also needs the local `imsg` IMCore bridge active for
-  outgoing user mirrors. The service probes it but never launches or relaunches
-  Messages automatically; core helper and Codex functions remain independent.
+- `imsg` 0.13.0 with these patches applied in order: daemon contacts,
+  custom-emoji tapbacks, macOS 27 edits, runtime hardening, then client-owned
+  message GUIDs (`docs/imsg-*.patch`), plus the full IMCore bridge enabled.
+- The active Codex profile also needs that patched local `imsg` IMCore bridge
+  active for outgoing user mirrors. Its status must advertise
+  `rpc_methods: ["send.rich.client-guid", ...]` and
+  `selectors.clientMessageGuid: true`. The distinct RPC method makes a mixed
+  old-CLI/new-helper installation fail before any send. The service probes it
+  but never launches or relaunches Messages automatically; core helper and
+  Codex functions remain independent.
 - Network access to OpenAI authentication and Remote Control endpoints.
 - Node.js 22.6 or newer and pnpm 10.26.
 
