@@ -43,10 +43,34 @@ test("daemon immediately dispatches genuine actions released by mirror GUID reso
   assert.match(delivery, /try \{[\s\S]*localUserMirrorSender\.sendMirror\([\s\S]*\} finally \{[\s\S]*drainReleasedUserMirrorActions\(\)[\s\S]*queueLocalAction\(action\)/);
 });
 
+test("daemon gates task ordering on receiver-observed primary mirrors and has no service-profile fallback", () => {
+  const daemon = readFileSync(path.join(repo, "service/src/daemon.mjs"), "utf8");
+  const start = daemon.indexOf("async function deliverLiveMessage(message)");
+  const end = daemon.indexOf("\nfunction liveMirrorBackoffFor", start);
+  assert.ok(start >= 0 && end > start);
+  const delivery = daemon.slice(start, end);
+  assert.match(delivery, /const ordered = orderedUserMirrorDelivery\(local\);/);
+  assert.match(delivery, /if \(ordered\.sent\) return ordered;/);
+  assert.match(delivery, /return ordered;\s*\} else if/);
+  assert.doesNotMatch(delivery, /fallbackSafe\s*!==\s*true|retain the prior service-side mirror/);
+});
+
+test("daemon proves the primary mirror account differs from the authenticated service account", () => {
+  const daemon = readFileSync(path.join(repo, "service/src/daemon.mjs"), "utf8");
+  assert.match(daemon, /new LocalUserMirrorSender\(\{[\s\S]*verifyReceiverMirror: \(proof\) => imsgTransport\.verifyUserMirrorReceipt\(proof\),/);
+  assert.match(daemon, /localUserMirrorSender\.initialize\(\{[\s\S]*expectedLocalSender: profile\.expectedSender,[\s\S]*serviceAccountFingerprint: helper\.helperAttestation\?\.accountHash,/);
+});
+
 test("daemon holds one private service lease without locking Codex", () => {
   const daemon = readFileSync(path.join(repo, "service/src/daemon.mjs"), "utf8");
   assert.match(daemon, /new ExclusiveProcessLease\(\{ lockPath: `\$\{paths\.home\}\/daemon\.lease` \}\)/);
-  assert.match(daemon, /async function main\(\) \{\s*[\s\S]{0,500}await daemonLease\.acquire\(\{ timeoutMs: 30_000 \}\);\s*serviceReadiness\.markStarting\(\);/);
+  const acquire = daemon.indexOf("await daemonLease.acquire({ timeoutMs: 30_000 })");
+  const configRead = daemon.indexOf("const config = readConfig()");
+  const transportConstruction = daemon.indexOf("const imsgTransport = new ImsgTransport");
+  assert.ok(acquire >= 0 && acquire < configRead && acquire < transportConstruction,
+    "the lease must be acquired before any durable state or transport is read");
+  assert.doesNotMatch(daemon.slice(daemon.indexOf("async function main()")), /await daemonLease\.acquire/,
+    "main must not reacquire after stateful objects were constructed");
   assert.match(daemon, /daemonLease\.release\(\);\s*process\.exit\(0\);/);
   assert.doesNotMatch(daemon, /stateDb.*(?:lock|lease)|sessions.*(?:lock|lease)|codexRuntime.*(?:lock|lease)/i,
     "the singleton boundary must remain confined to the handoff service home");
@@ -67,4 +91,35 @@ test("daemon publishes core readiness before backlog work and gates live mirrors
   assert.ok(initialize >= 0 && initialize < ready);
   assert.ok(ready < reconcile && reconcile < initialized);
   assert.ok(initialized < release && release < scan);
+});
+
+test("the hidden controller shares scheduler capacity and safely replaces expired ephemeral sessions", () => {
+  const daemon = readFileSync(path.join(repo, "service/src/daemon.mjs"), "utf8");
+  assert.match(daemon, /const controllerRunner = codexRuntime\.createPersistentRunner\(\);/);
+  assert.match(daemon, /new HiddenControllerConversation\(\{[\s\S]*cwd: paths\.hiddenControllerWorkspace,[\s\S]*runner: controllerRunner,/);
+  assert.match(daemon, /for \(const event of hiddenController\.pendingEvents\(\)\) runs\.enqueue\(event\);/);
+  assert.match(daemon, /if \(\["THREAD_NOT_FOUND", "CODEX_THREAD_NOT_FOUND"\]\.includes\(error\?\.code\)\) \{\s*context\.defer\(1_000\);/);
+  assert.match(daemon, /error\?\.controllerDeliveryPending === true[\s\S]{0,180}context\.defer\(15_000\);/);
+  assert.doesNotMatch(daemon, /new RunManager\([^)]*controller/i,
+    "the controller must not create capacity outside the global task scheduler");
+});
+
+test("controller task stops require a service-issued task-bound confirmation", () => {
+  const daemon = readFileSync(path.join(repo, "service/src/daemon.mjs"), "utf8");
+  const controller = readFileSync(path.join(repo, "service/src/hidden-controller-conversation.mjs"), "utf8");
+  assert.match(controller, /name: "stop_task",[\s\S]{0,500}inputSchema: objectSchema\(\{\s*id: stringId,?\s*\}, \["id"\]\)/);
+  assert.doesNotMatch(controller, /confirmed:\s*\{\s*type:\s*"boolean"/);
+  assert.match(daemon, /async function confirmControllerStop\([\s\S]{0,1600}controllerServerRequests\.request\(\{[\s\S]{0,800}Stop Codex task[\s\S]{0,800}Stop task/);
+  assert.match(daemon, /const confirmed = await confirmControllerStop\(\{ job, operationId, thread, signal \}\);[\s\S]{0,500}await stopTask\(thread\.id, \{ notify: false \}\)/);
+});
+
+test("controller cancellation cannot cross a dynamic mutation commit boundary", () => {
+  const daemon = readFileSync(path.join(repo, "service/src/daemon.mjs"), "utf8");
+  const controller = readFileSync(path.join(repo, "service/src/hidden-controller-conversation.mjs"), "utf8");
+  assert.match(controller, /get cancellationSafe\(\) \{\s*return this\.activeMutations === 0;/);
+  assert.match(controller, /combinedRequestContext\(requestContext, signal\)/);
+  assert.match(daemon, /if \(!hiddenController\.cancellationSafe\) \{\s*receipt = hiddenController\.recordControlReceipt\(action\.messageKey, \{ outcome: "blocked" \}\);/);
+  assert.match(daemon, /outcome: "authorized",\s*replyIds: hiddenController\.pendingEvents\(\)\.map\(\(event\) => event\.replyId\)/);
+  assert.match(daemon, /runs\.cancel\(CONTROLLER_RUN_THREAD_ID, \{\s*replyIds: receipt\.replyIds,\s*onRequested: \(cancelled\) => \{\s*receipt = hiddenController\.applyControlCancellation/);
+  assert.match(daemon, /queueLocalPrompt\([\s\S]{0,500}\{ signal \}\)/);
 });

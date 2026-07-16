@@ -418,6 +418,7 @@ export class ImsgIpcClient {
   probeCapabilities(params = {}) { return this.status(params); }
   latestMessage(params) { return this.#request("latestMessage", params); }
   authorizeMessageGuid(params) { return this.#request("message.authorize", params); }
+  verifyUserMirrorReceipt(params) { return this.#request("message.verify-user-mirror", params); }
   async start() { await this.#request("client.start"); return this; }
 
   async stop() {

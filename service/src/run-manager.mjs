@@ -81,17 +81,46 @@ export class RunManager {
     return new Map([...ids].map((id) => [id, this.state(id)]).filter(([, state]) => state));
   }
 
-  async cancel(threadId) {
+  async cancel(threadId, { replyIds = null, onRequested = null } = {}) {
     const id = String(threadId || "");
-    const active = this.active.get(id);
-    const queued = this.queues.get(id) || [];
+    const requested = Array.isArray(replyIds)
+      ? new Set(replyIds.map((value) => String(value || "")).filter(Boolean))
+      : null;
+    const currentActive = this.active.get(id);
+    const active = currentActive && (!requested || requested.has(currentActive.entry.replyId))
+      ? currentActive
+      : null;
+    const currentQueue = this.queues.get(id) || [];
+    const queued = requested
+      ? currentQueue.filter((entry) => requested.has(entry.replyId))
+      : currentQueue;
+    const retained = requested
+      ? currentQueue.filter((entry) => !requested.has(entry.replyId))
+      : [];
     if (active) {
       active.cancelRequested = true;
-      active.cancel?.();
+      try { active.cancel?.(); } catch (error) {
+        try { this.onError(error, active.entry); } catch {}
+      }
     }
     if (queued.length) {
-      this.queues.delete(id);
-      this.#clearBlock(id);
+      if (retained.length) this.queues.set(id, retained);
+      else this.queues.delete(id);
+      if (!retained.length) this.#clearBlock(id);
+    }
+    const outcome = { active: Boolean(active), pending: queued.length };
+    let requestError = null;
+    if (typeof onRequested === "function") {
+      try {
+        const callbackResult = onRequested(outcome);
+        if (callbackResult && typeof callbackResult.then === "function") {
+          throw new TypeError("RunManager cancellation commits must be synchronous.");
+        }
+      } catch (error) {
+        requestError = error;
+      }
+    }
+    if (queued.length) {
       await Promise.allSettled(queued.map(async (entry) => {
         try {
           delete entry.deferredRetries;
@@ -102,7 +131,8 @@ export class RunManager {
       }));
     }
     if (active || queued.length) this.#changed();
-    return { active: Boolean(active), pending: queued.length };
+    if (requestError) throw requestError;
+    return outcome;
   }
 
   cancelAll() {

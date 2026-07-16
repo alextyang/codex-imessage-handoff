@@ -79,6 +79,69 @@ test("cancel is immediate and discards queued replies", async () => {
   assert.deepEqual([...discarded].sort(), ["a1", "a2"]);
 });
 
+test("targeted cancellation never stops work admitted after the durable snapshot", async () => {
+  const releases = new Map();
+  const cancelled = [];
+  const discarded = [];
+  const manager = new RunManager({
+    maxConcurrent: 1,
+    run: (event, context) => new Promise((resolve) => {
+      releases.set(event.replyId, resolve);
+      context.setCancel(() => {
+        cancelled.push(event.replyId);
+        resolve();
+      });
+    }),
+    discard: async (event) => discarded.push(event.replyId),
+  });
+  manager.enqueue({ threadId: "controller", replyId: "old-active" });
+  manager.enqueue({ threadId: "controller", replyId: "old-pending" });
+  await tick();
+  manager.enqueue({ threadId: "controller", replyId: "new-after-snapshot" });
+
+  const result = await manager.cancel("controller", {
+    replyIds: ["old-active", "old-pending"],
+  });
+  assert.deepEqual(result, { active: true, pending: 1 });
+  assert.deepEqual(cancelled, ["old-active"]);
+  assert.equal(manager.has("new-after-snapshot"), true);
+  await tick();
+  await tick();
+  assert.equal(discarded.includes("new-after-snapshot"), false);
+  assert.equal(releases.has("new-after-snapshot"), true);
+  releases.get("new-after-snapshot")();
+});
+
+test("cancellation commits its durable snapshot synchronously before queued discard awaits", async () => {
+  let releaseActive;
+  let releaseDiscard;
+  const order = [];
+  const manager = new RunManager({
+    maxConcurrent: 1,
+    run: (_event, context) => new Promise((resolve) => {
+      releaseActive = resolve;
+      context.setCancel(resolve);
+    }),
+    discard: (event) => event.replyId === "queued" ? new Promise((resolve) => {
+      order.push(`discard:${event.replyId}`);
+      releaseDiscard = resolve;
+    }) : Promise.resolve(order.push(`discard:${event.replyId}`)),
+  });
+  manager.enqueue({ threadId: "controller", replyId: "active" });
+  manager.enqueue({ threadId: "controller", replyId: "queued" });
+  await tick();
+
+  const cancellation = manager.cancel("controller", {
+    replyIds: ["active", "queued"],
+    onRequested: (outcome) => order.push(`commit:${outcome.active}:${outcome.pending}`),
+  });
+  assert.deepEqual(order, ["commit:true:1", "discard:queued"]);
+  releaseDiscard();
+  await cancellation;
+  await tick();
+  releaseActive?.();
+});
+
 test("cancel requested before a run installs its handler is not lost", async () => {
   let launched = false;
   let cancelCalled = false;

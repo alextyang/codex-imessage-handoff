@@ -31,6 +31,7 @@ import { LocalUserMirrorSender } from "./local-user-mirror-sender.mjs";
 import { ExclusiveProcessLease } from "./exclusive-process-lease.mjs";
 import { safeImsgFailureDetails } from "./imsg-rpc-diagnostics.mjs";
 import { RemoteControlCodexRuntime } from "./remote-control-runner.mjs";
+import { readControllerEnrollment } from "./remote-control-controller.mjs";
 import {
   RemoteControlAvailability,
   remoteControlPresenceState,
@@ -42,6 +43,11 @@ import { RunManager } from "./run-manager.mjs";
 import { RolloutActivityMonitor } from "./rollout-activity-monitor.mjs";
 import { RolloutReconcileScheduler } from "./rollout-reconcile-scheduler.mjs";
 import { ServerRequestBroker } from "./server-request-broker.mjs";
+import {
+  CONTROLLER_REASONING,
+  CONTROLLER_RUN_THREAD_ID,
+  HiddenControllerConversation,
+} from "./hidden-controller-conversation.mjs";
 import { FailureQueue } from "./failure-queue.mjs";
 import { isImmediateLocalAction, isTerminalLocalActionFailure, LocalActionDispatch } from "./local-action-dispatch.mjs";
 import { loadClaimedJobs, markClaimedJobState, removeClaimedJob, saveClaimedJob } from "./claimed-store.mjs";
@@ -53,7 +59,11 @@ import { LiveMirrorRetryBackoff } from "./live-mirror-backoff.mjs";
 import { servicePaths } from "./paths.mjs";
 import { ServiceReadiness } from "./service-readiness.mjs";
 import { PresenceTracker } from "./presence-tracker.mjs";
-import { shouldSuppressSubmittedUserMirror, submittedUserMirrorMode } from "./submitted-user-mirror-policy.mjs";
+import {
+  orderedUserMirrorDelivery,
+  shouldSuppressSubmittedUserMirror,
+  submittedUserMirrorMode,
+} from "./submitted-user-mirror-policy.mjs";
 import { NewThreadFlowStore } from "./new-thread-flow.mjs";
 import {
   resumeNewProjectSelection,
@@ -72,13 +82,35 @@ import {
 
 const paths = servicePaths();
 const daemonLease = new ExclusiveProcessLease({ lockPath: `${paths.home}/daemon.lease` });
+// Acquire before constructing any stateful transport/controller object. A
+// waiting overlap must never cache and later rewrite an older durable view.
+await daemonLease.acquire({ timeoutMs: 30_000 });
 const serviceReadiness = new ServiceReadiness(paths.serviceReadinessState);
+process.on("exit", () => {
+  if (daemonLease.acquired) clearServiceReadiness();
+  daemonLease.release();
+});
 const config = readConfig();
+const controllerEnrollment = readControllerEnrollment(paths.remoteControlClient);
+const controllerIdentityKey = createHash("sha256")
+  .update("imessage-hidden-controller-identity-v1\0")
+  .update(createHash("sha256").update(`${config.imsg.chatGuid}\0${config.imsg.expectedSender}`).digest("hex"))
+  .update("\0")
+  .update(controllerEnrollment
+    ? JSON.stringify({
+      accountUserId: controllerEnrollment.accountUserId,
+      clientId: controllerEnrollment.clientId,
+      keyId: controllerEnrollment.keyId,
+      publicKeySpkiDerBase64: controllerEnrollment.publicKeySpkiDerBase64,
+    })
+    : "unenrolled")
+  .digest("hex");
 const imsgTransport = new ImsgTransport({ profile: config.imsg, stateFile: paths.imsgState, logger: log });
 const localUserMirrorSender = new LocalUserMirrorSender({
   stateFile: paths.localUserMirrorState,
   router: imsgTransport.router,
   conversationKey: createHash("sha256").update(`imsg-chat:${config.imsg.chatGuid}`).digest("hex"),
+  verifyReceiverMirror: (proof) => imsgTransport.verifyUserMirrorReceipt(proof),
 });
 serviceReadiness.setHealthCheck(() => imsgTransport.healthStatus());
 const remoteControlAvailability = new RemoteControlAvailability();
@@ -129,6 +161,8 @@ const failedRuns = new FailureQueue();
 const newThreadFlows = new NewThreadFlowStore();
 const localActionContext = new AsyncLocalStorage();
 const codexRuntime = new RemoteControlCodexRuntime();
+const controllerRunner = codexRuntime.createPersistentRunner();
+let hiddenController = null;
 const retryableCodexErrors = new Set([
   "CODEX_DISCONNECTED",
   "CODEX_PROTOCOL_ERROR",
@@ -299,7 +333,8 @@ async function deliverLiveMessage(message) {
         queueLocalAction(action).catch(() => {});
       }
     }
-    if (local.sent) return local;
+    const ordered = orderedUserMirrorDelivery(local);
+    if (ordered.sent) return ordered;
     if (local.classification === "dead-letter") {
       // Do not replay an unverified side effect through another sender. A
       // content-free, task-scoped notice makes the rare failure visible while
@@ -312,14 +347,11 @@ async function deliverLiveMessage(message) {
         body: "⚠️ **User-message mirror not verified**\n\nThe task still ran in Codex. Use /turn to view the current turn.",
       }, { signal: AbortSignal.timeout(15_000), proactive: true });
     }
-    // Ambiguous local sends deliberately hold the durable rollout cursor. A
-    // repeat presents the same delivery id to the sender journal, which only
-    // reconciles exact GUID/root evidence and never blindly sends again.
-    if (local.retryable === true) return local;
-    if (local.fallbackSafe !== true) return local;
-    // Rich mode is optional to core Codex/iMessage health. If it is unavailable
-    // before any local send attempt, retain the prior service-side mirror so a
-    // user turn is never silently lost.
+    // Every nonterminal primary-profile outcome holds this task's durable
+    // rollout cursor. There is deliberately no dedicated/service-profile
+    // fallback: later commentary and final output wait for this user bubble,
+    // while unrelated task threads remain independently drainable.
+    return ordered;
   } else if (!imsgTransport.router.nativeThread(thread.id)?.listen) {
     return { status: "INACTIVE" };
   }
@@ -483,6 +515,16 @@ function log(message) {
   process.stdout.write(`${new Date().toISOString()} ${message}\n`);
 }
 
+function topLevelContextText(event) {
+  if (typeof event?.body === "string" && event.body.trim()) return event.body;
+  try {
+    const { deliveryId: _deliveryId, completionId: _completionId, messageId: _messageId, ...context } = event || {};
+    return JSON.stringify(context);
+  } catch {
+    return String(event?.kind || "System message");
+  }
+}
+
 async function sendOutbound(event, options = {}) {
   if (event?.thread?.id) {
     try {
@@ -502,6 +544,12 @@ async function sendOutbound(event, options = {}) {
     throw Object.assign(new Error("The local iMessage send remains pending."), {
       code: result.status || "IMSG_DELIVERY_PENDING",
       ...safeImsgFailureDetails(result),
+    });
+  }
+  if (!event?.thread?.id && options.controllerGenerated !== true && hiddenController) {
+    hiddenController.recordTopLevelEvent({
+      kind: String(event?.kind || "service.notice"),
+      text: topLevelContextText(event),
     });
   }
   return result;
@@ -622,6 +670,55 @@ const serverRequests = new ServerRequestBroker({
   },
 });
 
+const controllerServerRequests = new ServerRequestBroker({
+  logger: log,
+  requireReplyMatch: true,
+  sendText: ({ deliveryId, body }) => sendOutbound({
+    kind: "service.notice",
+    deliveryId,
+    code: "needs-attention",
+    body,
+  }, { controllerRoute: true, controllerGenerated: true }),
+  sendChoices: async ({ deliveryId, question, choices, allowOther, otherToken }) => {
+    const result = await imsgTransport.sendActionPicker(
+      question,
+      choices.map((choice) => ({
+        label: choice.label,
+        action: { kind: "controller-response", argument: choice.token },
+      })),
+      {
+        operationScope: deliveryId,
+        controllerRoute: true,
+        allowAddedChoiceSearch: allowOther === true,
+        ...(allowOther && otherToken ? {
+          addedChoiceAction: { kind: "controller-response", commandArgument: otherToken },
+        } : {}),
+      },
+    );
+    if (result?.terminal === false || result?.sent !== true) {
+      throw Object.assign(new Error("The private controller interaction choices could not be delivered."), {
+        code: result?.status || "IMSG_INTERACTION_PENDING",
+        ...safeImsgFailureDetails(result),
+      });
+    }
+    return result;
+  },
+});
+
+hiddenController = new HiddenControllerConversation({
+  stateFile: paths.hiddenControllerState,
+  identityKey: controllerIdentityKey,
+  cwd: paths.hiddenControllerWorkspace,
+  runner: controllerRunner,
+  send: sendOutbound,
+  sendImages: (files, options) => publishImages(null, files, options),
+  snapshot: controllerContextSnapshot,
+  executeTool: executeControllerTool,
+  onInteraction: (descriptor, requestContext) => controllerServerRequests.request(descriptor, requestContext),
+  setTyping: (typing) => imsgTransport.setControllerTyping(typing),
+  logger: log,
+});
+
 function outboundReasoningOptions(options) {
   return options.map((option) => option.value === "default"
     ? { ...option, value: "none", label: "↩️ Use default" }
@@ -734,6 +831,10 @@ async function publishFailure(thread, error, deliveryId = null) {
 }
 
 async function discardReply(event) {
+  if (event?.controller === true) {
+    hiddenController?.discard(event.controllerJobId);
+    return;
+  }
   await settleLiveSuppression(event, catalogById.get(String(event.threadId || "")), { forceClear: true });
   try { markClaimedJobState(event.replyId, "cancelled"); } catch {}
   removeClaimedJob(event.replyId);
@@ -774,12 +875,54 @@ async function deliverCompleted(event, thread) {
   removeClaimedJob(event.replyId);
 }
 
+async function executeHiddenController(event, context) {
+  const cancellation = new AbortController();
+  context.setCancel(() => {
+    cancellation.abort();
+    return controllerRunner.cancel(hiddenController.threadId);
+  });
+  try {
+    await hiddenController.execute(event.controllerJobId, { signal: cancellation.signal });
+    context.resetDeferBackoff();
+    markRemoteControlAvailable();
+  } catch (error) {
+    if (error?.code === "CONTROL_ABORTED" || cancellation.signal.aborted) return;
+    if (error?.controllerDeliveryPending === true || error?.code === "CONTROLLER_DELIVERY_PENDING") {
+      context.defer(15_000);
+      log("A private controller response is waiting for Messages delivery; its Codex turn will not be repeated.");
+      return;
+    }
+    if (["THREAD_NOT_FOUND", "CODEX_THREAD_NOT_FOUND"].includes(error?.code)) {
+      context.defer(1_000);
+      log("The private controller's ephemeral session expired; a replacement will be created before retrying.");
+      return;
+    }
+    if (shouldDeferCodexRun(error) || ["IMSG_DELIVERY_PENDING", "DELIVERY_PENDING"].includes(error?.code)) {
+      markRemoteControlFailure(error);
+      deferCodexRetry(context, error);
+      log(`Private controller work is waiting after ${error?.code || "a transient failure"}.`);
+      return;
+    }
+    try {
+      await hiddenController.fail(event.controllerJobId, error);
+    } catch (deliveryError) {
+      if (deliveryError?.controllerDeliveryPending === true || deliveryError?.code === "CONTROLLER_DELIVERY_PENDING") {
+        context.defer(15_000);
+        log("A private controller failure notice is waiting for Messages delivery.");
+        return;
+      }
+      throw deliveryError;
+    }
+  }
+}
+
 async function executeReply(event, context) {
   // Restored reply IDs must occupy the run manager before a local watch can
   // replay the same durable Messages event. Keep their actual work paused until
   // transport validation, subscription, and pending-action replay are complete.
   await startupWorkReady;
   if (stopped) return;
+  if (event?.controller === true) return executeHiddenController(event, context);
 
   const thread = catalogById.get(String(event.threadId || ""));
   if (!thread) {
@@ -1771,7 +1914,7 @@ async function handleNewThreadAction(action) {
   return null;
 }
 
-async function stopTask(threadIdValue) {
+async function stopTask(threadIdValue, { notify = true } = {}) {
   const threadId = String(threadIdValue || "");
   const thread = threadId ? catalogById.get(threadId) : null;
   if (threadId) imsgTransport.router.consumeThreadListen(threadId);
@@ -1790,14 +1933,21 @@ async function stopTask(threadIdValue) {
     pending: cancelled.pending,
     claiming,
   });
-  if (notice) {
+  if (notice && notify) {
     await sendOutbound({
       kind: "service.notice",
       ...notice,
       thread: thread ? threadLabel(thread) : undefined,
     });
   }
-  return notice;
+  return {
+    stopped: Boolean(cancelled.active || cancelled.pending || claiming || selectionCleared),
+    active: cancelled.active,
+    pending: cancelled.pending,
+    claiming,
+    selectionCleared,
+    notice,
+  };
 }
 
 async function handleControl(event) {
@@ -1974,6 +2124,374 @@ function projectKeyFor(thread) {
 
 function projectLabelFor(thread) {
   return projectKeyFor(thread) === "other-tasks" ? "Other tasks" : String(thread.projectLabel);
+}
+
+function controllerToolError(code, message) {
+  return Object.assign(new Error(message), { code });
+}
+
+function controllerArgs(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw controllerToolError("CONTROL_ARGUMENTS_INVALID", "The control arguments must be an object.");
+  }
+  return value;
+}
+
+function controllerTaskSummary(thread) {
+  const state = effectiveState(thread);
+  return {
+    id: thread.id,
+    title: thread.sidebarTitle || thread.title || "Untitled task",
+    projectKey: projectKeyFor(thread),
+    project: projectLabelFor(thread),
+    status: state.status,
+    pending: state.pendingCount,
+    reasoning: effectiveReasoning(thread),
+    muted: imsgTransport.router.isThreadMuted(thread.id),
+    listening: imsgTransport.router.nativeThread(thread.id)?.listen === true,
+    activityAt: thread.lastTurnAt || thread.activityAt || thread.updatedAt || null,
+  };
+}
+
+function controllerTaskRecency(thread) {
+  return Date.parse(thread.lastTurnAt || thread.activityAt || thread.updatedAt || "") || 0;
+}
+
+function assertControllerToolActive(signal) {
+  if (signal?.aborted) {
+    throw controllerToolError("CONTROL_ABORTED", "The controller request expired before the action boundary.");
+  }
+}
+
+async function confirmControllerStop({ job, operationId, thread, signal }) {
+  assertControllerToolActive(signal);
+  const confirmationValue = `stop:${thread.id}:${operationId}`;
+  const result = await controllerServerRequests.request({
+    kind: "userInput",
+    method: "imessage/controller/confirmStop",
+    requestId: `${job.id}:${operationId}:${thread.id}`,
+    threadId: hiddenController.threadId,
+    questions: [{
+      id: "stop_confirmation",
+      header: "Stop Codex task",
+      question: `Stop “${String(thread.sidebarTitle || thread.title || "Untitled task").replace(/\s+/g, " ").slice(0, 180)}”?`,
+      options: [
+        { label: "Stop task", value: confirmationValue },
+        { label: "Keep running", value: "keep-running" },
+      ],
+      isOther: false,
+      isSecret: false,
+    }],
+  }, { signal });
+  assertControllerToolActive(signal);
+  const answer = String(result?.answers?.stop_confirmation?.[0] || "").trim().toLowerCase();
+  return answer === confirmationValue.toLowerCase() || ["stop", "stop task", "yes"].includes(answer);
+}
+
+async function controllerContextSnapshot() {
+  const tasks = [...catalogById.values()]
+    .sort((left, right) => {
+      const priority = (thread) => {
+        const status = effectiveState(thread).status;
+        return status === "working" ? 3 : status === "pending" ? 2 : status === "error" ? 1 : 0;
+      };
+      return priority(right) - priority(left) || controllerTaskRecency(right) - controllerTaskRecency(left);
+    });
+  const active = tasks.filter((thread) => ["working", "pending", "error"].includes(effectiveState(thread).status));
+  return {
+    trusted: {
+      generatedAt: new Date().toISOString(),
+      transport: imsgTransport.notificationStatus(),
+      remoteControl: remoteControlAvailability.snapshot(),
+      taskCounts: {
+        total: tasks.length,
+        working: active.filter((thread) => effectiveState(thread).status === "working").length,
+        pending: active.filter((thread) => effectiveState(thread).status === "pending").length,
+        error: active.filter((thread) => effectiveState(thread).status === "error").length,
+      },
+      defaultReasoning: getDefaultReasoning() || "codex-default",
+      note: "This is a bounded snapshot. Use codex_control tools for authoritative details or actions.",
+    },
+    untrusted: {
+      recentTasks: tasks.slice(0, 8).map(controllerTaskSummary),
+      recentTopLevelMessages: hiddenController?.topLevelContext() || [],
+    },
+  };
+}
+
+function controllerProjectSelection(projectKey) {
+  const key = String(projectKey || "").trim();
+  if (key === "other-tasks") {
+    return {
+      projectKey: "other-tasks",
+      projectLabel: "Other tasks",
+      projectStartedAt: null,
+      cwd: os.homedir(),
+      otherTask: true,
+    };
+  }
+  const project = projectGroupsForNewTask("").find((item) => item.projectKey === key)
+    || [...catalogById.values()].map((thread) => ({
+      projectKey: projectKeyFor(thread),
+      projectLabel: projectLabelFor(thread),
+      projectStartedAt: thread.projectStartedAt || thread.createdAt || null,
+      representative: thread,
+    })).find((item) => item.projectKey === key);
+  if (!project) throw controllerToolError("CONTROL_PROJECT_NOT_FOUND", "That Codex project is no longer available.");
+  const representative = project.representative;
+  return {
+    projectKey: project.projectKey,
+    projectLabel: project.projectLabel,
+    projectStartedAt: project.projectStartedAt || project.startedAt || null,
+    cwd: representative.workspaceRoot || representative.cwd,
+    otherTask: false,
+  };
+}
+
+function applyControllerReasoning(thread, value) {
+  const requested = String(value || "default").trim().toLowerCase();
+  const canonical = ["none", "inherit"].includes(requested) ? "default" : requested;
+  if (!listReasoningOptions(thread).some((option) => option.value === canonical)) {
+    throw controllerToolError("CONTROL_REASONING_UNSUPPORTED", `Reasoning “${requested}” is not available for that task.`);
+  }
+  setReasoningOverride(thread.id, canonical);
+  return effectiveReasoning(thread);
+}
+
+async function controllerCreateTask({ job, operationId, projectKey, text, reasoning, signal }) {
+  await synchronize();
+  assertControllerToolActive(signal);
+  const project = controllerProjectSelection(projectKey);
+  const threadSource = `imessage-handoff:controller:${job.id}:${operationId}`;
+  let thread = await findThreadBySource(threadSource);
+  let createdHere = false;
+  if (!thread) {
+    try {
+      assertControllerToolActive(signal);
+      const created = await createCodexRunner().createThread({ cwd: project.cwd, threadSource });
+      thread = normalizeCreatedThread(created, { ...project, threadSource });
+      createdHere = true;
+      assertControllerToolActive(signal);
+    } catch (error) {
+      if (error?.code === "CONTROL_ABORTED" && createdHere && thread?.id) {
+        const deleted = await deleteControllerCreatedTask(thread.id);
+        if (!deleted) {
+          throw controllerToolError(
+            "CONTROL_TASK_CREATION_UNRESOLVED",
+            "The controller was interrupted after Codex created the task, and its cleanup could not be confirmed.",
+          );
+        }
+      }
+      if (!["CODEX_DISCONNECTED", "CODEX_PROTOCOL_ERROR", "CODEX_TIMEOUT"].includes(error?.code)) throw error;
+      for (const delayMs of [0, 250, 750, 1_500]) {
+        if (delayMs) await new Promise((resolve) => setTimeout(resolve, delayMs));
+        thread = await findThreadBySource(threadSource);
+        if (thread) break;
+      }
+      if (!thread) {
+        throw controllerToolError(
+          "CONTROL_TASK_CREATION_UNRESOLVED",
+          "Codex may have created the task, so the controller will not create another one automatically.",
+        );
+      }
+    }
+  }
+  catalogById.set(thread.id, thread);
+  multiLiveMirror.activate(thread, { resume: true });
+  liveMirrorScheduler.replaceCatalog([...catalogById.values()]);
+  let reasoningWarning = null;
+  try {
+    applyControllerReasoning(thread, reasoning || "default");
+  } catch (error) {
+    if (error?.code !== "CONTROL_REASONING_UNSUPPORTED") throw error;
+    applyControllerReasoning(thread, "default");
+    reasoningWarning = `Requested reasoning “${String(reasoning)}” is unavailable for this task; Codex default is active.`;
+  }
+  imsgTransport.router.setThreadListen(thread.id, true);
+  const messageKey = `controller-tool:${job.id}:${operationId}`;
+  let queued;
+  let queueWarning = null;
+  try {
+    assertControllerToolActive(signal);
+    queued = await queueLocalPrompt({
+      kind: "prompt",
+      messageKey,
+      body: text,
+      attachments: [],
+      createdAt: new Date().toISOString(),
+    }, thread.id, text, [], { signal });
+  } catch (error) {
+    queued = { accepted: runs.has(`imsg:${messageKey}`) };
+    if (error?.code === "CONTROL_ABORTED" && !queued.accepted && createdHere) {
+      const deleted = await deleteControllerCreatedTask(thread.id);
+      if (deleted) {
+        catalogById.delete(thread.id);
+        multiLiveMirror.clearThread(thread.id);
+        liveMirrorScheduler.replaceCatalog([...catalogById.values()]);
+        setReasoningOverride(thread.id, "default");
+        throw error;
+      }
+      throw controllerToolError(
+        "CONTROL_TASK_CREATION_UNRESOLVED",
+        "The controller was interrupted after Codex created the task, and its cleanup could not be confirmed.",
+      );
+    }
+    if (!queued.accepted) queueWarning = `The task was created, but its first message was not queued (${String(error?.code || "CONTROL_TASK_QUEUE_FAILED")}).`;
+  }
+  if (!queued.accepted && !queueWarning) queueWarning = "The task was created, but its first message was not queued.";
+  scheduleSynchronize();
+  return {
+    task: controllerTaskSummary(thread),
+    queued: queued.accepted === true,
+    warnings: [reasoningWarning, queueWarning].filter(Boolean),
+  };
+}
+
+async function deleteControllerCreatedTask(threadId) {
+  const runner = createCodexRunner();
+  try {
+    await runner.client.request("thread/delete", { threadId });
+    return true;
+  } catch (error) {
+    return ["THREAD_NOT_FOUND", "CODEX_THREAD_NOT_FOUND"].includes(error?.code);
+  } finally {
+    try { runner.close(); } catch {}
+  }
+}
+
+async function executeControllerTool({ job, tool, arguments: rawArguments, callId, operationId = callId, signal }) {
+  const args = controllerArgs(rawArguments);
+  if (tool === "list_tasks") {
+    await synchronize();
+    assertControllerToolActive(signal);
+    const query = String(args.query || "").trim().toLowerCase();
+    const project = String(args.project || "").trim().toLowerCase();
+    const limit = Math.max(1, Math.min(25, Number(args.limit) || 12));
+    const tasks = [...catalogById.values()]
+      .filter((thread) => {
+        const summary = controllerTaskSummary(thread);
+        if (project && !`${summary.projectKey} ${summary.project}`.toLowerCase().includes(project)) return false;
+        return !query || `${summary.id} ${summary.title} ${summary.project}`.toLowerCase().includes(query);
+      })
+      .sort((left, right) => {
+        const priority = (thread) => ["working", "pending", "error"].includes(effectiveState(thread).status) ? 1 : 0;
+        return priority(right) - priority(left) || controllerTaskRecency(right) - controllerTaskRecency(left);
+      })
+      .slice(0, limit)
+      .map(controllerTaskSummary);
+    return { result: { tasks, count: tasks.length } };
+  }
+  if (tool === "list_projects") {
+    await synchronize();
+    assertControllerToolActive(signal);
+    const limit = Math.max(1, Math.min(25, Number(args.limit) || 12));
+    const projects = projectGroupsForNewTask("").slice(0, Math.max(0, limit - 1)).map((project) => ({
+      key: project.projectKey,
+      label: project.projectLabel,
+      status: project.status,
+      activityAt: project.activityAt,
+    }));
+    projects.push({ key: "other-tasks", label: "Other tasks", status: "idle", activityAt: null });
+    return { result: { projects: projects.slice(0, limit) } };
+  }
+  if (tool === "service_status") {
+    assertControllerToolActive(signal);
+    return { result: (await controllerContextSnapshot()).trusted };
+  }
+
+  const id = String(args.id || "").trim();
+  const thread = id ? catalogById.get(id) : null;
+  if (tool !== "create_task" && !thread) {
+    throw controllerToolError("CONTROL_TASK_NOT_FOUND", "Use list_tasks and pass an exact current task ID.");
+  }
+
+  if (tool === "get_task") {
+    assertControllerToolActive(signal);
+    const view = ["status", "turn", "history"].includes(args.view) ? args.view : "status";
+    if (view === "status") return { result: { task: controllerTaskSummary(thread) } };
+    if (view === "turn") return { result: { task: controllerTaskSummary(thread), turn: await currentThreadTurn(thread) } };
+    const limit = Math.max(1, Math.min(5, Number(args.history_limit) || 3));
+    return {
+      result: {
+        task: controllerTaskSummary(thread),
+        history: (await getHistory(thread, limit)).map(outboundTurn),
+      },
+    };
+  }
+  if (tool === "send_task_message") {
+    const text = String(args.text || "").trim();
+    if (!text) throw controllerToolError("CONTROL_MESSAGE_EMPTY", "A task message is required.");
+    assertControllerToolActive(signal);
+    if (args.reasoning) applyControllerReasoning(thread, args.reasoning);
+    assertControllerToolActive(signal);
+    const queued = await queueLocalPrompt({
+      kind: "prompt",
+      messageKey: `controller-tool:${job.id}:${operationId}`,
+      body: text,
+      attachments: [],
+      createdAt: new Date().toISOString(),
+    }, thread.id, text, [], { signal });
+    if (!queued.accepted) throw controllerToolError("CONTROL_TASK_QUEUE_FAILED", "The task message could not be queued.");
+    return { result: { queued: true, task: controllerTaskSummary(thread) }, mutating: true };
+  }
+  if (tool === "create_task") {
+    const text = String(args.text || "").trim();
+    if (!text) throw controllerToolError("CONTROL_MESSAGE_EMPTY", "A first task message is required.");
+    const task = await controllerCreateTask({
+      job,
+      operationId,
+      projectKey: args.project_key,
+      text,
+      reasoning: args.reasoning,
+      signal,
+    });
+    return {
+      result: {
+        created: true,
+        queued: task.queued,
+        task: task.task,
+        warnings: task.warnings,
+      },
+      mutating: true,
+    };
+  }
+  if (tool === "configure_task") {
+    const action = String(args.action || "");
+    let result;
+    assertControllerToolActive(signal);
+    if (action === "listen" || action === "unlisten") {
+      result = { listening: imsgTransport.router.setThreadListen(thread.id, action === "listen") };
+    }
+    else if (action === "mute" || action === "unmute") {
+      const muted = action === "mute";
+      imsgTransport.router.setThreadMuted(thread.id, muted);
+      if (!muted) {
+        scheduleLiveMirrorScan();
+        scheduleCompletionScan();
+      }
+      result = { muted };
+    } else if (action === "reasoning") {
+      if (!args.value) throw controllerToolError("CONTROL_REASONING_REQUIRED", "A reasoning value is required.");
+      result = { reasoning: applyControllerReasoning(thread, args.value) };
+      scheduleSynchronize();
+    } else {
+      throw controllerToolError("CONTROL_ACTION_INVALID", "That task configuration action is unavailable.");
+    }
+    return { result: { changed: true, ...result, task: controllerTaskSummary(thread) }, mutating: true };
+  }
+  if (tool === "stop_task") {
+    const confirmed = await confirmControllerStop({ job, operationId, thread, signal });
+    if (!confirmed) {
+      return {
+        result: { stopped: false, confirmed: false, task: controllerTaskSummary(thread) },
+        mutating: true,
+      };
+    }
+    assertControllerToolActive(signal);
+    const stoppedResult = await stopTask(thread.id, { notify: false });
+    return { result: { ...stoppedResult, task: controllerTaskSummary(thread) }, mutating: true };
+  }
+  throw controllerToolError("CONTROL_TOOL_UNKNOWN", "That Codex control tool is unavailable.");
 }
 
 async function latestRequestText(thread) {
@@ -2159,7 +2677,14 @@ async function publishSearch(queryValue, options = {}) {
   );
 }
 
-async function queueLocalPrompt(action, threadId, bodyValue = action.body, attachments = action.attachments) {
+async function queueLocalPrompt(
+  action,
+  threadId,
+  bodyValue = action.body,
+  attachments = action.attachments,
+  { signal = null } = {},
+) {
+  assertControllerToolActive(signal);
   const thread = catalogById.get(String(threadId || ""));
   if (!thread) {
     await sendOutbound({ kind: "service.notice", code: "needs-attention", body: "That task is no longer available.\n\n/threads" });
@@ -2176,6 +2701,9 @@ async function queueLocalPrompt(action, threadId, bodyValue = action.body, attac
     destinationRoot: `${paths.attachments}/imsg`,
     messageKey: action.messageKey,
   });
+  // Importing attachments is deliberately pre-commit. A cancelled controller
+  // must stop here, before ingestReply durably admits the task turn.
+  assertControllerToolActive(signal);
   const body = String(bodyValue || "").trim() || (images.length ? "Please review the attached image." : "");
   if (!body) {
     await sendOutbound({ kind: "service.notice", code: "needs-attention", thread: threadLabel(thread), body: "That message did not contain text or a supported image." });
@@ -2205,7 +2733,70 @@ async function queueLocalPrompt(action, threadId, bodyValue = action.body, attac
   return { accepted: true, reaction };
 }
 
+async function queueControllerPrompt(action) {
+  const images = await imsgTransport.importInboundAttachments(action.attachments, {
+    destinationRoot: `${paths.attachments}/controller`,
+    messageKey: action.messageKey,
+  });
+  let event;
+  while (!stopped) {
+    try {
+      event = hiddenController.enqueue({
+        messageKey: action.messageKey,
+        body: String(action.body || ""),
+        attachments: images,
+        createdAt: action.createdAt,
+      });
+      break;
+    } catch (error) {
+      if (error?.code !== "CONTROLLER_QUEUE_FULL") throw error;
+      await hiddenController.waitForCapacity();
+    }
+  }
+  if (!event) throw Object.assign(new Error("The private controller stopped before admission."), { code: "SERVICE_STOPPED" });
+  if (event.completed === true) return { accepted: true };
+  if (!runs.has(event.replyId) && !runs.enqueue(event)) {
+    throw Object.assign(new Error("The private controller request could not enter the Codex queue."), {
+      code: "CONTROLLER_QUEUE_UNAVAILABLE",
+    });
+  }
+  return { accepted: true };
+}
+
 async function handleLocalAction(action) {
+  const controllerThreadId = hiddenController.threadId;
+  const controllerInteraction = action.kind === "controller-response"
+    ? await controllerServerRequests.handleAction({
+      ...action,
+      kind: "control",
+      command: "respond",
+      threadId: controllerThreadId,
+    }, { beforeConsume: () => hiddenController.consumeInteraction(action.messageKey) })
+    : action.kind === "controller-prompt" && controllerThreadId && controllerServerRequests.pending(controllerThreadId)
+      ? await controllerServerRequests.handleAction({
+        ...action,
+        kind: "prompt",
+        threadId: controllerThreadId,
+      }, { beforeConsume: () => hiddenController.consumeInteraction(action.messageKey) })
+      : { handled: false };
+  if (controllerInteraction.handled) {
+    if (controllerInteraction.persistenceFailed) {
+      throw Object.assign(new Error("The controller answer could not be durably consumed before granting authority."), {
+        code: "CONTROLLER_INTERACTION_PERSISTENCE_FAILED",
+      });
+    }
+    if (controllerInteraction.stale) {
+      await sendOutbound({
+        kind: "service.notice",
+        code: "needs-attention",
+        body: "That private controller request has expired or was already answered.",
+      }, { controllerRoute: true });
+      return { reaction: "❌" };
+    }
+    return action.kind === "controller-response"
+      ? { reaction: controllerInteraction.deliveryFailed ? "❌" : controllerInteraction.accepted ? "✅" : "❓" }
+      : null;
+  }
   const serverRequestOutcome = await serverRequests.handleAction(action);
   if (serverRequestOutcome.handled) {
     if (serverRequestOutcome.stale) {
@@ -2359,6 +2950,46 @@ async function handleLocalAction(action) {
     const queued = await queueLocalPrompt(action, action.threadId);
     return queued.reaction ? { reaction: queued.reaction } : null;
   }
+  if (action.kind === "controller-prompt") {
+    await queueControllerPrompt(action);
+    return null;
+  }
+  if (action.kind === "controller-cancel") {
+    let receipt = hiddenController.controlReceipt(action.messageKey);
+    if (!receipt) {
+      if (!hiddenController.cancellationSafe) {
+        receipt = hiddenController.recordControlReceipt(action.messageKey, { outcome: "blocked" });
+      } else {
+        receipt = hiddenController.recordControlReceipt(action.messageKey, {
+          outcome: "authorized",
+          replyIds: hiddenController.pendingEvents().map((event) => event.replyId),
+        });
+      }
+    }
+    if (receipt.outcome === "authorized") {
+      await runs.cancel(CONTROLLER_RUN_THREAD_ID, {
+        replyIds: receipt.replyIds,
+        onRequested: (cancelled) => {
+          receipt = hiddenController.applyControlCancellation(action.messageKey, {
+            replyIds: receipt.replyIds,
+            active: cancelled.active,
+            pending: cancelled.pending,
+          });
+        },
+      });
+    }
+    const blocked = receipt.outcome === "blocked";
+    await sendOutbound({
+      kind: "service.notice",
+      code: blocked ? "needs-attention" : "updated",
+      body: blocked
+        ? "A confirmed Codex action was crossing its commit boundary, so this stop request did not interrupt it. Send a new stop request after that action reports its result."
+        : receipt.active || receipt.pending
+          ? `Stopped the private controller${receipt.pending ? ` and cleared ${receipt.pending} queued message${receipt.pending === 1 ? "" : "s"}` : ""}.`
+          : "The private controller was already idle.",
+    });
+    return { reaction: blocked ? "⏳" : receipt.active || receipt.pending ? "🛑" : "○" };
+  }
   if (action.kind === "control") {
     return handleControl(action);
   }
@@ -2448,8 +3079,17 @@ async function processLocalAction(action) {
 const localActionDispatch = new LocalActionDispatch(processLocalAction);
 
 function queueLocalAction(action) {
+  const controllerPrompt = action?.kind === "controller-prompt" && hiddenController?.threadId
+    ? {
+      ...action,
+      kind: "prompt",
+      threadId: hiddenController.threadId,
+    }
+    : null;
   return localActionDispatch.enqueue(action, {
-    immediate: isImmediateLocalAction(action),
+    immediate: isImmediateLocalAction(action)
+      || Boolean(controllerPrompt && controllerServerRequests.canHandleAction(controllerPrompt)),
+    lane: action?.kind === "controller-prompt" ? "controller" : "default",
   });
 }
 
@@ -2457,9 +3097,9 @@ async function main() {
   // This lease is confined to the handoff service's private home. It prevents
   // a manual `service run` or launchd restart overlap from sending the same
   // deterministic mirror twice, without touching or locking Codex Desktop.
-  await daemonLease.acquire({ timeoutMs: 30_000 });
   serviceReadiness.markStarting();
   const restoredJobs = loadClaimedJobs();
+  for (const event of hiddenController.pendingEvents()) runs.enqueue(event);
   for (const job of restoredJobs) {
     if (job.delivery?.body) completions.suppressNext(job.threadId, job.delivery.body, job.queuedAt);
   }
@@ -2480,6 +3120,7 @@ async function main() {
   }
   const localUserMirrorInitialization = localUserMirrorSender.initialize({
     expectedLocalSender: profile.expectedSender,
+    serviceAccountFingerprint: helper.helperAttestation?.accountHash,
     knownRootGuids: threads.map((thread) => imsgTransport.router.nativeThread(thread.id)?.rootGuid).filter(Boolean),
     knownThreads: threads.map((thread) => ({
       threadId: thread.id,
@@ -2524,6 +3165,7 @@ async function stop() {
   rolloutActivity.stop();
   liveMirrorScheduler.stop();
   serverRequests.stop();
+  controllerServerRequests.stop();
   codexRuntime.close();
   await Promise.race([
     liveMirrorScheduler.whenIdle(),
@@ -2538,10 +3180,6 @@ async function stop() {
 
 process.on("SIGTERM", () => { stop(); });
 process.on("SIGINT", () => { stop(); });
-process.on("exit", () => {
-  if (daemonLease.acquired) clearServiceReadiness();
-  daemonLease.release();
-});
 
 main().catch((error) => {
   if (daemonLease.acquired) clearServiceReadiness();

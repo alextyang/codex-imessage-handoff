@@ -15,7 +15,9 @@ export function isTerminalLocalActionFailure(code) {
 }
 
 export function isImmediateLocalAction(action) {
-  return action?.kind === "reaction-control" && action.command === "stop";
+  return (action?.kind === "reaction-control" && action.command === "stop")
+    || action?.kind === "controller-response"
+    || action?.kind === "controller-cancel";
 }
 
 // Keeps ordinary actions ordered while coalescing the same durable inbound
@@ -27,20 +29,27 @@ export class LocalActionDispatch {
     if (typeof process !== "function") throw new TypeError("LocalActionDispatch requires a processor.");
     this.process = process;
     this.chain = Promise.resolve();
+    this.laneChains = new Map([["default", this.chain]]);
     this.scheduled = new Map();
   }
 
-  enqueue(action, { immediate = false } = {}) {
+  enqueue(action, { immediate = false, lane = "default" } = {}) {
     const key = messageKey(action);
     if (!key) return Promise.resolve();
     const existing = this.scheduled.get(key);
     if (existing) return existing;
 
     const execute = () => this.process(action);
+    const laneKey = String(lane || "default").slice(0, 40);
+    const prior = this.laneChains.get(laneKey) || Promise.resolve();
     const operation = immediate
       ? Promise.resolve().then(execute)
-      : this.chain.catch(() => {}).then(execute);
-    if (!immediate) this.chain = operation.catch(() => {});
+      : prior.catch(() => {}).then(execute);
+    if (!immediate) {
+      const continuation = operation.catch(() => {});
+      this.laneChains.set(laneKey, continuation);
+      if (laneKey === "default") this.chain = continuation;
+    }
     this.scheduled.set(key, operation);
     const release = () => {
       if (this.scheduled.get(key) === operation) this.scheduled.delete(key);

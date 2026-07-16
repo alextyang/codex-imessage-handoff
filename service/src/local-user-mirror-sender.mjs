@@ -39,6 +39,7 @@ const MARKER_END = "\u{E007F}";
 const WIRE_MODE_PLAIN = "plain";
 const WIRE_MODE_TAGGED = "tagged";
 const WIRE_MODE_CLIENT_GUID = "client-guid";
+const CONVERSATION_RESET_REQUIRED = Symbol("conversation-reset-required");
 const BINARY_CANDIDATES = Object.freeze([
   "/opt/homebrew/bin/imsg",
   "/usr/local/bin/imsg",
@@ -199,7 +200,9 @@ function readState(file, expectedConversationKey = null) {
     const value = JSON.parse(readFileSync(file, "utf8"));
     const conversationKey = clean(expectedConversationKey);
     if (value?.version !== STATE_VERSION || (conversationKey && clean(value.conversationKey) !== conversationKey)) {
-      return emptyState(conversationKey);
+      const state = emptyState(conversationKey);
+      Object.defineProperty(state, CONVERSATION_RESET_REQUIRED, { value: true });
+      return state;
     }
     const binding = value.binding && typeof value.binding === "object" && !Array.isArray(value.binding)
       && /^[a-f0-9]{64}$/u.test(clean(value.binding.accountFingerprint))
@@ -265,15 +268,33 @@ function directExternalChat(chat, ownIdentities) {
 }
 
 function chatUsesSender(chat, expectedIdentity) {
-  if (!expectedIdentity) return true;
+  if (!expectedIdentity) return false;
   const value = clean(chat?.last_addressed_handle ?? chat?.lastAddressedHandle ?? chat?.account_login ?? chat?.accountLogin);
+  return canonicalImsgIdentity(value) === expectedIdentity;
+}
+
+function rowUsesSender(row, expectedIdentity) {
+  if (!expectedIdentity) return false;
+  const value = clean(
+    row?.destination_caller_id
+      ?? row?.destinationCallerId
+      ?? row?.destination_caller
+      ?? row?.destinationCaller,
+  );
   return canonicalImsgIdentity(value) === expectedIdentity;
 }
 
 function rowBelongsToChat(row, binding) {
   const id = Number(row?.chat_id ?? row?.chatId);
   const guid = clean(row?.chat_guid ?? row?.chatGuid);
-  return id === binding.chatId || (guid && guid === binding.chatGuid);
+  return id === binding.chatId && Boolean(guid) && guid === binding.chatGuid;
+}
+
+function chatCoordinate(value) {
+  const rowLike = value?.chat_id !== undefined || value?.chatId !== undefined;
+  const id = Number(rowLike ? value?.chat_id ?? value?.chatId : value?.id);
+  const guid = clean(rowLike ? value?.chat_guid ?? value?.chatGuid : value?.guid);
+  return Number.isSafeInteger(id) && id > 0 && guid ? `${id}\0${guid}` : null;
 }
 
 function rowRootGuid(row) {
@@ -330,6 +351,7 @@ export class LocalUserMirrorSender {
     sendLeaseFactory = null,
     conversationKey = null,
     imsgClientFactory = null,
+    verifyReceiverMirror = null,
     allowUnsafeTestBinary = false,
   } = {}) {
     if (!stateFile || !router) throw new TypeError("LocalUserMirrorSender requires private state and a conversation router.");
@@ -352,6 +374,9 @@ export class LocalUserMirrorSender {
       candidates: [binary],
       sendTimeoutMs: this.sendTimeoutMs,
     }));
+    this.verifyReceiverMirror = typeof verifyReceiverMirror === "function"
+      ? verifyReceiverMirror
+      : async () => ({ observed: false });
     this.allowUnsafeTestBinary = allowUnsafeTestBinary;
     this.state = readState(this.stateFile, this.conversationKey);
     this.binary = null;
@@ -359,6 +384,7 @@ export class LocalUserMirrorSender {
     this.accountIdentities = new Set();
     this.expectedLocalSender = null;
     this.expectedLocalSenderRaw = "";
+    this.serviceAccountFingerprint = null;
     this.chats = [];
     this.chain = Promise.resolve();
     this.activeChildren = new Set();
@@ -462,8 +488,24 @@ export class LocalUserMirrorSender {
     throw codedError("IMSG_LOCAL_NOT_FOUND", "The normal-profile imsg CLI is unavailable.", { attempted: false });
   }
 
-  async #initialize({ serviceIdentity = "", expectedLocalSender = "", knownRootGuids = [], knownThreads = [] } = {}) {
+  async #initialize({
+    serviceIdentity = "",
+    expectedLocalSender = "",
+    serviceAccountFingerprint = "",
+    knownRootGuids = [],
+    knownThreads = [],
+  } = {}) {
     try {
+      const senderRaw = clean(expectedLocalSender) || this.expectedLocalSenderRaw;
+      const sender = canonicalImsgIdentity(senderRaw);
+      if (!sender) return this.#unavailable("PRIMARY_SENDER_REQUIRED");
+      this.expectedLocalSenderRaw = senderRaw;
+      this.expectedLocalSender = sender;
+      const forbiddenAccount = (clean(serviceAccountFingerprint) || this.serviceAccountFingerprint || "").toLowerCase();
+      if (!/^[a-f0-9]{64}$/u.test(forbiddenAccount)) {
+        return this.#unavailable("SERVICE_ACCOUNT_PROOF_REQUIRED");
+      }
+      this.serviceAccountFingerprint = forbiddenAccount;
       if (!this.binary) await this.#locateBinary();
       const status = (await this.#runJson(["status", "--json"], { timeout: 8_000, maxBuffer: 512 * 1024 }))[0];
       const methods = new Set(Array.isArray(status?.rpc_methods) ? status.rpc_methods : []);
@@ -476,11 +518,20 @@ export class LocalUserMirrorSender {
       const identities = extractImsgAccountIdentities(account);
       const accountFingerprint = imsgAccountFingerprint(identities);
       if (!accountFingerprint) return this.#unavailable("ACCOUNT_UNAVAILABLE");
+      if (accountFingerprint === this.serviceAccountFingerprint) {
+        return this.#unavailable("SERVICE_ACCOUNT_REJECTED");
+      }
+      if (this.state[CONVERSATION_RESET_REQUIRED] === true) {
+        this.state = emptyState(this.conversationKey);
+        writeState(this.stateFile, this.state);
+      }
+      const pinnedAccountFingerprint = this.state.binding?.accountFingerprint;
+      if (pinnedAccountFingerprint && pinnedAccountFingerprint !== accountFingerprint) {
+        return this.#unavailable("PRIMARY_ACCOUNT_MISMATCH");
+      }
       this.accountFingerprint = accountFingerprint;
       this.accountIdentities = new Set(identities.map(canonicalImsgIdentity).filter(Boolean));
-      if (clean(expectedLocalSender)) this.expectedLocalSenderRaw = clean(expectedLocalSender);
-      this.expectedLocalSender = canonicalImsgIdentity(this.expectedLocalSenderRaw);
-      if (this.expectedLocalSender && !this.accountIdentities.has(this.expectedLocalSender)) {
+      if (!this.accountIdentities.has(this.expectedLocalSender)) {
         return this.#unavailable("SENDER_IDENTITY_MISMATCH");
       }
       const requestedRecipient = canonicalImsgIdentity(serviceIdentity);
@@ -499,23 +550,26 @@ export class LocalUserMirrorSender {
         .map((thread) => ({ threadId: clean(thread?.threadId ?? thread?.id), rootGuid: clean(thread?.rootGuid) }))
         .filter((thread) => thread.threadId && thread.rootGuid)
         .slice(0, 12);
-      const matchingChatIds = new Set();
+      const matchingChatCoordinates = new Set();
       for (const thread of known) {
         const rows = await this.#runJson([
           "search", "--query", `codex://threads/${thread.threadId}`, "--match", "contains", "--limit", "50", "--json",
         ], { timeout: 10_000 }).catch(() => []);
         for (const row of rows) {
           if (row?.is_from_me !== true && (rowRootGuid(row) === thread.rootGuid || messageGuid(row) === thread.rootGuid)) {
-            const id = Number(row?.chat_id ?? row?.chatId);
-            if (Number.isSafeInteger(id) && id > 0) matchingChatIds.add(id);
+            const coordinate = chatCoordinate(row);
+            if (coordinate) matchingChatCoordinates.add(coordinate);
           }
         }
       }
-      matches.push(...this.chats.filter((chat) => matchingChatIds.has(Number(chat.id))));
+      matches.push(...this.chats.filter((chat) => matchingChatCoordinates.has(chatCoordinate(chat))));
       if (!known.length && roots.length) {
         for (const chat of this.chats) {
           const rows = await this.#history(Number(chat.id), 500).catch(() => []);
-          if (roots.some((guid) => rows.some((row) => messageGuid(row) === guid))) matches.push(chat);
+          const binding = { chatId: Number(chat.id), chatGuid: clean(chat.guid) };
+          if (roots.some((guid) => rows.some((row) => rowBelongsToChat(row, binding) && messageGuid(row) === guid))) {
+            matches.push(chat);
+          }
         }
       }
       if (!matches.length && roots.length && this.state.binding?.accountFingerprint === accountFingerprint) {
@@ -523,7 +577,9 @@ export class LocalUserMirrorSender {
           && clean(chat.guid) === this.state.binding.chatGuid);
         if (priorChat) {
           const rows = await this.#history(Number(priorChat.id), 500).catch(() => []);
-          if (roots.some((guid) => rows.some((row) => messageGuid(row) === guid))) matches.push(priorChat);
+          if (roots.some((guid) => rows.some((row) => rowBelongsToChat(row, this.state.binding) && messageGuid(row) === guid))) {
+            matches.push(priorChat);
+          }
         }
       }
       let selected = matches.length === 1 ? matches[0] : null;
@@ -532,15 +588,31 @@ export class LocalUserMirrorSender {
           && clean(chat.guid) === this.state.binding.chatGuid) || null;
       }
       if (matches.length > 1) return this.#unavailable("CHAT_AMBIGUOUS");
-      if (selected) this.#bindChat(selected);
-      else if (this.state.binding?.accountFingerprint !== accountFingerprint) {
-        this.state = emptyState(this.conversationKey);
-        writeState(this.stateFile, this.state);
+      if (selected && !this.#bindChat(selected)) {
+        return this.capabilityStatus();
       }
-      // A same-account root lookup can be transiently empty while Messages is
-      // still indexing or the CLI is recovering. Keep the already target-pinned
-      // binding and, critically, its at-most-once delivery journal. Every send
-      // still revalidates the account and proves its exact Reply root locally.
+      if (this.state.binding) {
+        const expectedSenderHash = imsgIdentityHashes(this.expectedLocalSender)[0];
+        const liveBinding = this.chats.find((chat) => (
+          Number(chat?.id ?? chat?.chat_id) === this.state.binding.chatId
+          && clean(chat?.guid ?? chat?.chat_guid) === this.state.binding.chatGuid
+        ));
+        const liveRecipientHash = liveBinding
+          ? imsgIdentityHashes(participantValues(liveBinding)[0])[0]
+          : null;
+        if (!expectedSenderHash || !liveBinding) {
+          return this.#unavailable("CHAT_SENDER_MISMATCH");
+        }
+        if (!liveRecipientHash || liveRecipientHash !== this.state.binding.recipientHash) {
+          return this.#unavailable("CHAT_RECIPIENT_MISMATCH");
+        }
+        if (!this.state.binding.senderHash) {
+          this.state.binding = { ...this.state.binding, senderHash: expectedSenderHash };
+          writeState(this.stateFile, this.state);
+        } else if (this.state.binding.senderHash !== expectedSenderHash) {
+          return this.#unavailable("CHAT_SENDER_MISMATCH");
+        }
+      }
       this.capability = {
         available: true,
         status: this.state.binding ? "READY" : "AWAITING_THREAD_ROOT",
@@ -562,22 +634,31 @@ export class LocalUserMirrorSender {
     const chatGuid = clean(chat?.guid ?? chat?.chat_guid);
     const participant = participantValues(chat)[0];
     const recipientHash = imsgIdentityHashes(participant)[0];
-    if (!Number.isSafeInteger(chatId) || chatId <= 0 || !chatGuid || !recipientHash
+    const senderHash = this.expectedLocalSender ? imsgIdentityHashes(this.expectedLocalSender)[0] : null;
+    if (!Number.isSafeInteger(chatId) || chatId <= 0 || !chatGuid || !recipientHash || !senderHash
       || !directExternalChat(chat, this.accountIdentities)
       || !chatUsesSender(chat, this.expectedLocalSender)) return false;
     const binding = {
       accountFingerprint: this.accountFingerprint,
       recipientHash,
-      senderHash: this.expectedLocalSender ? imsgIdentityHashes(this.expectedLocalSender)[0] : null,
+      senderHash,
       chatId,
       chatGuid,
     };
     const prior = this.state.binding;
-    if (!prior || prior.accountFingerprint !== binding.accountFingerprint
+    if (prior && (prior.accountFingerprint !== binding.accountFingerprint
       || prior.recipientHash !== binding.recipientHash
-      || prior.senderHash !== binding.senderHash
-      || prior.chatId !== binding.chatId || prior.chatGuid !== binding.chatGuid) {
-      this.state = { ...emptyState(this.conversationKey), binding };
+      || (prior.senderHash && prior.senderHash !== binding.senderHash)
+      || prior.chatId !== binding.chatId || prior.chatGuid !== binding.chatGuid)) {
+      this.#unavailable("CHAT_BINDING_MISMATCH");
+      return false;
+    }
+    if (!prior && Object.keys(this.state.deliveries).length > 0) {
+      this.#unavailable("JOURNAL_BINDING_MISSING");
+      return false;
+    }
+    if (!prior || prior.senderHash !== binding.senderHash) {
+      this.state = { ...this.state, binding };
       writeState(this.stateFile, this.state);
     } else {
       this.state.binding = binding;
@@ -594,16 +675,18 @@ export class LocalUserMirrorSender {
       ], { timeout: 10_000 }).catch(() => []);
       const matchingRows = rows.filter((row) => row?.is_from_me !== true
         && (rowRootGuid(row) === expectedRoot || messageGuid(row) === expectedRoot));
-      const candidateIds = new Set(matchingRows.map((row) => Number(row?.chat_id ?? row?.chatId)).filter((id) => Number.isSafeInteger(id) && id > 0));
-      const matches = this.chats.filter((chat) => candidateIds.has(Number(chat.id)));
+      const candidateCoordinates = new Set(matchingRows.map(chatCoordinate).filter(Boolean));
+      const matches = this.chats.filter((chat) => candidateCoordinates.has(chatCoordinate(chat)));
       if (matches.length === 1 && this.#bindChat(matches[0])) return true;
+      if (matches.length === 1 && !this.capability.available) return false;
       if (matches.length > 1) return false;
       // A just-synchronized chat may not have been in the initialization list.
       const chats = await this.#runJson(["chats", "--limit", "250", "--json"], { timeout: 10_000 }).catch(() => []);
       this.chats = chats.filter((chat) => directExternalChat(chat, this.accountIdentities)
         && chatUsesSender(chat, this.expectedLocalSender));
-      const refreshed = this.chats.filter((chat) => candidateIds.has(Number(chat.id)));
+      const refreshed = this.chats.filter((chat) => candidateCoordinates.has(chatCoordinate(chat)));
       if (refreshed.length === 1 && this.#bindChat(refreshed[0])) return true;
+      if (refreshed.length === 1 && !this.capability.available) return false;
       if (this.now() >= deadline) break;
       await this.sleep(Math.min(300, Math.max(1, deadline - this.now())));
     } while (this.now() < deadline);
@@ -612,6 +695,10 @@ export class LocalUserMirrorSender {
 
   async #revalidateBinding() {
     try {
+      if (!this.expectedLocalSender) return this.#unavailable("PRIMARY_SENDER_REQUIRED");
+      if (!/^[a-f0-9]{64}$/u.test(this.serviceAccountFingerprint || "")) {
+        return this.#unavailable("SERVICE_ACCOUNT_PROOF_REQUIRED");
+      }
       const status = (await this.#runJson(["status", "--json"], { timeout: 8_000, maxBuffer: 512 * 1024 }))[0];
       const methods = new Set(Array.isArray(status?.rpc_methods) ? status.rpc_methods : []);
       if (status?.advanced_features !== true || status?.v2_ready !== true
@@ -623,8 +710,16 @@ export class LocalUserMirrorSender {
       const identities = extractImsgAccountIdentities(account);
       const fingerprint = imsgAccountFingerprint(identities);
       const identitySet = new Set(identities.map(canonicalImsgIdentity).filter(Boolean));
-      if (!fingerprint || (this.expectedLocalSender && !identitySet.has(this.expectedLocalSender))) {
+      if (!fingerprint) return this.#unavailable("ACCOUNT_UNAVAILABLE");
+      if (fingerprint === this.serviceAccountFingerprint) {
+        return this.#unavailable("SERVICE_ACCOUNT_REJECTED");
+      }
+      if (!identitySet.has(this.expectedLocalSender)) {
         return this.#unavailable("SENDER_IDENTITY_MISMATCH");
+      }
+      const pinnedAccountFingerprint = this.state.binding?.accountFingerprint;
+      if (pinnedAccountFingerprint && pinnedAccountFingerprint !== fingerprint) {
+        return this.#unavailable("PRIMARY_ACCOUNT_MISMATCH");
       }
       this.accountFingerprint = fingerprint;
       this.accountIdentities = identitySet;
@@ -632,13 +727,26 @@ export class LocalUserMirrorSender {
       this.chats = chats.filter((chat) => directExternalChat(chat, identitySet)
         && chatUsesSender(chat, this.expectedLocalSender));
       if (this.state.binding) {
-        if (this.state.binding.accountFingerprint !== fingerprint) {
-          this.state = emptyState(this.conversationKey);
-          writeState(this.stateFile, this.state);
+        const expectedSenderHash = imsgIdentityHashes(this.expectedLocalSender)[0];
+        const liveBinding = this.chats.find((chat) => (
+          Number(chat?.id ?? chat?.chat_id) === this.state.binding.chatId
+          && clean(chat?.guid ?? chat?.chat_guid) === this.state.binding.chatGuid
+        ));
+        const liveRecipientHash = liveBinding
+          ? imsgIdentityHashes(participantValues(liveBinding)[0])[0]
+          : null;
+        if (!expectedSenderHash || !liveBinding) {
+          return this.#unavailable("CHAT_SENDER_MISMATCH");
         }
-        // A transiently incomplete chat list is not evidence that the durable
-        // conversation scope changed. Retain the pinned binding and journal;
-        // #localRoot must independently prove the requested root before send.
+        if (!liveRecipientHash || liveRecipientHash !== this.state.binding.recipientHash) {
+          return this.#unavailable("CHAT_RECIPIENT_MISMATCH");
+        }
+        if (!this.state.binding.senderHash) {
+          this.state.binding = { ...this.state.binding, senderHash: expectedSenderHash };
+          writeState(this.stateFile, this.state);
+        } else if (this.state.binding.senderHash !== expectedSenderHash) {
+          return this.#unavailable("CHAT_SENDER_MISMATCH");
+        }
       }
       this.capability = {
         available: true,
@@ -661,7 +769,9 @@ export class LocalUserMirrorSender {
     const deadline = this.now() + this.discoveryTimeoutMs;
     do {
       const history = await this.#history().catch(() => []);
-      if (expectedRoot && history.some((row) => messageGuid(row) === expectedRoot)) return expectedRoot;
+      if (expectedRoot && history.some((row) => rowBelongsToChat(row, binding) && messageGuid(row) === expectedRoot)) {
+        return expectedRoot;
+      }
       const rows = await this.#runJson([
         "search", "--query", `codex://threads/${threadId}`, "--match", "contains", "--limit", "50", "--json",
       ], { timeout: 10_000 }).catch(() => []);
@@ -681,6 +791,8 @@ export class LocalUserMirrorSender {
       const cleanBodyMatches = (!isClientGuidDelivery(entry) && entry.wireMode === WIRE_MODE_TAGGED)
         || hash("local-user-mirror-body-v1", typeof row?.text === "string" ? row.text : "") === entry.bodyHash;
       return row?.is_from_me === true
+        && rowBelongsToChat(row, this.state.binding)
+        && rowUsesSender(row, this.expectedLocalSender)
         && cleanBodyMatches
         && contextRoot === entry.rootGuid
         && Boolean(messageGuid(row));
@@ -773,6 +885,65 @@ export class LocalUserMirrorSender {
     this.router.confirmUserMirrorEcho(key, guid);
     this.router.routeOutboundGuid(guid, threadId);
     return guid;
+  }
+
+  async #acceptedPartResult(classification, key, entry, guidValue, reservationText) {
+    const guid = clean(guidValue);
+    let receiverObserved = Boolean(guid && this.#receiverReceiptGuid(key, entry) === guid);
+    if (guid && !receiverObserved) {
+      try {
+        // An accepted sender journal is at-most-once proof, not receiving-side
+        // ordering proof. Rebuild the exact guard before the narrow helper
+        // lookup so an old row behind the watch cursor can be recovered
+        // without ever becoming a second Codex prompt or being sent again.
+        this.router.reserveUserMirrorEcho({
+          reservationId: key,
+          threadId: entry.threadId,
+          text: reservationText,
+          rootGuid: entry.rootGuid,
+          bodyHash: entry.bodyHash,
+        });
+        if (!this.router.markUserMirrorEchoAttempted(key, entry.bodyHash)) {
+          receiverObserved = this.#receiverReceiptGuid(key, entry) === guid;
+        } else {
+          this.router.confirmUserMirrorEcho(key, guid);
+          const proof = await this.verifyReceiverMirror({
+            guid,
+            rootGuid: entry.rootGuid,
+            bodyHash: entry.bodyHash,
+          });
+          if (proof?.observed === true && clean(proof.guid) === guid) {
+            this.router.recordVerifiedUserMirrorReceipt?.({
+              reservationId: key,
+              threadId: entry.threadId,
+              rootGuid: entry.rootGuid,
+              guid,
+              bodyHash: entry.bodyHash,
+            });
+          }
+          receiverObserved = this.#receiverReceiptGuid(key, entry) === guid;
+        }
+      } catch {
+        // A receiver lookup is recovery-only. Missing/transient proof keeps
+        // this task's cursor pinned and must never reopen the native send.
+        receiverObserved = this.#receiverReceiptGuid(key, entry) === guid;
+      }
+    }
+    if (!receiverObserved) {
+      const acceptedAt = Date.parse(entry.acceptedAt || entry.attemptedAt || entry.preparedAt);
+      if (Number.isFinite(acceptedAt) && this.now() - acceptedAt >= AMBIGUOUS_DEAD_LETTER_MS) {
+        entry.status = "dead-letter";
+        entry.deadLetteredAt ||= new Date(this.now()).toISOString();
+        this.#saveDelivery(key, entry);
+        return { classification: "dead-letter", reservationId: key, attempted: true, receiverObserved: false };
+      }
+    }
+    return {
+      classification,
+      guid,
+      reservationId: key,
+      receiverObserved,
+    };
   }
 
   #unresolvedPart(key, entry) {
@@ -921,7 +1092,7 @@ export class LocalUserMirrorSender {
         this.router.confirmUserMirrorEcho(key, entry.guid);
         this.router.routeOutboundGuid(entry.guid, threadId);
       }
-      return { classification: "duplicate", guid: entry.guid, reservationId: key };
+      return this.#acceptedPartResult("duplicate", key, entry, entry.guid, reservationText);
     }
     if (entry.status === "dead-letter") {
       return { classification: "dead-letter", reservationId: key, attempted: true };
@@ -930,7 +1101,7 @@ export class LocalUserMirrorSender {
       receiverReceiptGuid = this.#receiverReceiptGuid(key, entry);
       if (receiverReceiptGuid) {
         this.#acceptPart(key, entry, threadId, receiverReceiptGuid);
-        return { classification: "duplicate", guid: receiverReceiptGuid, reservationId: key };
+        return this.#acceptedPartResult("duplicate", key, entry, receiverReceiptGuid, reservationText);
       }
       const recovered = await this.#reconcile(entry, entry.guid || "");
       if (!recovered) {
@@ -941,7 +1112,7 @@ export class LocalUserMirrorSender {
         return this.#unresolvedPart(key, entry);
       } else {
         this.#acceptPart(key, entry, threadId, messageGuid(recovered) || entry.guid);
-        return { classification: "duplicate", guid: entry.guid, reservationId: key };
+        return this.#acceptedPartResult("duplicate", key, entry, entry.guid, reservationText);
       }
     }
 
@@ -998,7 +1169,7 @@ export class LocalUserMirrorSender {
       receiverReceiptGuid = this.#receiverReceiptGuid(key, entry);
       if (receiverReceiptGuid) {
         this.#acceptPart(key, entry, threadId, receiverReceiptGuid);
-        return { classification: "accepted", guid: receiverReceiptGuid, reservationId: key };
+        return this.#acceptedPartResult("accepted", key, entry, receiverReceiptGuid, reservationText);
       }
       const recovered = await this.#reconcile(entry);
       if (recovered) result = { classification: "accepted", ok: true, guid: messageGuid(recovered) };
@@ -1029,7 +1200,7 @@ export class LocalUserMirrorSender {
     receiverReceiptGuid = this.#receiverReceiptGuid(key, entry);
     if (receiverReceiptGuid) {
       this.#acceptPart(key, entry, threadId, receiverReceiptGuid);
-      return { classification: "accepted", guid: receiverReceiptGuid, reservationId: key };
+      return this.#acceptedPartResult("accepted", key, entry, receiverReceiptGuid, reservationText);
     }
     if (result?.classification === "ambiguous") {
       const recovered = await this.#reconcile(entry, returnedGuid);
@@ -1054,7 +1225,7 @@ export class LocalUserMirrorSender {
       return this.#unresolvedPart(key, entry);
     }
     this.#acceptPart(key, entry, threadId, verifiedGuid);
-    return { classification: "accepted", guid: entry.guid, reservationId: key };
+    return this.#acceptedPartResult("accepted", key, entry, entry.guid, reservationText);
   }
 
   async #sendMirror(message = {}) {
@@ -1109,11 +1280,13 @@ export class LocalUserMirrorSender {
     const parts = imsgTransportInternals.splitTextIntent(intent);
     const guids = [];
     let duplicateOnly = true;
+    let receiverObserved = true;
     let ambiguous = false;
     let deadLetter = false;
     for (let index = 0; index < parts.length; index += 1) {
       const part = await this.#sendPart({ deliveryId, threadId, rootGuid, intent: parts[index], index });
       if (part.guid) guids.push(part.guid);
+      receiverObserved &&= part.receiverObserved === true;
       if (part.classification === "accepted") duplicateOnly = false;
       if (part.classification === "unavailable") {
         return deliveryResult("unavailable", {
@@ -1155,6 +1328,7 @@ export class LocalUserMirrorSender {
       attempted: !duplicateOnly,
       guids,
       parts: parts.length,
+      receiverObserved,
       fallbackSafe: false,
     });
   }

@@ -52,7 +52,7 @@ test("persists a prompt before acknowledgement and resumes it after restart", ()
   assert.equal(resumed.ingest(message(10, "Run the tests.")), null);
 });
 
-test("a newly created task can become the durable default without opening a selection pause", () => {
+test("a newly created task can become command context without capturing top-level conversation", () => {
   const { router, stateFile } = fixture();
   router.setAwaitingPrompt("thread-old");
   router.clearAwaitingPrompt("thread-old");
@@ -70,8 +70,8 @@ test("a newly created task can become the durable default without opening a sele
   const action = resumed.ingest(message(11, "Continue the new task.", {
     createdAt: "2026-07-12T12:00:02.000Z",
   }));
-  assert.equal(action.kind, "prompt");
-  assert.equal(action.threadId, "thread-new");
+  assert.equal(action.kind, "controller-prompt");
+  assert.equal(action.threadId, undefined);
 });
 
 test("atomically acknowledges an action with a durable deterministic confirmation", () => {
@@ -156,7 +156,8 @@ test("native originators route replies while incidental reply parents do not cha
   router.acknowledge(seed.messageKey);
 
   const topLevel = router.ingest(message(20, "Continue my default.", { reply_to_guid: "root-b" }));
-  assert.equal(topLevel.threadId, "thread-a");
+  assert.equal(topLevel.kind, "controller-prompt");
+  assert.equal(topLevel.threadId, undefined);
   assert.equal(topLevel.replyToGuid, "root-b");
   router.acknowledge(topLevel.messageKey);
 
@@ -305,8 +306,8 @@ test("stress: interleaved native descendants keep command and prompt context acr
     reply_to_guid: roots[(threadIds.indexOf(expectedLastThread) + 1) % roots.length],
     createdAt: "2026-07-12T12:02:01.000Z",
   }));
-  assert.equal(topLevel.kind, "prompt");
-  assert.equal(topLevel.threadId, expectedLastThread);
+  assert.equal(topLevel.kind, "controller-prompt");
+  assert.equal(topLevel.threadId, undefined);
 });
 
 test("unknown and corrupt native originators fail closed without falling back to the default task", () => {
@@ -1087,6 +1088,60 @@ test("a clean user-mirror reservation requires exact GUID evidence before consum
   assert.equal(consumed.expectedGuid, "clean-mirror-guid");
 });
 
+test("authenticated receiver proof imports an exact durable mirror receipt without fresh user activity", () => {
+  const { router, stateFile } = fixture();
+  const reservationId = "9".repeat(64);
+  const threadId = "thread-a";
+  const rootGuid = "root-a";
+  const guid = "receiver-observed-guid";
+  const body = "Mirror observed before receiver watch restart";
+  const bodyHash = mirrorBodyHash(body);
+  router.routeOutboundGuid(rootGuid, threadId, { root: true });
+  router.reserveUserMirrorEcho({ reservationId, threadId, text: body, rootGuid, bodyHash });
+  router.markUserMirrorEchoAttempted(reservationId, bodyHash);
+  router.confirmUserMirrorEcho(reservationId, guid, { verified: false });
+
+  const exactProof = { reservationId, threadId, rootGuid, guid, bodyHash };
+  assert.equal(router.recordVerifiedUserMirrorReceipt(exactProof), null,
+    "a bridge proposal alone is not authoritative enough to import receiver history");
+  assert.equal(router.confirmUserMirrorEcho(reservationId, guid), true);
+
+  for (const changed of [
+    { reservationId: "8".repeat(64) },
+    { threadId: "thread-b" },
+    { rootGuid: "root-b" },
+    { guid: "wrong-guid" },
+    { bodyHash: "a".repeat(64) },
+  ]) {
+    assert.equal(router.recordVerifiedUserMirrorReceipt({ ...exactProof, ...changed }), null);
+    assert.equal(router.userMirrorEchoReceipt(reservationId), null);
+  }
+
+  const receipt = router.recordVerifiedUserMirrorReceipt(exactProof);
+  assert.deepEqual(receipt, {
+    threadId,
+    rootGuid,
+    guid,
+    bodyHash,
+    fingerprint: createHash("sha256").update(`imsg-user-mirror:${body}`).digest("hex"),
+    consumedAt: "2026-07-12T12:00:00.000Z",
+  });
+  assert.equal(router.hasSeenMessageGuid(guid), true);
+  assert.equal(router.nativeThread(threadId).rootGuid, rootGuid);
+  assert.equal(router.nativeThread(threadId).latestGuid, guid);
+  assert.equal(router.lastUserThreadId, null, "old recovery proof must not become fresh command context");
+  assert.deepEqual(router.recordVerifiedUserMirrorReceipt(exactProof), receipt, "proof import is idempotent");
+
+  const resumed = new LocalConversationRouter({ stateFile, now: () => Date.parse("2026-07-12T12:00:01.000Z") });
+  assert.deepEqual(resumed.userMirrorEchoReceipt(reservationId), receipt);
+  assert.equal(resumed.recordVerifiedUserMirrorReceipt({ ...exactProof, bodyHash: "b".repeat(64) }), null);
+  assert.equal(resumed.consumeUserMirrorEcho(message(58_130, body, {
+    guid,
+    thread_originator_guid: rootGuid,
+  })), null, "a replayed watch row remains suppressed after proof import");
+  assert.deepEqual(resumed.pendingActions(), []);
+});
+
 test("an attempted clean mirror releases disproved candidates and fails closed on quarantine overflow", () => {
   const { router, stateFile } = fixture();
   router.routeOutboundGuid("root-a", "thread-a", { root: true });
@@ -1334,6 +1389,30 @@ test("quarantine release rolls back before any original or newly released inbox 
     ["parked-capacity-one", "parked-capacity-two"]);
   persisted = JSON.parse(readFileSync(stateFile, "utf8"));
   assert.deepEqual(persisted.userMirrorEchoes, []);
+});
+
+test("a saturated local inbox rejects the newest row without advancing or evicting", () => {
+  const { router, stateFile } = fixture();
+  for (let index = 0; index < 128; index += 1) {
+    router.ingest(message(70_000 + index, `Pending top-level request ${index}`, {
+      guid: `pending-controller-${index}`,
+      createdAt: "2026-07-12T12:00:05.000Z",
+    }));
+  }
+  const before = readFileSync(stateFile, "utf8");
+  assert.throws(
+    () => router.ingest(message(70_128, "Do not evict request zero", {
+      guid: "pending-controller-overflow",
+      createdAt: "2026-07-12T12:00:06.000Z",
+    })),
+    { code: "LOCAL_ACTION_QUEUE_FULL" },
+  );
+
+  assert.equal(readFileSync(stateFile, "utf8"), before);
+  assert.equal(router.pendingActions().length, 128);
+  assert.equal(router.pendingActions()[0].messageKey, "pending-controller-0");
+  assert.equal(router.pendingActions().at(-1).messageKey, "pending-controller-127");
+  assert.equal(JSON.parse(before).lastRowId, 70_127);
 });
 
 test("settled mirror ids are body-bound and legacy unbound receipts fail closed", () => {
@@ -1587,7 +1666,7 @@ test("conversation identity changes reset chat-bound routes, activity, and pendi
   switched.setActiveThread("thread-b");
   const stored = JSON.parse(readFileSync(stateFile, "utf8"));
   assert.equal(stored.conversationKey, "b".repeat(64));
-  assert.equal(stored.version, 5);
+  assert.equal(stored.version, 6);
 });
 
 test("old conversation state is reset instead of carrying legacy routes forward", () => {
@@ -1604,6 +1683,88 @@ test("old conversation state is reset instead of carrying legacy routes forward"
   assert.equal(router.lastUserThreadId, null);
   assert.deepEqual(router.pendingActions(), []);
   assert.equal(router.nativeThread("legacy-thread"), null);
+});
+
+test("v5 default-task prompts migrate to the hidden controller without rewriting explicit task replies", () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "imsg-router-v5-controller-migration-"));
+  const stateFile = path.join(directory, "state.json");
+  writeFileSync(stateFile, `${JSON.stringify({
+    version: 5,
+    activeThreadId: "legacy-default",
+    mostRecentThreadId: "legacy-default",
+    lastUserThreadId: "legacy-default",
+    threads: {
+      "legacy-default": { rootGuid: "legacy-root" },
+      "native-task": { rootGuid: "native-root" },
+      "selected-task": { rootGuid: "selected-root" },
+    },
+    pending: [
+      {
+        kind: "prompt",
+        messageKey: "legacy-top-level",
+        threadId: "legacy-default",
+        body: "This was routed only by the old default task.",
+        guid: "legacy-top-level",
+        createdAt: "2026-07-12T11:59:57.000Z",
+      },
+      {
+        kind: "prompt",
+        messageKey: "native-reply",
+        threadId: "native-task",
+        body: "This has authoritative native Reply context.",
+        guid: "native-reply",
+        threadOriginatorGuid: "native-root",
+        createdAt: "2026-07-12T11:59:58.000Z",
+      },
+      {
+        kind: "prompt",
+        messageKey: "manual-selection",
+        threadId: "selected-task",
+        body: "This consumed an explicit selection lease.",
+        guid: "manual-selection",
+        fromAwaitingPrompt: true,
+        createdAt: "2026-07-12T11:59:59.000Z",
+      },
+    ],
+  })}\n`);
+
+  const router = new LocalConversationRouter({
+    stateFile,
+    now: () => Date.parse("2026-07-12T12:00:00.000Z"),
+  });
+  const [legacyTopLevel, nativeReply, manualSelection] = router.pendingActions();
+  assert.deepEqual({
+    kind: legacyTopLevel.kind,
+    threadId: legacyTopLevel.threadId,
+    body: legacyTopLevel.body,
+  }, {
+    kind: "controller-prompt",
+    threadId: undefined,
+    body: "This was routed only by the old default task.",
+  });
+  assert.deepEqual({
+    kind: nativeReply.kind,
+    threadId: nativeReply.threadId,
+    threadOriginatorGuid: nativeReply.threadOriginatorGuid,
+  }, {
+    kind: "prompt",
+    threadId: "native-task",
+    threadOriginatorGuid: "native-root",
+  });
+  assert.deepEqual({
+    kind: manualSelection.kind,
+    threadId: manualSelection.threadId,
+    fromAwaitingPrompt: manualSelection.fromAwaitingPrompt,
+  }, {
+    kind: "prompt",
+    threadId: "selected-task",
+    fromAwaitingPrompt: true,
+  });
+
+  assert.equal(router.acknowledge(legacyTopLevel.messageKey), true);
+  const persisted = JSON.parse(readFileSync(stateFile, "utf8"));
+  assert.equal(persisted.version, 6);
+  assert.equal(persisted.pending.some((action) => action.threadId === "legacy-default"), false);
 });
 
 test("persists content-free outbound receipts and GUID routes", () => {
@@ -1703,8 +1864,12 @@ test("explicit inbound route registration persists the message and authoritative
   assert.equal(resumed.ingest(message(64, "Reply at root", { thread_originator_guid: "assistant-root" })).threadId, "thread-a");
   resumed.acknowledge("guid-64");
   const incidentalParent = resumed.ingest(message(65, "Top-level parent metadata", { reply_to_guid: "assistant-child" }));
-  assert.equal(incidentalParent.threadId, "thread-a");
-  assert.equal(resumed.ingest(message(66, "Unknown parent remains top-level", { reply_to_guid: "not-routed" })).threadId, "thread-a");
+  assert.equal(incidentalParent.kind, "controller-prompt");
+  assert.equal(incidentalParent.threadId, undefined);
+  resumed.acknowledge(incidentalParent.messageKey);
+  const unknownParent = resumed.ingest(message(66, "Unknown parent remains top-level", { reply_to_guid: "not-routed" }));
+  assert.equal(unknownParent.kind, "controller-prompt");
+  assert.equal(unknownParent.threadId, undefined);
 });
 
 test("a conflicting originator can never become another task's native root", () => {
@@ -1741,10 +1906,11 @@ test("remembering an inbound message never turns its incidental parent into repl
   const seedDefault = router.ingest(message(67, "Use B by default", { thread_originator_guid: "root-b" }));
   router.acknowledge(seedDefault.messageKey);
   const topLevel = router.ingest(message(68, "Still B", { reply_to_guid: "incidental-unmapped-parent" }));
-  assert.equal(topLevel.threadId, "thread-b");
+  assert.equal(topLevel.kind, "controller-prompt");
+  assert.equal(topLevel.threadId, undefined);
 });
 
-test("background output cannot redirect an unthreaded prompt away from the last user task", () => {
+test("background output and task defaults cannot capture a top-level controller prompt", () => {
   const { router } = fixture();
   router.routeOutboundGuid("root-a", "thread-a", { root: true, createdAt: "2026-07-12T11:59:58.000Z" });
   const initial = router.ingest(message(69, "Work here.", { thread_originator_guid: "root-a" }));
@@ -1752,9 +1918,9 @@ test("background output cannot redirect an unthreaded prompt away from the last 
   router.routeOutboundGuid("root-b", "thread-b", { createdAt: "2026-07-12T12:00:01.000Z" });
   assert.equal(router.mostRecentThreadId, "thread-b");
   const action = router.ingest(message(70, "Continue my task."));
-  assert.equal(action.kind, "prompt");
-  assert.equal(action.threadId, "thread-a");
-  assert.equal(router.mostRecentThreadId, "thread-a");
+  assert.equal(action.kind, "controller-prompt");
+  assert.equal(action.threadId, undefined);
+  assert.equal(router.mostRecentThreadId, "thread-b");
   assert.equal(router.lastUserThreadId, "thread-a");
 });
 
@@ -1853,7 +2019,7 @@ test("task commands prefer native reply then recent default context before a pic
   }
 });
 
-test("command default context has an inclusive configurable TTL while ordinary prompts remain indefinite", () => {
+test("command default context expires while ordinary top-level prompts use the hidden controller", () => {
   const { router, advance } = fixture({ commandContextTtlMs: 1_000 });
   router.routeOutboundGuid("root-a", "thread-a", { root: true });
   const seed = router.ingest(message(120, "Work here.", { thread_originator_guid: "root-a" }));
@@ -1873,8 +2039,67 @@ test("command default context has an inclusive configurable TTL while ordinary p
 
   advance(60 * 60 * 1000);
   const prompt = router.ingest(message(123, "Continue despite the old context."));
-  assert.equal(prompt.kind, "prompt");
-  assert.equal(prompt.threadId, "thread-a");
+  assert.equal(prompt.kind, "controller-prompt");
+  assert.equal(prompt.threadId, undefined);
+  assert.equal(router.lastUserThreadId, "thread-a");
+});
+
+test("controller replies survive restart without becoming task reply context", () => {
+  const { router, stateFile } = fixture();
+  router.routeOutboundGuid("task-root", "thread-a", { root: true });
+  assert.equal(router.routeControllerOutboundGuid("controller-output"), true);
+
+  const resumed = new LocalConversationRouter({ stateFile });
+  const controllerReply = resumed.ingest(message(124, "What is running?", {
+    thread_originator_guid: "controller-output",
+    reply_to_guid: "controller-output",
+  }));
+  assert.equal(controllerReply.kind, "controller-prompt");
+  assert.equal(controllerReply.threadId, undefined);
+  resumed.acknowledge(controllerReply.messageKey);
+
+  const taskReply = resumed.ingest(message(125, "Continue this task.", {
+    thread_originator_guid: "task-root",
+  }));
+  assert.equal(taskReply.kind, "prompt");
+  assert.equal(taskReply.threadId, "thread-a");
+});
+
+test("top-level cancel and emphasis on controller output cancel only the hidden controller", () => {
+  const { router, stateFile } = fixture();
+  router.routeOutboundGuid("task-root", "thread-a", { root: true });
+  assert.equal(router.routeControllerOutboundGuid("controller-root"), true);
+
+  const slashCancel = router.ingest(message(9_930, "/cancel"));
+  assert.equal(slashCancel.kind, "controller-cancel");
+  assert.equal(slashCancel.threadId, undefined);
+  router.acknowledge(slashCancel.messageKey);
+
+  const emphasisCancel = router.ingest(message(9_931, "Emphasized a message", {
+    is_reaction: true,
+    reaction_type: "emphasize",
+    is_reaction_add: true,
+    reacted_to_guid: "controller-root",
+  }));
+  assert.equal(emphasisCancel.kind, "controller-cancel");
+  assert.equal(emphasisCancel.threadId, undefined);
+  router.acknowledge(emphasisCancel.messageKey);
+
+  const taskCancel = router.ingest(message(9_932, "/cancel", {
+    thread_originator_guid: "task-root",
+  }));
+  assert.equal(taskCancel.kind, "unknown-command");
+  assert.equal(taskCancel.threadId, "thread-a");
+  router.acknowledge(taskCancel.messageKey);
+
+  const removedEmphasis = router.ingest(message(9_933, "Removed emphasis", {
+    is_reaction: true,
+    reaction_type: "emphasize",
+    is_reaction_add: false,
+    reacted_to_guid: "controller-root",
+  }));
+  assert.equal(removedEmphasis, null);
+  assert.deepEqual(new LocalConversationRouter({ stateFile }).pendingActions(), []);
 });
 
 test("awaiting-prompt pause is task-local, expiring, and explicitly clearable", () => {
@@ -1928,12 +2153,12 @@ test("a native reply prompt to the manually selected task consumes the pause dur
   assert.equal(new LocalConversationRouter({ stateFile }).incomingPaused, false);
 });
 
-test("link and task cancel commands are unavailable and cannot release a manual selection", () => {
+test("top-level controller cancel and unavailable link cannot release a manual task selection", () => {
   const { router, stateFile } = fixture();
   router.setAwaitingPrompt("thread-a");
   const cancel = router.ingest(message(103, "/cancel", { reply_to_guid: "incidental-parent" }));
-  assert.equal(cancel.kind, "unknown-command");
-  assert.equal(cancel.threadId, "thread-a");
+  assert.equal(cancel.kind, "controller-cancel");
+  assert.equal(cancel.threadId, undefined);
   router.acknowledge(cancel.messageKey);
   const link = router.ingest(message(104, "/link"));
   assert.equal(link.kind, "unknown-command");
@@ -1944,7 +2169,7 @@ test("link and task cancel commands are unavailable and cannot release a manual 
   }).incomingPaused, true);
 });
 
-test("v5 state persists the last user task independently from background activity", () => {
+test("v6 state persists the last user task independently from background activity", () => {
   const { router, stateFile } = fixture();
   router.routeOutboundGuid("root-a", "thread-a", { root: true });
   const action = router.ingest(message(110, "Reply", { thread_originator_guid: "root-a" }));
@@ -1953,7 +2178,7 @@ test("v5 state persists the last user task independently from background activit
   const resumed = new LocalConversationRouter({ stateFile });
   assert.equal(resumed.lastUserThreadId, "thread-a");
   assert.equal(resumed.mostRecentThreadId, "thread-b");
-  assert.equal(JSON.parse(readFileSync(stateFile, "utf8")).version, 5);
+  assert.equal(JSON.parse(readFileSync(stateFile, "utf8")).version, 6);
 });
 
 test("new-task and default-reasoning commands stay global inside and outside native replies", () => {
@@ -2040,6 +2265,6 @@ test("new-task prompt lease lasts 120 seconds, yields to explicit replies, and c
   advance(120_001);
   assert.equal(router.awaitingNewPrompt, null);
   const afterExpiry = router.ingest(message(9_023, "Continue the old default."));
-  assert.equal(afterExpiry.kind, "prompt");
-  assert.equal(afterExpiry.threadId, "thread-a");
+  assert.equal(afterExpiry.kind, "controller-prompt");
+  assert.equal(afterExpiry.threadId, undefined);
 });

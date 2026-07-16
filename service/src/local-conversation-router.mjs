@@ -3,13 +3,14 @@ import { createHash } from "node:crypto";
 import path from "node:path";
 import { parseMenuSelection, parseSlashCommand } from "../../protocol/presentation.ts";
 
-const STATE_VERSION = 5;
+const STATE_VERSION = 6;
 const DEFAULT_MENU_TTL_MS = 10 * 60 * 1000;
 const DEFAULT_AWAITING_PROMPT_TTL_MS = 2 * 60 * 1000;
 const DEFAULT_COMMAND_CONTEXT_TTL_MS = 5 * 60 * 1000;
 const MAX_PENDING = 128;
 const MAX_SEEN = 512;
 const MAX_GUID_ROUTES = 4096;
+const MAX_CONTROLLER_GUIDS = 1024;
 const MAX_POLLS = 64;
 const MAX_RECEIPTS = 512;
 const MAX_THREADS = 512;
@@ -51,6 +52,7 @@ const POLL_ACTION_KINDS = new Set([
   "new-reasoning",
   "new-reasoning-refresh",
   "default-reasoning",
+  "controller-response",
 ]);
 
 function emptyState(conversationKey = null) {
@@ -71,6 +73,7 @@ function emptyState(conversationKey = null) {
     pending: [],
     seen: [],
     guidRoutes: {},
+    controllerGuids: {},
     polls: {},
     outboundReceipts: {},
     outboundEchoes: [],
@@ -146,6 +149,7 @@ function normalizePollAction(value) {
   if (kind === "new-project" && !action.projectKey) return null;
   if (kind === "new-reasoning" && !action.argument) return null;
   if (kind === "default-reasoning" && !action.argument) return null;
+  if (kind === "controller-response" && !action.argument && !action.commandArgument) return null;
   return action;
 }
 
@@ -311,7 +315,8 @@ function normalizeConfirmation(value) {
 
 function normalizeState(value, expectedConversationKey = null) {
   const requestedConversationKey = cleanString(expectedConversationKey, 128);
-  if (!value || typeof value !== "object" || Number(value.version) !== STATE_VERSION) {
+  const storedVersion = Number(value?.version);
+  if (!value || typeof value !== "object" || ![5, STATE_VERSION].includes(storedVersion)) {
     return emptyState(requestedConversationKey);
   }
   const storedConversationKey = cleanString(value.conversationKey, 128);
@@ -360,13 +365,25 @@ function normalizeState(value, expectedConversationKey = null) {
     const references = cleanReferences(value.menu.references);
     if (expiresAt && references.length) state.menu = { expiresAt, references };
   }
-  state.pending = Array.isArray(value.pending) ? value.pending.map(cleanAction).filter(Boolean).slice(-MAX_PENDING) : [];
+  state.pending = Array.isArray(value.pending) ? value.pending.map(cleanAction).filter(Boolean).map((action) => {
+    if (storedVersion !== 5 || action.kind !== "prompt"
+      || action.threadOriginatorGuid || action.fromAwaitingPrompt) return action;
+    const { threadId: _legacyDefaultThreadId, ...controllerAction } = action;
+    return { ...controllerAction, kind: "controller-prompt" };
+  }).slice(-MAX_PENDING) : [];
   state.seen = Array.isArray(value.seen) ? value.seen.map((item) => cleanString(item, 256)).filter(Boolean).slice(-MAX_SEEN) : [];
   if (value.guidRoutes && typeof value.guidRoutes === "object" && !Array.isArray(value.guidRoutes)) {
     for (const [guid, threadId] of Object.entries(value.guidRoutes).slice(-MAX_GUID_ROUTES)) {
       const cleanGuid = cleanString(guid, 256);
       const cleanThread = cleanString(threadId, 200);
       if (cleanGuid && cleanThread) state.guidRoutes[cleanGuid] = cleanThread;
+    }
+  }
+  if (storedVersion >= 6 && value.controllerGuids && typeof value.controllerGuids === "object" && !Array.isArray(value.controllerGuids)) {
+    for (const [guid, at] of Object.entries(value.controllerGuids).slice(-MAX_CONTROLLER_GUIDS)) {
+      const cleanGuid = cleanString(guid, 256);
+      const cleanAt = isoString(at);
+      if (cleanGuid && cleanAt && !state.guidRoutes[cleanGuid]) state.controllerGuids[cleanGuid] = cleanAt;
     }
   }
   if (value.polls && typeof value.polls === "object" && !Array.isArray(value.polls)) {
@@ -568,12 +585,24 @@ function pruneThreadStates(state) {
 function routeGuid(state, guid, threadId) {
   const cleanGuid = cleanString(guid, 256);
   const cleanThread = cleanString(threadId, 200);
-  if (!cleanGuid || !cleanThread) return false;
+  if (!cleanGuid || !cleanThread || state.controllerGuids[cleanGuid]) return false;
   if (state.guidRoutes[cleanGuid] && state.guidRoutes[cleanGuid] !== cleanThread) return false;
   delete state.guidRoutes[cleanGuid];
   state.guidRoutes[cleanGuid] = cleanThread;
   const entries = Object.entries(state.guidRoutes);
   if (entries.length > MAX_GUID_ROUTES) state.guidRoutes = Object.fromEntries(entries.slice(-MAX_GUID_ROUTES));
+  return true;
+}
+
+function routeControllerGuid(state, guid, at = new Date().toISOString()) {
+  const cleanGuid = cleanString(guid, 256);
+  if (!cleanGuid || state.guidRoutes[cleanGuid]) return false;
+  delete state.controllerGuids[cleanGuid];
+  state.controllerGuids[cleanGuid] = isoString(at, new Date().toISOString());
+  const entries = Object.entries(state.controllerGuids);
+  if (entries.length > MAX_CONTROLLER_GUIDS) {
+    state.controllerGuids = Object.fromEntries(entries.slice(-MAX_CONTROLLER_GUIDS));
+  }
   return true;
 }
 
@@ -730,15 +759,29 @@ function resolveNativeReplyContext(message, state) {
   // Messages populates reply_to_guid on ordinary top-level messages with the
   // immediately preceding message. Only thread_originator_guid denotes a
   // native Reply conversation and is therefore safe to use for task routing.
-  if (!message.hasThreadOriginatorGuid) return { explicit: false, threadId: null, error: null };
+  if (!message.hasThreadOriginatorGuid) return { explicit: false, controller: false, threadId: null, error: null };
+  if (state.controllerGuids[message.threadOriginatorGuid]) {
+    const taskMatches = threadsForGuid(state, message.threadOriginatorGuid);
+    if (taskMatches.length > 0) {
+      return { explicit: true, controller: false, threadId: null, error: { kind: "ambiguous-reply-context" } };
+    }
+    return { explicit: true, controller: true, threadId: null, error: null };
+  }
   const matches = threadsForGuid(state, message.threadOriginatorGuid);
-  if (matches.length > 1) return { explicit: true, threadId: null, error: { kind: "ambiguous-reply-context" } };
-  if (matches.length === 0) return { explicit: true, threadId: null, error: { kind: "stale-reply-context" } };
-  return { explicit: true, threadId: matches[0], error: null };
+  if (matches.length > 1) return { explicit: true, controller: false, threadId: null, error: { kind: "ambiguous-reply-context" } };
+  if (matches.length === 0) return { explicit: true, controller: false, threadId: null, error: { kind: "stale-reply-context" } };
+  return { explicit: true, controller: false, threadId: matches[0], error: null };
 }
 
 function actionFromReaction(message, state) {
   if (!message.isReaction) return { action: null, consumed: false };
+  const controllerTarget = message.reactedToGuid || message.threadOriginatorGuid;
+  if (controllerTarget && state.controllerGuids[controllerTarget]) {
+    if ((message.reactionType === "emphasize" || message.reactionType === "emphasis") && message.isReactionAdd) {
+      return { action: { kind: "controller-cancel" }, consumed: true };
+    }
+    return { action: null, consumed: true };
+  }
   let matches = threadsForGuid(state, message.reactedToGuid);
   if (matches.length === 0 && message.hasThreadOriginatorGuid) {
     matches = threadsForGuid(state, message.threadOriginatorGuid);
@@ -939,16 +982,23 @@ export class LocalConversationRouter {
       if (!parked?.message || (excludeGuid && parked.guid === excludeGuid)) continue;
       const parkedMessageKey = messageKey(parked.message);
       const wasPending = this.state.pending.some((action) => action.messageKey === parkedMessageKey);
-      const action = this.#ingest(parked.message, false);
+      let action;
+      try {
+        action = this.#ingest(parked.message, false);
+      } catch (error) {
+        if (error?.code !== "LOCAL_ACTION_QUEUE_FULL") throw error;
+        throw Object.assign(new Error("The user-mirror quarantine cannot be released while the inbox is full."), {
+          code: "IMSG_MIRROR_ECHO_RELEASE_BLOCKED",
+        });
+      }
       if (action && !wasPending && !released.some((item) => item.messageKey === action.messageKey)) {
         released.push(action);
         protectedPendingKeys.add(action.messageKey);
       }
     }
-    // #ingest normally keeps the inbox bounded by evicting its oldest item.
-    // Releasing a private quarantine must be lossless instead: if there is no
-    // durable inbox capacity, leave the reservation and all parked rows intact
-    // so the caller can retry after pending work is acknowledged.
+    // Releasing a private quarantine must be lossless: if there is no durable
+    // inbox capacity, leave the reservation and all parked rows intact so the
+    // caller can retry after pending work is acknowledged.
     if ([...protectedPendingKeys].some((key) => !this.state.pending.some((action) => action.messageKey === key))) {
       throw Object.assign(new Error("The user-mirror quarantine cannot be released while the inbox is full."), {
         code: "IMSG_MIRROR_ECHO_RELEASE_BLOCKED",
@@ -1208,6 +1258,12 @@ export class LocalConversationRouter {
     });
     writeState(this.stateFile, this.state);
     return structuredClone(item);
+  }
+
+  routeControllerOutboundGuid(guid, updatedAt = new Date(this.now()).toISOString()) {
+    if (!routeControllerGuid(this.state, guid, updatedAt)) return false;
+    writeState(this.stateFile, this.state);
+    return true;
   }
 
   routeInboundGuid(guid, threadId, options = {}) {
@@ -1507,6 +1563,64 @@ export class LocalConversationRouter {
     const reservationId = cleanString(reservationIdValue, 96);
     const receipt = reservationId ? this.state.userMirrorReceipts[reservationId] : null;
     return receipt ? structuredClone(receipt) : null;
+  }
+
+  recordVerifiedUserMirrorReceipt({
+    reservationId: reservationIdValue,
+    threadId: threadIdValue,
+    rootGuid: rootGuidValue,
+    guid: guidValue,
+    bodyHash: bodyHashValue,
+  } = {}) {
+    const reservationId = cleanString(reservationIdValue, 96);
+    const threadId = cleanString(threadIdValue, 200);
+    const rootGuid = cleanString(rootGuidValue, 256);
+    const guid = cleanString(guidValue, 256);
+    const bodyHash = cleanString(bodyHashValue, 64)?.toLowerCase();
+    if (!reservationId || !threadId || !rootGuid || !guid
+      || !/^[a-f0-9]{64}$/u.test(bodyHash || "")) return null;
+
+    const settled = this.state.userMirrorReceipts[reservationId];
+    if (settled) {
+      return settled.threadId === threadId && settled.rootGuid === rootGuid
+        && settled.guid === guid && settled.bodyHash === bodyHash
+        ? structuredClone(settled)
+        : null;
+    }
+
+    const priorState = structuredClone(this.state);
+    try {
+      const index = this.state.userMirrorEchoes.findIndex((echo) => echo.reservationId === reservationId);
+      if (index < 0) return null;
+      const echo = this.state.userMirrorEchoes[index];
+      const existingThread = threadState(this.state, threadId);
+      const guidRoute = this.state.guidRoutes[guid];
+      const rootRoute = this.state.guidRoutes[rootGuid];
+      if (echo.threadId !== threadId || echo.rootGuid !== rootGuid
+        || echo.bodyHash !== bodyHash || echo.expectedGuid !== guid
+        || echo.guidVerified !== true
+        || (guidRoute && guidRoute !== threadId)
+        || (rootRoute && rootRoute !== threadId)
+        || (existingThread?.rootGuid && existingThread.rootGuid !== rootGuid)) return null;
+
+      const released = this.#ingestQuarantinedUserMirrorCandidates(echo, guid);
+      this.state.userMirrorEchoes.splice(index, 1);
+      this.state.seen.push(guid);
+      this.state.seen = [...new Set(this.state.seen)].slice(-MAX_SEEN);
+      routeGuid(this.state, guid, threadId);
+      routeGuid(this.state, rootGuid, threadId);
+      const nativeThread = threadState(this.state, threadId, { create: true });
+      nativeThread.rootGuid ||= rootGuid;
+      nativeThread.latestGuid = guid;
+      pruneThreadStates(this.state);
+      this.#recordUserMirrorReceipt(echo, guid);
+      writeState(this.stateFile, this.state);
+      this.releasedUserMirrorActions.push(...released.map((action) => structuredClone(action)));
+      return structuredClone(this.state.userMirrorReceipts[reservationId]);
+    } catch (error) {
+      this.state = priorState;
+      throw error;
+    }
   }
 
   provisionalUserMirrorEcho(rawMessage) {
@@ -1818,6 +1932,8 @@ export class LocalConversationRouter {
       if (command === "cancel") {
         if (!explicitThreadId && (awaitingNewPrompt?.flowId || this.state.activeNewFlowId)) {
           action = { kind: "new-cancel", flowId: awaitingNewPrompt?.flowId || this.state.activeNewFlowId };
+        } else if (!explicitThreadId) {
+          action = { kind: "controller-cancel" };
         } else {
           action = { kind: "unknown-command", threadId: targetThreadId };
         }
@@ -1853,7 +1969,7 @@ export class LocalConversationRouter {
     } else if (!action && message.text.startsWith("/")) {
       action = { kind: "unknown-command", threadId: targetThreadId };
     } else if (!action && (message.text || message.attachments.length)) {
-      if (!explicitThreadId && awaitingNewPrompt?.flowId) {
+      if (!replyContext.explicit && awaitingNewPrompt?.flowId) {
         action = {
           kind: "new-prompt",
           flowId: awaitingNewPrompt.flowId,
@@ -1861,14 +1977,14 @@ export class LocalConversationRouter {
           attachments: message.attachments,
         };
         this.state.awaitingNewPrompt = null;
-      } else if (!explicitThreadId && awaitingPrompt?.threadId) {
+      } else if (!replyContext.explicit && awaitingPrompt?.threadId) {
         targetThreadId = awaitingPrompt.threadId;
         consumedAwaitingPrompt = true;
       }
       if (!action) {
-        action = targetThreadId
-          ? { kind: "prompt", threadId: targetThreadId, body: message.text, attachments: message.attachments }
-          : { kind: "no-thread" };
+        action = replyContext.controller || (!explicitThreadId && !consumedAwaitingPrompt)
+          ? { kind: "controller-prompt", body: message.text, attachments: message.attachments }
+          : { kind: "prompt", threadId: explicitThreadId || targetThreadId, body: message.text, attachments: message.attachments };
       }
     }
     if (!action) {
@@ -1928,8 +2044,12 @@ export class LocalConversationRouter {
         touchThreadState(this.state, action.threadId, message.createdAt);
       }
     }
+    if (this.state.pending.length >= MAX_PENDING) {
+      throw Object.assign(new Error("The durable local action inbox is full; the Messages watch will retry this row after capacity recovers."), {
+        code: "LOCAL_ACTION_QUEUE_FULL",
+      });
+    }
     this.state.pending.push(action);
-    this.state.pending = this.state.pending.slice(-MAX_PENDING);
     this.state.lastUserMessageAt = message.createdAt;
     this.state.lastRowId = Math.max(this.state.lastRowId, message.id);
     if (persist) writeState(this.stateFile, this.state);

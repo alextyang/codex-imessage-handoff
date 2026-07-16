@@ -20,6 +20,20 @@ const MAX_SERVER_REQUEST_STRING_BYTES = 16 * 1024;
 const MAX_SERVER_REQUEST_COLLECTION_ITEMS = 32;
 const MAX_SERVER_REQUEST_JSON_DEPTH = 6;
 const MAX_THREAD_NAME_CODE_POINTS = 160;
+const MAX_MODEL_ID_BYTES = 256;
+const MAX_PERMISSION_PROFILE_ID_BYTES = 256;
+const MAX_INSTRUCTION_BYTES = 128 * 1024;
+const MAX_DYNAMIC_TOOLS = 32;
+const MAX_DYNAMIC_NAMESPACE_TOOLS = 32;
+const MAX_DYNAMIC_TOOL_NAME_BYTES = 128;
+const MAX_DYNAMIC_TOOL_DESCRIPTION_BYTES = 8 * 1024;
+const MAX_DYNAMIC_TOOL_SCHEMA_BYTES = 64 * 1024;
+const MAX_OPTION_JSON_DEPTH = 16;
+const MAX_OPTION_JSON_ITEMS = 256;
+const MAX_ADDITIONAL_CONTEXT_ENTRIES = 32;
+const MAX_ADDITIONAL_CONTEXT_KEY_BYTES = 256;
+const MAX_ADDITIONAL_CONTEXT_VALUE_BYTES = 32 * 1024;
+const MAX_ADDITIONAL_CONTEXT_BYTES = 128 * 1024;
 const UNCERTAIN_TURN_OUTCOME_CODES = new Set([
   "CODEX_DISCONNECTED",
   "CODEX_PROTOCOL_ERROR",
@@ -191,6 +205,297 @@ function defaultServerRequestResult(method) {
 
 function isRecord(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function optionError(code, message) {
+  throw codedError(code, message);
+}
+
+function validationBoundary(code, message, callback) {
+  try {
+    return callback();
+  } catch (error) {
+    if (error instanceof Error && error.code === code) throw error;
+    throw codedError(code, message, error instanceof Error ? error : undefined);
+  }
+}
+
+function ownDataEntries(value, code, label) {
+  if (!isRecord(value)) optionError(code, `${label} must be an object.`);
+  let prototype;
+  let keys;
+  try {
+    prototype = Object.getPrototypeOf(value);
+    keys = Reflect.ownKeys(value);
+  } catch {
+    optionError(code, `${label} is invalid.`);
+  }
+  if ((prototype !== Object.prototype && prototype !== null) || keys.some((key) => typeof key !== "string")) {
+    optionError(code, `${label} must be a plain object.`);
+  }
+  return keys.map((key) => {
+    let descriptor;
+    try {
+      descriptor = Object.getOwnPropertyDescriptor(value, key);
+    } catch {
+      optionError(code, `${label} is invalid.`);
+    }
+    if (!descriptor || !Object.hasOwn(descriptor, "value")) {
+      optionError(code, `${label} must contain only data properties.`);
+    }
+    return [key, descriptor.value];
+  });
+}
+
+function exactKeys(entries, expected, code, label) {
+  const actual = entries.map(([key]) => key).sort();
+  const canonical = [...expected].sort();
+  if (actual.length !== canonical.length || actual.some((key, index) => key !== canonical[index])) {
+    optionError(code, `${label} contains unsupported fields.`);
+  }
+}
+
+function validUnicodeText(value, maximumBytes, { allowEmpty = true, singleLine = false } = {}) {
+  if (typeof value !== "string" || value !== value.toWellFormed()) return false;
+  if ((!allowEmpty && !value) || value.includes("\u0000") || Buffer.byteLength(value, "utf8") > maximumBytes) return false;
+  return !singleLine || !/[\u0000-\u001f\u007f]/.test(value);
+}
+
+function validatedOptionalModel(value, code = "CODEX_THREAD_OPTIONS_INVALID") {
+  if (value === undefined) return undefined;
+  if (!validUnicodeText(value, MAX_MODEL_ID_BYTES, { allowEmpty: false, singleLine: true })
+    || !/^[a-z0-9][a-z0-9._:/-]*$/i.test(value)) {
+    optionError(code, "The requested Codex model is invalid.");
+  }
+  return value;
+}
+
+function validatedOptionalInstruction(value, label) {
+  if (value === undefined) return undefined;
+  if (!validUnicodeText(value, MAX_INSTRUCTION_BYTES)) {
+    optionError("CODEX_THREAD_OPTIONS_INVALID", `${label} are invalid or too large.`);
+  }
+  return value;
+}
+
+function validatedEphemeral(value) {
+  if (value === undefined) return false;
+  if (typeof value !== "boolean") {
+    optionError("CODEX_THREAD_OPTIONS_INVALID", "The ephemeral thread option must be a boolean.");
+  }
+  return value;
+}
+
+function validatedApprovalPolicy(value) {
+  if (value === undefined) return undefined;
+  if (value === "untrusted" || value === "on-request" || value === "never") return value;
+  const entries = ownDataEntries(value, "CODEX_THREAD_OPTIONS_INVALID", "The approval policy");
+  exactKeys(entries, ["granular"], "CODEX_THREAD_OPTIONS_INVALID", "The approval policy");
+  const granular = entries[0][1];
+  const granularEntries = ownDataEntries(
+    granular,
+    "CODEX_THREAD_OPTIONS_INVALID",
+    "The granular approval policy",
+  );
+  const fields = ["sandbox_approval", "rules", "skill_approval", "request_permissions", "mcp_elicitations"];
+  exactKeys(granularEntries, fields, "CODEX_THREAD_OPTIONS_INVALID", "The granular approval policy");
+  const output = {};
+  for (const [key, decision] of granularEntries) {
+    if (typeof decision !== "boolean") {
+      optionError("CODEX_THREAD_OPTIONS_INVALID", "Granular approval decisions must be booleans.");
+    }
+    output[key] = decision;
+  }
+  return { granular: output };
+}
+
+function validatedThreadAccess({ permissions, sandbox }) {
+  if (permissions !== undefined && sandbox !== undefined) {
+    optionError("CODEX_THREAD_OPTIONS_INVALID", "A thread cannot select both permissions and a sandbox mode.");
+  }
+  let canonicalPermissions;
+  if (permissions !== undefined) {
+    if (!validUnicodeText(permissions, MAX_PERMISSION_PROFILE_ID_BYTES, { allowEmpty: false, singleLine: true })
+      || !/^[a-z0-9][a-z0-9._:/-]*$/i.test(permissions)) {
+      optionError("CODEX_THREAD_OPTIONS_INVALID", "The permissions profile is invalid.");
+    }
+    canonicalPermissions = permissions;
+  }
+  let canonicalSandbox;
+  if (sandbox !== undefined) {
+    if (sandbox !== "read-only" && sandbox !== "workspace-write" && sandbox !== "danger-full-access") {
+      optionError("CODEX_THREAD_OPTIONS_INVALID", "The sandbox mode is invalid.");
+    }
+    canonicalSandbox = sandbox;
+  }
+  return { permissions: canonicalPermissions, sandbox: canonicalSandbox };
+}
+
+function cloneBoundedJson(value, code, label, depth = 0) {
+  if (depth > MAX_OPTION_JSON_DEPTH) optionError(code, `${label} is nested too deeply.`);
+  if (value === null || typeof value === "boolean" || typeof value === "string") return value;
+  if (typeof value === "number") {
+    if (!Number.isFinite(value)) optionError(code, `${label} contains a non-finite number.`);
+    return value;
+  }
+  if (Array.isArray(value)) {
+    if (value.length > MAX_OPTION_JSON_ITEMS) optionError(code, `${label} contains too many values.`);
+    return value.map((item) => cloneBoundedJson(item, code, label, depth + 1));
+  }
+  const entries = ownDataEntries(value, code, label);
+  if (entries.length > MAX_OPTION_JSON_ITEMS) optionError(code, `${label} contains too many fields.`);
+  const output = {};
+  for (const [key, item] of entries) {
+    if (!validUnicodeText(key, 512, { allowEmpty: false })
+      || key === "__proto__" || key === "prototype" || key === "constructor") {
+      optionError(code, `${label} contains an invalid field name.`);
+    }
+    output[key] = cloneBoundedJson(item, code, label, depth + 1);
+  }
+  return output;
+}
+
+function validatedDynamicToolFunction(value, label) {
+  const code = "CODEX_THREAD_OPTIONS_INVALID";
+  const entries = ownDataEntries(value, code, label);
+  const fields = new Map(entries);
+  const expected = ["type", "name", "description", "inputSchema"];
+  if (fields.has("deferLoading")) expected.push("deferLoading");
+  exactKeys(entries, expected, code, label);
+  if (fields.get("type") !== "function") optionError(code, `${label} must have type function.`);
+  const name = fields.get("name");
+  if (!validUnicodeText(name, MAX_DYNAMIC_TOOL_NAME_BYTES, { allowEmpty: false, singleLine: true })
+    || !/^[a-z][a-z0-9_.-]*$/i.test(name)) {
+    optionError(code, `${label} has an invalid name.`);
+  }
+  const description = fields.get("description");
+  if (!validUnicodeText(description, MAX_DYNAMIC_TOOL_DESCRIPTION_BYTES)) {
+    optionError(code, `${label} has an invalid description.`);
+  }
+  const inputSchema = cloneBoundedJson(fields.get("inputSchema"), code, `${label} input schema`);
+  if (Buffer.byteLength(JSON.stringify(inputSchema), "utf8") > MAX_DYNAMIC_TOOL_SCHEMA_BYTES) {
+    optionError(code, `${label} input schema is too large.`);
+  }
+  const output = { type: "function", name, description, inputSchema };
+  if (fields.has("deferLoading")) {
+    if (typeof fields.get("deferLoading") !== "boolean") {
+      optionError(code, `${label} deferLoading must be a boolean.`);
+    }
+    output.deferLoading = fields.get("deferLoading");
+  }
+  return output;
+}
+
+function validatedDynamicTools(value) {
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value) || value.length > MAX_DYNAMIC_TOOLS) {
+    optionError("CODEX_THREAD_OPTIONS_INVALID", "Dynamic tools must be a bounded array.");
+  }
+  const names = new Set();
+  return value.map((tool, index) => {
+    const entries = ownDataEntries(tool, "CODEX_THREAD_OPTIONS_INVALID", `Dynamic tool ${index + 1}`);
+    const fields = new Map(entries);
+    if (fields.get("type") === "function") {
+      const output = validatedDynamicToolFunction(tool, `Dynamic tool ${index + 1}`);
+      if (names.has(output.name)) optionError("CODEX_THREAD_OPTIONS_INVALID", "Dynamic tool names must be unique.");
+      names.add(output.name);
+      return output;
+    }
+    if (fields.get("type") !== "namespace") {
+      optionError("CODEX_THREAD_OPTIONS_INVALID", `Dynamic tool ${index + 1} has an invalid type.`);
+    }
+    exactKeys(entries, ["type", "name", "description", "tools"], "CODEX_THREAD_OPTIONS_INVALID", `Dynamic tool ${index + 1}`);
+    const name = fields.get("name");
+    const description = fields.get("description");
+    const tools = fields.get("tools");
+    if (!validUnicodeText(name, MAX_DYNAMIC_TOOL_NAME_BYTES, { allowEmpty: false, singleLine: true })
+      || !/^[a-z][a-z0-9_.-]*$/i.test(name)) {
+      optionError("CODEX_THREAD_OPTIONS_INVALID", `Dynamic tool namespace ${index + 1} has an invalid name.`);
+    }
+    if (!validUnicodeText(description, MAX_DYNAMIC_TOOL_DESCRIPTION_BYTES)
+      || !Array.isArray(tools) || tools.length > MAX_DYNAMIC_NAMESPACE_TOOLS) {
+      optionError("CODEX_THREAD_OPTIONS_INVALID", `Dynamic tool namespace ${name} is invalid.`);
+    }
+    if (names.has(name)) optionError("CODEX_THREAD_OPTIONS_INVALID", "Dynamic tool names must be unique.");
+    names.add(name);
+    const namespaceNames = new Set();
+    const canonicalTools = tools.map((item, toolIndex) => {
+      const canonical = validatedDynamicToolFunction(item, `Dynamic tool ${name}.${toolIndex + 1}`);
+      if (namespaceNames.has(canonical.name)) {
+        optionError("CODEX_THREAD_OPTIONS_INVALID", `Dynamic tools in namespace ${name} must have unique names.`);
+      }
+      namespaceNames.add(canonical.name);
+      return canonical;
+    });
+    return { type: "namespace", name, description, tools: canonicalTools };
+  });
+}
+
+function validatedAdditionalContext(value) {
+  if (value === undefined) return undefined;
+  const entries = ownDataEntries(value, "CODEX_TURN_OPTIONS_INVALID", "Additional context");
+  if (entries.length > MAX_ADDITIONAL_CONTEXT_ENTRIES) {
+    optionError("CODEX_TURN_OPTIONS_INVALID", "Additional context contains too many entries.");
+  }
+  const output = {};
+  for (const [key, entry] of entries) {
+    if (!validUnicodeText(key, MAX_ADDITIONAL_CONTEXT_KEY_BYTES, { allowEmpty: false, singleLine: true })
+      || !/^[a-z0-9][a-z0-9._:/-]*$/i.test(key)) {
+      optionError("CODEX_TURN_OPTIONS_INVALID", "Additional context has an invalid source identifier.");
+    }
+    const contextEntries = ownDataEntries(entry, "CODEX_TURN_OPTIONS_INVALID", `Additional context ${key}`);
+    exactKeys(contextEntries, ["value", "kind"], "CODEX_TURN_OPTIONS_INVALID", `Additional context ${key}`);
+    const fields = new Map(contextEntries);
+    const text = fields.get("value");
+    const kind = fields.get("kind");
+    if (!validUnicodeText(text, MAX_ADDITIONAL_CONTEXT_VALUE_BYTES)
+      || (kind !== "untrusted" && kind !== "application")) {
+      optionError("CODEX_TURN_OPTIONS_INVALID", `Additional context ${key} is invalid.`);
+    }
+    output[key] = { value: text, kind };
+  }
+  if (Buffer.byteLength(JSON.stringify(output), "utf8") > MAX_ADDITIONAL_CONTEXT_BYTES) {
+    optionError("CODEX_TURN_OPTIONS_INVALID", "Additional context is too large.");
+  }
+  return output;
+}
+
+function validatedThreadStartOptions(options) {
+  return validationBoundary(
+    "CODEX_THREAD_OPTIONS_INVALID",
+    "The Codex thread options are invalid.",
+    () => {
+      const access = validatedThreadAccess(options);
+      const output = { ephemeral: validatedEphemeral(options.ephemeral) };
+      const model = validatedOptionalModel(options.model);
+      const baseInstructions = validatedOptionalInstruction(options.baseInstructions, "Base instructions");
+      const developerInstructions = validatedOptionalInstruction(
+        options.developerInstructions,
+        "Developer instructions",
+      );
+      const dynamicTools = validatedDynamicTools(options.dynamicTools);
+      const approvalPolicy = validatedApprovalPolicy(options.approvalPolicy);
+      if (model !== undefined) output.model = model;
+      if (baseInstructions !== undefined) output.baseInstructions = baseInstructions;
+      if (developerInstructions !== undefined) output.developerInstructions = developerInstructions;
+      if (dynamicTools !== undefined) output.dynamicTools = dynamicTools;
+      if (approvalPolicy !== undefined) output.approvalPolicy = approvalPolicy;
+      if (access.permissions !== undefined) output.permissions = access.permissions;
+      if (access.sandbox !== undefined) output.sandbox = access.sandbox;
+      return output;
+    },
+  );
+}
+
+function validatedTurnOptions(options) {
+  return validationBoundary(
+    "CODEX_TURN_OPTIONS_INVALID",
+    "The Codex turn options are invalid.",
+    () => ({
+      model: validatedOptionalModel(options.model, "CODEX_TURN_OPTIONS_INVALID"),
+      additionalContext: validatedAdditionalContext(options.additionalContext),
+    }),
+  );
 }
 
 function safeProtocolId(value, maximumBytes = 512) {
@@ -755,7 +1060,18 @@ export class AppServerRpcClient {
     return this.#requestWithoutConnect(method, params, options);
   }
 
-  async startThread({ cwd, threadSource } = {}) {
+  async startThread({
+    cwd,
+    threadSource,
+    model,
+    ephemeral,
+    baseInstructions,
+    developerInstructions,
+    dynamicTools,
+    approvalPolicy,
+    permissions,
+    sandbox,
+  } = {}) {
     if (this.activeTurn) throw codedError("BUSY", "Another Codex run is active.");
     const canonicalCwd = String(cwd || "").trim();
     const canonicalSource = String(threadSource || "").trim();
@@ -763,11 +1079,31 @@ export class AppServerRpcClient {
     if (!canonicalSource || canonicalSource.length > 512 || /[\u0000-\u001f]/.test(canonicalSource)) {
       throw codedError("INVALID_THREAD_SOURCE", "A valid thread source is required.");
     }
-    const result = await this.request("thread/start", {
-      cwd: canonicalCwd,
-      ephemeral: false,
-      threadSource: canonicalSource,
+    const canonical = validatedThreadStartOptions({
+      model,
+      ephemeral,
+      baseInstructions,
+      developerInstructions,
+      dynamicTools,
+      approvalPolicy,
+      permissions,
+      sandbox,
     });
+    const params = {
+      cwd: canonicalCwd,
+      threadSource: canonicalSource,
+      ...canonical,
+    };
+    let submitted = false;
+    let result;
+    try {
+      result = await this.request("thread/start", params, {
+        onSent: () => { submitted = true; },
+      });
+    } catch (error) {
+      if (submitted && isUncertainTurnOutcome(error)) error.threadStartOutcomeUnknown = true;
+      throw error;
+    }
     const threadId = typeof result?.thread?.id === "string" ? result.thread.id.trim() : "";
     if (!threadId) {
       throw codedError("CODEX_PROTOCOL_ERROR", "Codex did not return a valid thread identifier.");
@@ -869,7 +1205,12 @@ export class AppServerRpcClient {
 
     const active = this.activeTurn;
     const descriptor = serverRequestDescriptor(message, active);
-    const handler = active?.onServerRequest;
+    // A server can race a new approval/tool request with a local cancellation.
+    // Once cancellation or timeout starts, no late request may regain authority
+    // through the turn handler; return the method's fail-closed fallback.
+    const handler = active && !active.cancelled && !active.timedOut && !active.settled
+      ? active.onServerRequest
+      : null;
     if (!descriptor || typeof handler !== "function") {
       try { this.#send({ id: message.id, result: fallback }); } catch {}
       return;
@@ -1076,6 +1417,7 @@ export class AppServerRpcClient {
 
   async runTurn(options) {
     if (this.activeTurn) throw codedError("BUSY", "Another Codex run is active.");
+    const canonical = validatedTurnOptions(options);
     const active = {
       threadId: options.thread.id,
       clientUserMessageId: clientUserMessageId(options.clientUserMessageId),
@@ -1143,6 +1485,8 @@ export class AppServerRpcClient {
       ];
       const params = { threadId: options.thread.id, input };
       if (active.clientUserMessageId) params.clientUserMessageId = active.clientUserMessageId;
+      if (canonical.model !== undefined) params.model = canonical.model;
+      if (canonical.additionalContext !== undefined) params.additionalContext = canonical.additionalContext;
       if (typeof options.reasoningEffort === "string" && /^[a-z][a-z0-9_-]{0,31}$/i.test(options.reasoningEffort)) {
         params.effort = options.reasoningEffort;
       }
@@ -1250,13 +1594,38 @@ export class AppServerCodexRunner {
     return this.#withClient(() => this.client.interruptTurn(threadId, turnId));
   }
 
-  async createThread({ cwd, threadSource } = {}) {
+  async createThread({
+    cwd,
+    threadSource,
+    model,
+    ephemeral,
+    baseInstructions,
+    developerInstructions,
+    dynamicTools,
+    approvalPolicy,
+    permissions,
+    sandbox,
+  } = {}) {
     const canonicalCwd = String(cwd || "").trim();
+    const canonical = validatedThreadStartOptions({
+      model,
+      ephemeral,
+      baseInstructions,
+      developerInstructions,
+      dynamicTools,
+      approvalPolicy,
+      permissions,
+      sandbox,
+    });
     return this.#withClient(async () => {
       if (!canonicalCwd || !existsSync(canonicalCwd)) {
         throw codedError("MISSING_CWD", "Thread working directory no longer exists.");
       }
-      const result = await this.client.startThread({ cwd: canonicalCwd, threadSource });
+      const result = await this.client.startThread({
+        cwd: canonicalCwd,
+        threadSource,
+        ...canonical,
+      });
       return {
         ...result.thread,
         id: result.thread.id.trim(),
@@ -1278,6 +1647,8 @@ export class AppServerCodexRunner {
     images = [],
     clientUserMessageId,
     reasoningEffort,
+    model,
+    additionalContext,
     onPhase = () => {},
     onReasoningDelta = () => {},
     onAssistantDelta = () => {},
@@ -1287,6 +1658,7 @@ export class AppServerCodexRunner {
     onServerRequest,
     turnTimeoutMs,
   }) {
+    const canonical = validatedTurnOptions({ model, additionalContext });
     return this.#withClient(async () => {
       if (!existsSync(thread.cwd)) throw codedError("MISSING_CWD", "Thread working directory no longer exists.");
       if (this.client.isRunning()) throw codedError("BUSY", "Another Codex run is active.");
@@ -1296,6 +1668,8 @@ export class AppServerCodexRunner {
         images,
         clientUserMessageId,
         reasoningEffort,
+        model: canonical.model,
+        additionalContext: canonical.additionalContext,
         onPhase,
         onReasoningDelta,
         onAssistantDelta,

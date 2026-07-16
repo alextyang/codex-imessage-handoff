@@ -737,3 +737,155 @@ test("unsupported requests and per-task overflow fail closed", async () => {
     (error) => error?.code === "CODEX_INTERACTION_STOPPED",
   )));
 });
+
+test("strict controller text replies require the current native Reply GUID", async () => {
+  const texts = [];
+  const choiceMessages = [];
+  const broker = new ServerRequestBroker({
+    requireReplyMatch: true,
+    sendText: async (message) => {
+      texts.push(message);
+      return { guid: `controller-text-${texts.length}` };
+    },
+    sendChoices: async (message) => {
+      choiceMessages.push(message);
+      return { guids: [`controller-poll-${choiceMessages.length}`] };
+    },
+  });
+  const result = broker.request(approval("controller", "strict-reply"));
+  await waitFor(() => choiceMessages.length === 1);
+
+  const withoutReply = { kind: "prompt", body: "deny", threadId: "controller" };
+  const wrongReply = { ...withoutReply, threadOriginatorGuid: "unrelated-guid" };
+  assert.equal(broker.canHandleAction(withoutReply), false);
+  assert.equal(broker.canHandleAction(wrongReply), false);
+  assert.equal(broker.canHandleAction({
+    ...withoutReply,
+    threadOriginatorGuid: "controller-text-1",
+  }), true);
+  assert.equal(broker.canHandleAction({
+    ...withoutReply,
+    threadOriginatorGuid: "controller-poll-1",
+  }), true);
+  assert.deepEqual(await broker.handleAction(withoutReply), { handled: false, mismatch: true });
+  assert.deepEqual(await broker.handleAction(wrongReply), { handled: false, mismatch: true });
+  assert.equal(broker.pending("controller"), true);
+
+  assert.deepEqual(await broker.handleAction({
+    kind: "prompt",
+    body: "not a decision",
+    threadId: "controller",
+    threadOriginatorGuid: "controller-poll-1",
+  }), { handled: true, accepted: false, stale: false });
+  assert.equal(texts.length, 2, "invalid input should replace the Reply target with guidance");
+  assert.equal(broker.canHandleAction({
+    ...withoutReply,
+    threadOriginatorGuid: "controller-poll-1",
+  }), false, "an earlier presentation must stop carrying authority after guidance");
+  assert.equal(broker.canHandleAction({
+    ...withoutReply,
+    threadOriginatorGuid: "controller-text-2",
+  }), true);
+
+  assert.deepEqual(await broker.handleAction({
+    ...withoutReply,
+    threadOriginatorGuid: "controller-text-2",
+  }), { handled: true, accepted: true, stale: false });
+  assert.deepEqual(await result, { decision: "decline" });
+});
+
+test("strict controller poll tokens remain authenticated without Reply metadata", async () => {
+  const choiceMessages = [];
+  const broker = new ServerRequestBroker({
+    requireReplyMatch: true,
+    sendText: async () => ({ guid: "controller-permission-text" }),
+    sendChoices: async (message) => {
+      choiceMessages.push(message);
+      return { guid: "controller-permission-poll" };
+    },
+  });
+  const result = broker.request(approval("controller", "strict-token"));
+  await waitFor(() => choiceMessages.length === 1);
+  const response = await broker.handleAction({
+    kind: "control",
+    command: "respond",
+    argument: tokenFor(choiceMessages[0], "Deny"),
+    threadId: "controller",
+  });
+  assert.deepEqual(response, { handled: true, accepted: true, stale: false });
+  assert.deepEqual(await result, { decision: "decline" });
+});
+
+test("beforeConsume durably commits an answer before releasing controller authority", async () => {
+  let releaseCommit;
+  let commitStarted;
+  const commitStartedPromise = new Promise((resolve) => { commitStarted = resolve; });
+  const commitGate = new Promise((resolve) => { releaseCommit = resolve; });
+  const broker = new ServerRequestBroker({
+    requireReplyMatch: true,
+    sendText: async () => ({ guid: "durable-answer-guid" }),
+    sendChoices: async () => ({ guid: "durable-answer-poll" }),
+  });
+  let requestSettled = false;
+  const request = broker.request(approval("controller", "durable-answer"));
+  request.finally(() => { requestSettled = true; });
+  await waitFor(() => broker.pending("controller"));
+
+  const handling = broker.handleAction({
+    kind: "prompt",
+    body: "deny",
+    threadId: "controller",
+    threadOriginatorGuid: "durable-answer-guid",
+  }, {
+    beforeConsume: async () => {
+      assert.equal(broker.pending("controller"), true);
+      commitStarted();
+      await commitGate;
+    },
+  });
+  await commitStartedPromise;
+  await flush();
+  assert.equal(requestSettled, false);
+  assert.equal(broker.pending("controller"), true);
+
+  releaseCommit();
+  assert.deepEqual(await handling, { handled: true, accepted: true, stale: false });
+  assert.deepEqual(await request, { decision: "decline" });
+  assert.equal(requestSettled, true);
+});
+
+test("beforeConsume persistence failure leaves the controller request pending and retryable", async () => {
+  const broker = new ServerRequestBroker({
+    requireReplyMatch: true,
+    sendText: async () => ({ guid: "retryable-answer-guid" }),
+    sendChoices: async () => ({ guid: "retryable-answer-poll" }),
+  });
+  let requestSettled = false;
+  const request = broker.request(approval("controller", "retryable-answer"));
+  request.finally(() => { requestSettled = true; });
+  await waitFor(() => broker.pending("controller"));
+  const action = {
+    kind: "prompt",
+    body: "deny",
+    threadId: "controller",
+    threadOriginatorGuid: "retryable-answer-guid",
+  };
+
+  assert.deepEqual(await broker.handleAction(action, {
+    beforeConsume: async () => { throw new Error("state fsync failed"); },
+  }), {
+    handled: true,
+    accepted: false,
+    stale: false,
+    persistenceFailed: true,
+  });
+  assert.equal(requestSettled, false);
+  assert.equal(broker.pending("controller"), true);
+
+  let committed = false;
+  assert.deepEqual(await broker.handleAction(action, {
+    beforeConsume: async () => { committed = true; },
+  }), { handled: true, accepted: true, stale: false });
+  assert.equal(committed, true);
+  assert.deepEqual(await request, { decision: "decline" });
+});

@@ -59,6 +59,15 @@ inline-reply controller or thread map, so concurrent sends cannot steal or
 clear another conversation's reply context. A reply whose selected GUID,
 derived thread identifier, parent message, or parent item is missing is not
 sent.
+The primary sender pin is mandatory. The active account must own the exact
+sender handle used by the service conversation and match the durable positive
+account fingerprint on the bound chat; that fingerprint must also differ from
+the authenticated dedicated Codex Messages account. Account or chat changes
+fail closed without deleting the at-most-once journal. The bound chat must
+still advertise the pinned sender before every send, and the accepted sender
+row must retain that destination handle plus both native chat coordinates. The
+dedicated transport rejects user-role live messages before creating a header
+or issuing any RPC, so there is no service-identity mirror fallback.
 Before dispatch, the service persists a private delivery journal and reserves
 a fingerprint of the exact clean body plus native Reply root. The receiver may
 provisionally hold that candidate while the bridge returns its GUID. Before the
@@ -71,12 +80,21 @@ genuine user input. Parked input is bounded to eight plain-text messages of 96
 KiB each, and overflow leaves the inbox cursor behind for safe watch recovery.
 While no authoritative identity exists, the unavoidable ambiguity still favors
 preventing a duplicate Codex action. The bridge-returned GUID is registered
-immediately. An exact receiver receipt or an exact normal-profile sender-row
-proof for GUID, body, chat, and Reply root makes acceptance durable and
-suppresses only that echo. Receipts are body-bound so a reused delivery ID
-cannot settle different content. This preserves crash idempotence without
-hidden Unicode. Ambiguous writes are reconciled without resending; after 15
-minutes, a content-free task notice unblocks later output. Historical
+immediately. Exact normal-profile sender-row proof for GUID, body, sender,
+chat, and Reply root makes the no-resend journal durable. The task's rollout
+cursor remains nonterminal until the dedicated receiver watch writes the exact
+body/root-bound GUID receipt for every mirror part. Commentary, completion,
+and later task output therefore cannot overtake a slow user bubble, including
+across restart, while unrelated tasks continue independently. Receipts are
+body-bound so a reused delivery ID cannot settle different content. If a
+restart inherited an accepted journal after its watch cursor passed the row, a
+narrow authenticated helper lookup proves only the exact inbound GUID, pinned
+chat and sender, Reply root, and body digest; message content never crosses the
+helper boundary. That proof reconstructs the same durable receipt without a
+native resend. This
+preserves crash idempotence without hidden Unicode. Ambiguous writes are
+reconciled without resending; after 15 minutes, a content-free task notice
+unblocks later output. Historical
 caller-GUID and tagged journals remain reconciliation-only and are never
 resent.
 
@@ -301,7 +319,9 @@ Status output redacts the chat GUID, sender identity, and helper-client path.
    the dedicated user's helper/watch connection.
 2. The Remote Control controller and relay connection are created lazily when
    Codex work is first needed. Each active iMessage task gets its own
-   app-server RPC client and logical stream on that shared connection.
+   app-server RPC client and logical stream on that shared connection. The
+   private top-level controller reuses one long-lived logical client on the
+   same physical relay; it is not another Codex or app-server process.
 3. The controller reads the active user's current Codex authentication,
    refreshes its short-lived Remote Control session, and verifies the exact
    enrolled Desktop environment is online.
@@ -329,10 +349,45 @@ the same pinned environment returns.
 ## Messages interface
 
 Each Codex task owns a durable native Messages reply thread. Replying to a task
-message routes to that exact Codex task. An unthreaded message routes to the
-task most recently addressed by the user, not the task that most recently sent
-a notification. Task commands use that default for five minutes; ordinary new
-messages keep using it until the user addresses another task.
+message routes to that exact Codex task. Ordinary unthreaded messages instead
+go to a private top-level controller, so they can use natural language to
+inspect and control Codex or ask Codex to operate the Mac. Replies to a
+controller response return to that controller. They never silently become a
+message to whichever task happened to be active most recently.
+
+### Private top-level controller
+
+The controller is an ephemeral `gpt-5.6-terra` Codex conversation with medium
+reasoning. The app-server does not materialize the ephemeral conversation in
+normal task history or the Codex sidebar. It receives a short explanation of
+the Messages interface, a bounded current service snapshot, and narrowly
+defined `codex_control` tools for listing, inspecting, creating, configuring,
+messaging, or stopping tasks. Standard Codex tools remain available for
+computer work and retain their normal approval behavior. Destructive task
+stops require explicit confirmation. Its workspace is a dedicated private
+directory rather than the user's home folder; each short-lived session uses a
+fresh `0700` child and starts with a read-only filesystem sandbox. A stop tool
+cannot act on model self-attestation: the service sends a native confirmation
+poll bound to the exact task and waits for the user's reply before stopping it.
+
+Top-level controller input is a durable FIFO. Its responses, questions, and
+approval polls remain top-level rather than entering any task's native Reply
+thread. Exact native task replies, short manual/new-task prompt leases, slash
+commands, poll votes, and tapbacks keep their deterministic routing and take
+precedence over the controller.
+
+Context is deliberately small. Each turn gets bounded trusted service state
+separately from bounded untrusted task/message excerpts; only a few truncated
+controller exchanges are carried into a replacement session. App-server memory
+is disabled, and the ephemeral session rotates after eight turns, 64 KiB of
+conversation, or 45 minutes idle. A turn is limited to 16 control calls,
+48 KiB of cumulative control responses, and ten minutes. No controller call
+runs merely to maintain context while idle. Completed inbound keys, control
+receipts, and exact mutating tool intents are journaled, so a restart,
+regenerated tool call, or retried stop cannot repeat an accepted action. If a
+connection is lost after a turn may have run, the service reports that
+uncertainty and never resubmits it automatically. Ambiguous thread creation and
+failed deletion remain durable cleanup obligations and block unsafe reuse.
 
 A Messages header shows the project first and task immediately underneath,
 followed by a separated status block and task link. Opening its
@@ -375,7 +430,9 @@ Adding or removing 👍 on a task message enables or disables one-turn live
 listening. Adding or removing 👎 mutes or unmutes that task. Adding ❓ shows
 its status, Codex link, and recent history. Adding ‼️ stops iMessage-started
 work in that task immediately. Task-scoped commands sent outside a native
-reply thread use the five-minute default before opening a task picker.
+reply thread may use the task the user addressed within the last five minutes
+before opening a task picker; this applies to commands, not ordinary
+natural-language messages.
 Notifications cannot silently retarget them. A `/new` command without a
 message waits up to 120 seconds for the first unthreaded message and pauses
 proactive task traffic during that short handoff. Its first turn listens for
@@ -405,9 +462,11 @@ Codex on the Mac.
   queued.
 - Every authorized inbound Messages event is marked read, including poll and
   tapback events that intentionally produce no Codex action.
-- The runtime multiplexes up to three independently owned Remote Control RPC
-  clients over one physical relay connection. A task still runs only one turn
-  at a time; excess or same-task work remains queued and starts automatically.
+- The runtime multiplexes up to three active turns over independently owned
+  Remote Control RPC clients on one physical relay connection. The private
+  controller uses that same global capacity rather than creating an extra
+  Codex process. A task still runs only one turn at a time; excess or same-task
+  work remains queued and starts automatically.
 - Every submitted turn has a durable client message id. If the relay or host
   disconnects after accepting `turn/start`, recovery looks up that exact id and
   never blindly submits a replacement turn.
@@ -447,10 +506,13 @@ Codex on the Mac.
 - Closing the service detaches from Remote Control; it does not cancel a
   canonical Codex turn unless the user explicitly stopped that task with ‼️.
 - No operation falls back to another Codex transport, another environment, a
-  local app-server process, or `imsg send`.
+  local app-server process, `imsg send`, or the dedicated Messages identity for
+  a primary-profile user mirror.
 - Losing the normal-profile rich bridge degrades only the user-mirror
-  capability. The service never restarts Messages, and the authenticated
-  helper/watch and Codex Remote Control paths continue independently.
+  capability. The affected task holds later transcript output until its mirror
+  is receiver-observed or explicitly dead-lettered; unrelated tasks, the
+  authenticated helper/watch, and Codex Remote Control continue independently.
+  The service never restarts Messages.
 
 ## Failure modes
 

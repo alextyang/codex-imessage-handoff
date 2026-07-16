@@ -266,6 +266,38 @@ test("retryable delivery holds the cursor and deterministic id, preserving stric
   assert.equal(second.delivered, 1);
 });
 
+test("a user mirror awaiting receiver observation blocks later task commentary in source order", async () => {
+  const item = fixture("thread-receiver-order");
+  const mirror = new LiveMirror(item.stateFile);
+  mirror.activate(item.thread);
+  append(item.rolloutPath,
+    started("turn-receiver-order"),
+    user("Primary-profile request"),
+    commentary("Codex commentary after the request"));
+
+  let receiverObserved = false;
+  const attempts = [];
+  const deliver = async (event) => {
+    attempts.push(`${event.role}:${event.body}`);
+    if (event.role === "user" && !receiverObserved) {
+      return { sent: false, terminal: false, status: "AWAITING_RECEIVER" };
+    }
+    return { sent: true, status: event.role === "user" ? "DUPLICATE" : "SENT" };
+  };
+  const held = await mirror.reconcile(item.thread, { deliver });
+  assert.equal(held.retryable, 1);
+  assert.deepEqual(attempts, ["user:Primary-profile request"]);
+
+  receiverObserved = true;
+  const released = await mirror.reconcile(item.thread, { deliver });
+  assert.equal(released.delivered, 2);
+  assert.deepEqual(attempts, [
+    "user:Primary-profile request",
+    "user:Primary-profile request",
+    "assistant:Codex commentary after the request",
+  ]);
+});
+
 test("consecutive commentary is bucketed across private records and stops at visible boundaries", async () => {
   const item = fixture("thread-buckets");
   const mirror = new LiveMirror(item.stateFile);

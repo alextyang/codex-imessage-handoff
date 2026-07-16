@@ -1,8 +1,21 @@
 import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 
-const MESSAGE_LOOKUP_MAX_BYTES = 64 * 1024;
+const MESSAGE_LOOKUP_MAX_BYTES = 256 * 1024;
+const LEGACY_USER_MIRROR_TAG_SUFFIX = /\u{E0001}[\u{E0020}-\u{E007E}]+\u{E007F}$/u;
+
+function userMirrorBodyHash(value) {
+  if (typeof value !== "string") return null;
+  // Current mirrors are byte-for-byte plain text. Older journals appended one
+  // private Tags-block marker after the visible text; remove only that exact
+  // terminal envelope so their original visible body remains recoverable.
+  const visible = value.replace(LEGACY_USER_MIRROR_TAG_SUFFIX, "");
+  return createHash("sha256")
+    .update(`local-user-mirror-body-v1\0${visible}`)
+    .digest("hex");
+}
 
 function participantValue(value) {
   if (typeof value === "string") return value.trim();
@@ -73,7 +86,9 @@ export function inspectLocalImsgMessage({
       m.guid AS guid,
       cmj.chat_id AS chat_id,
       m.is_from_me AS is_from_me,
-      h.id AS sender
+      h.id AS sender,
+      m.thread_originator_guid AS thread_originator_guid,
+      m.text AS text
     FROM message AS m
     JOIN chat_message_join AS cmj ON cmj.message_id = m.ROWID
     LEFT JOIN handle AS h ON h.ROWID = m.handle_id
@@ -125,5 +140,11 @@ export function inspectLocalImsgMessage({
     chat_id: id,
     is_from_me: row.is_from_me === 1 || row.is_from_me === true,
     sender: typeof row.sender === "string" ? row.sender.trim() : "",
+    thread_originator_guid: typeof row.thread_originator_guid === "string"
+      ? row.thread_originator_guid.trim()
+      : "",
+    // Keep the exact body private to the helper account. The controller needs
+    // only this domain-separated digest to prove that a known mirror arrived.
+    body_hash: userMirrorBodyHash(row.text),
   };
 }

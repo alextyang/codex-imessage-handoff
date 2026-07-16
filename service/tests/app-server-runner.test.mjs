@@ -340,6 +340,121 @@ test("Remote Control creates a persistent thread with an idempotency source", as
   assert.equal(messages(capture).some((message) => message.method === "turn/start"), false);
 });
 
+test("Remote Control creates a hidden controller thread with bounded app-server options", async (t) => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "imessage-app-server-controller-create-"));
+  const { runner, capture } = testRunner(directory);
+  t.after(() => runner.client.close());
+  const dynamicTools = [{
+    type: "function",
+    name: "list_tasks",
+    description: "List the user's recent Codex tasks.",
+    inputSchema: {
+      type: "object",
+      properties: { limit: { type: "integer", minimum: 1, maximum: 20 } },
+      additionalProperties: false,
+    },
+  }, {
+    type: "namespace",
+    name: "task",
+    description: "Control an existing Codex task.",
+    tools: [{
+      type: "function",
+      name: "send",
+      description: "Send a user message to a task.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          threadId: { type: "string" },
+          message: { type: "string" },
+        },
+        required: ["threadId", "message"],
+        additionalProperties: false,
+      },
+      deferLoading: false,
+    }],
+  }];
+
+  await runner.createThread({
+    cwd: directory,
+    threadSource: "imessage-handoff:controller:test",
+    model: "gpt-5.6-terra",
+    ephemeral: true,
+    baseInstructions: "You are the private iMessage Codex controller.",
+    developerInstructions: "Use the supplied controls and keep responses concise.",
+    dynamicTools,
+    approvalPolicy: "on-request",
+    sandbox: "workspace-write",
+  });
+
+  let start = messages(capture).find((message) => message.method === "thread/start");
+  assert.deepEqual(start.params, {
+    cwd: directory,
+    ephemeral: true,
+    threadSource: "imessage-handoff:controller:test",
+    model: "gpt-5.6-terra",
+    baseInstructions: "You are the private iMessage Codex controller.",
+    developerInstructions: "Use the supplied controls and keep responses concise.",
+    dynamicTools,
+    approvalPolicy: "on-request",
+    sandbox: "workspace-write",
+  });
+
+  await runner.createThread({
+    cwd: directory,
+    threadSource: "imessage-handoff:controller:permissions-test",
+    ephemeral: true,
+    permissions: "mobile-controller",
+  });
+  start = messages(capture).filter((message) => message.method === "thread/start").at(-1);
+  assert.deepEqual(start.params, {
+    cwd: directory,
+    ephemeral: true,
+    threadSource: "imessage-handoff:controller:permissions-test",
+    permissions: "mobile-controller",
+  });
+});
+
+test("hidden controller thread options reject malformed or ambiguous values before app-server", async (t) => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "imessage-app-server-controller-invalid-"));
+  const { runner, capture } = testRunner(directory);
+  t.after(() => runner.client.close());
+  const valid = {
+    cwd: directory,
+    threadSource: "imessage-handoff:controller:invalid-test",
+  };
+  const hostileTools = [];
+  Object.defineProperty(hostileTools, 0, {
+    enumerable: true,
+    get() { throw new Error("must remain inside the validation boundary"); },
+  });
+  hostileTools.length = 1;
+  const invalidOptions = [
+    { model: " gpt-5.6-terra" },
+    { ephemeral: "true" },
+    { baseInstructions: null },
+    { developerInstructions: "unsafe\u0000instruction" },
+    { approvalPolicy: "sometimes" },
+    { permissions: "mobile controller" },
+    { sandbox: "unrestricted" },
+    { permissions: "mobile-controller", sandbox: "workspace-write" },
+    { dynamicTools: {} },
+    { dynamicTools: [{ type: "function", name: "bad tool", description: "", inputSchema: {} }] },
+    { dynamicTools: [{ type: "function", name: "duplicate", description: "", inputSchema: {} }, {
+      type: "function", name: "duplicate", description: "", inputSchema: {},
+    }] },
+    { dynamicTools: [{ type: "function", name: "unsafe", description: "", inputSchema: undefined }] },
+    { dynamicTools: hostileTools },
+  ];
+
+  for (const options of invalidOptions) {
+    await assert.rejects(
+      runner.createThread({ ...valid, ...options }),
+      (error) => error?.code === "CODEX_THREAD_OPTIONS_INVALID",
+    );
+  }
+  assert.equal(messages(capture).some((message) => message.method === "thread/start"), false);
+});
+
 test("thread creation rejects an invalid app-server response and a missing cwd", async (t) => {
   const directory = mkdtempSync(path.join(os.tmpdir(), "imessage-app-server-create-invalid-"));
   const { runner, capture } = testRunner(directory, "invalid-thread-start");
@@ -387,6 +502,8 @@ test("Remote Control runner preserves input and streams safe output", async (t) 
   assert.deepEqual(start.params.input[1], { type: "localImage", path: localInput });
   assert.equal(start.params.clientUserMessageId, "client-message-stable");
   assert.equal(start.params.effort, "high");
+  assert.equal(Object.hasOwn(start.params, "model"), false);
+  assert.equal(Object.hasOwn(start.params, "additionalContext"), false);
   assert.deepEqual(invocations, [{ command: invocations[0].command, args: [], codexHome: path.join(directory, "codex-home") }]);
   assert.equal(sent.some((message) => message.method === "initialized"), true);
   assert.deepEqual(phases, ["Starting work.", "Creating an image.", "Finishing the response."]);
@@ -395,6 +512,52 @@ test("Remote Control runner preserves input and streams safe output", async (t) 
   assert.deepEqual(completed, ["A clean answer.\n"]);
   assert.deepEqual(images, [image]);
   assert.deepEqual(result, { status: "completed", body: "A clean answer.\n", generatedImages: [image] });
+  assert.equal(runner.isRunning(), false);
+});
+
+test("Remote Control applies a validated per-turn model and compact additional context", async (t) => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "imessage-app-server-controller-turn-"));
+  const { runner, capture } = testRunner(directory);
+  t.after(() => runner.client.close());
+  const additionalContext = {
+    "imessage.current": { kind: "untrusted", value: "Show me the task that is still running." },
+    "codex.snapshot": { kind: "application", value: "One running task: thread-1 · Deploy service" },
+  };
+
+  const result = await runner.run({
+    thread: { id: "thread-1", cwd: directory },
+    prompt: "Handle this controller request.",
+    model: "gpt-5.6-terra",
+    reasoningEffort: "medium",
+    additionalContext,
+  });
+
+  assert.equal(result.status, "completed");
+  const start = messages(capture).find((message) => message.method === "turn/start");
+  assert.equal(start.params.model, "gpt-5.6-terra");
+  assert.equal(start.params.effort, "medium");
+  assert.deepEqual(start.params.additionalContext, additionalContext);
+});
+
+test("per-turn model and additional context validation fails before resuming a task", async (t) => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "imessage-app-server-controller-turn-invalid-"));
+  const { runner, capture } = testRunner(directory);
+  t.after(() => runner.client.close());
+  const thread = { id: "thread-1", cwd: directory };
+
+  await assert.rejects(
+    runner.run({ thread, prompt: "Invalid model", model: "gpt 5.6 terra" }),
+    (error) => error?.code === "CODEX_TURN_OPTIONS_INVALID",
+  );
+  await assert.rejects(
+    runner.run({
+      thread,
+      prompt: "Invalid context",
+      additionalContext: { "codex.snapshot": { kind: "trusted", value: "No." } },
+    }),
+    (error) => error?.code === "CODEX_TURN_OPTIONS_INVALID",
+  );
+  assert.equal(messages(capture).some((message) => message.method === "thread/resume"), false);
   assert.equal(runner.isRunning(), false);
 });
 
@@ -1259,6 +1422,36 @@ test("disconnect aborts an outstanding mobile decision and ignores a late approv
   assert.equal(fixture.socket().sent.some((message) => (
     message.id === "interactive-1" && !message.method
   )), false);
+});
+
+test("a server request arriving after cancellation is declined without invoking its handler", async (t) => {
+  const fixture = interactiveRunner(null, { completeOnResponse: false, interruptGraceMs: 25 });
+  t.after(() => fixture.client.close());
+  let calls = 0;
+  const run = fixture.runner.run({
+    thread: { id: "thread-1", cwd: "/tmp" },
+    prompt: "Cancel before a late tool request.",
+    onServerRequest: async () => {
+      calls += 1;
+      return { success: true, contentItems: [{ type: "text", text: "must not run" }] };
+    },
+  });
+  await waitFor(() => fixture.socket()?.sent.some((message) => message.method === "turn/start"));
+  assert.equal(fixture.runner.cancel("thread-1"), true);
+  fixture.socket().notify(interactiveRequest("item/tool/call", {
+    callId: "late-call",
+    namespace: "codex_control",
+    tool: "send_task_message",
+    arguments: { id: "task-a", text: "must not run" },
+  }, "late-request"));
+  await waitFor(() => fixture.socket().sent.some((message) => message.id === "late-request" && !message.method));
+
+  assert.equal(calls, 0);
+  assert.deepEqual(fixture.socket().sent.find((message) => message.id === "late-request" && !message.method), {
+    id: "late-request",
+    result: { contentItems: [], success: false },
+  });
+  assert.deepEqual(await run, { status: "cancelled", body: "" });
 });
 
 test("runner interrupts a remote turn without closing its shared stream", async (t) => {

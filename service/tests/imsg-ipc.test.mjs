@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { EventEmitter } from "node:events";
-import { createPrivateKey, createPublicKey } from "node:crypto";
+import { createHash, createPrivateKey, createPublicKey } from "node:crypto";
 import {
   chmodSync,
   existsSync,
@@ -33,6 +33,10 @@ import {
 import { ImsgHelperServer, inspectLocalImsgIdentity } from "../src/imsg-helper-server.mjs";
 import { inspectLocalImsgMessage } from "../src/imsg-chat.mjs";
 import { ImsgIpcClient, createImsgIpcClientFromConfig } from "../src/imsg-ipc-client.mjs";
+
+function mirrorBodyHash(text) {
+  return createHash("sha256").update(`local-user-mirror-body-v1\0${text}`).digest("hex");
+}
 import { REQUIRED_PINNED_IMSG_CAPABILITIES } from "../src/imsg-client.mjs";
 import {
   IMSG_IPC_MUTATION_TIMEOUT_MS,
@@ -232,19 +236,26 @@ test("live account inspection uses the bridge account command and shared fingerp
   assert.equal(result.accountFingerprint, imsgAccountFingerprint(result.identities));
 });
 
-test("message lookup proves an exact GUID belongs to the pinned chat without reading content", () => {
+test("message lookup proves an exact GUID, root, and body without returning content", () => {
   const { root, cleanup } = temporary();
   try {
     const database = path.join(root, "chat.db");
     execFileSync("/usr/bin/sqlite3", [database], {
       input: `
-        CREATE TABLE message (ROWID INTEGER PRIMARY KEY, guid TEXT, is_from_me INTEGER, handle_id INTEGER);
+        CREATE TABLE message (
+          ROWID INTEGER PRIMARY KEY,
+          guid TEXT,
+          is_from_me INTEGER,
+          handle_id INTEGER,
+          thread_originator_guid TEXT,
+          text TEXT
+        );
         CREATE TABLE chat_message_join (chat_id INTEGER, message_id INTEGER);
         CREATE TABLE handle (ROWID INTEGER PRIMARY KEY, id TEXT);
         INSERT INTO handle VALUES (1, '+12145550196');
-        INSERT INTO message VALUES (1, 'PINNED-GUID', 0, 1);
+        INSERT INTO message VALUES (1, 'PINNED-GUID', 0, 1, 'PINNED-ROOT', 'Pinned body');
         INSERT INTO chat_message_join VALUES (42, 1);
-        INSERT INTO message VALUES (2, 'FOREIGN-GUID', 0, 1);
+        INSERT INTO message VALUES (2, 'FOREIGN-GUID', 0, 1, 'FOREIGN-ROOT', 'Foreign body');
         INSERT INTO chat_message_join VALUES (99, 2);
       `,
     });
@@ -258,6 +269,8 @@ test("message lookup proves an exact GUID belongs to the pinned chat without rea
       chat_id: 42,
       is_from_me: false,
       sender: "+12145550196",
+      thread_originator_guid: "PINNED-ROOT",
+      body_hash: mirrorBodyHash("Pinned body"),
     });
     assert.equal(inspectLocalImsgMessage({
       chatId: 42,
@@ -463,6 +476,83 @@ test("a replacement controller connection can reauthorize only a GUID from the p
   await assert.rejects(
     client.authorizeMessageGuid({ chat_id: 42, message_guid: "FOREIGN-CHAT-GUID" }),
     (error) => error?.code === "IMSG_MESSAGE_NOT_ALLOWED",
+  );
+});
+
+test("receiver mirror proof is content-free and requires exact pinned GUID, sender, root, and body", async (t) => {
+  const bodyHash = mirrorBodyHash("Exact mirrored request");
+  let inspected = {
+    guid: "RECEIVER-MIRROR-GUID",
+    chat_id: 42,
+    sender: "+12145550196",
+    is_from_me: false,
+    thread_originator_guid: "THREAD-ROOT-GUID",
+    body_hash: bodyHash,
+  };
+  const { client } = await fixture(t, {
+    inspectMessage: (_profile, guid) => guid === "MISSING-GUID" ? null : { ...inspected },
+  });
+  const proof = {
+    chat_id: 42,
+    message_guid: "RECEIVER-MIRROR-GUID",
+    root_guid: "THREAD-ROOT-GUID",
+    body_hash: bodyHash,
+  };
+
+  const exact = await client.verifyUserMirrorReceipt(proof);
+  assert.deepEqual(exact, {
+    classification: "accepted",
+    accepted: true,
+    observed: true,
+    terminal: true,
+    guid: "RECEIVER-MIRROR-GUID",
+  });
+  assert.deepEqual(Object.keys(exact).sort(), ["accepted", "classification", "guid", "observed", "terminal"]);
+  assert.equal(JSON.stringify(exact).includes("Exact mirrored request"), false);
+  assert.equal(JSON.stringify(exact).includes(bodyHash), false);
+  assert.equal(JSON.stringify(exact).includes("+12145550196"), false);
+  assert.equal(JSON.stringify(exact).includes("THREAD-ROOT-GUID"), false);
+
+  inspected = { ...inspected, thread_originator_guid: "OTHER-ROOT" };
+  const wrongRoot = await client.verifyUserMirrorReceipt(proof);
+  assert.equal(wrongRoot.classification, "terminal");
+  assert.equal(wrongRoot.observed, false);
+  assert.equal(wrongRoot.reason, "mirror-proof-mismatch");
+
+  inspected = { ...inspected, thread_originator_guid: "THREAD-ROOT-GUID", body_hash: mirrorBodyHash("Other body") };
+  const wrongBody = await client.verifyUserMirrorReceipt(proof);
+  assert.equal(wrongBody.classification, "terminal");
+  assert.equal(wrongBody.observed, false);
+
+  inspected = { ...inspected, body_hash: bodyHash, sender: "+15550000000" };
+  await assert.rejects(
+    client.verifyUserMirrorReceipt(proof),
+    (error) => error?.code === "IMSG_MESSAGE_NOT_ALLOWED",
+  );
+
+  inspected = { ...inspected, sender: "+12145550196", is_from_me: true };
+  await assert.rejects(
+    client.verifyUserMirrorReceipt(proof),
+    (error) => error?.code === "IMSG_MESSAGE_NOT_ALLOWED",
+  );
+
+  inspected = { ...inspected, is_from_me: false, guid: "DIFFERENT-GUID" };
+  await assert.rejects(
+    client.verifyUserMirrorReceipt(proof),
+    (error) => error?.code === "IMSG_MESSAGE_NOT_ALLOWED",
+  );
+
+  const missing = await client.verifyUserMirrorReceipt({ ...proof, message_guid: "MISSING-GUID" });
+  assert.equal(missing.classification, "terminal");
+  assert.equal(missing.observed, false);
+  assert.equal(missing.reason, "message-not-found");
+  await assert.rejects(
+    client.verifyUserMirrorReceipt({ ...proof, chat_id: 99 }),
+    (error) => error?.code === "IMSG_CHAT_NOT_ALLOWED",
+  );
+  await assert.rejects(
+    client.verifyUserMirrorReceipt({ ...proof, body_hash: "not-a-hash" }),
+    (error) => error?.code === "IMSG_MIRROR_PROOF_INVALID",
   );
 });
 

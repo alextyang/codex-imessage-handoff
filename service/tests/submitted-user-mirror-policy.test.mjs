@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  orderedUserMirrorDelivery,
   shouldSuppressSubmittedUserMirror,
   submittedUserMirrorMode,
 } from "../src/submitted-user-mirror-policy.mjs";
@@ -29,4 +30,35 @@ test("claimed mirror policy is restart-safe and legacy jobs keep their no-echo b
   assert.equal(shouldSuppressSubmittedUserMirror({ userMirrorMode: "suppress" }), true);
   assert.equal(shouldSuppressSubmittedUserMirror({}), true);
   assert.equal(shouldSuppressSubmittedUserMirror(null), true);
+});
+
+test("a primary mirror stays nonterminal until the dedicated receiver observes its exact echo", () => {
+  const awaiting = orderedUserMirrorDelivery({
+    classification: "accepted",
+    sent: true,
+    terminal: true,
+    status: "SENT",
+    receiverObserved: false,
+    guids: ["mirror-guid"],
+  });
+  assert.deepEqual(awaiting, {
+    classification: "accepted",
+    sent: false,
+    terminal: false,
+    status: "AWAITING_RECEIVER",
+    receiverObserved: false,
+    retryable: true,
+    fallbackSafe: false,
+    guids: ["mirror-guid"],
+  });
+  const observed = {
+    classification: "duplicate",
+    sent: true,
+    terminal: true,
+    status: "DUPLICATE",
+    receiverObserved: true,
+  };
+  assert.equal(orderedUserMirrorDelivery(observed), observed);
+  const unavailable = { sent: false, status: "ROOT_NOT_SYNCED" };
+  assert.equal(orderedUserMirrorDelivery(unavailable), unavailable);
 });

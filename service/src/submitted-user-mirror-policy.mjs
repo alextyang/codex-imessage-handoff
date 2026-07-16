@@ -21,3 +21,22 @@ export function submittedUserMirrorMode(action) {
 export function shouldSuppressSubmittedUserMirror(claim) {
   return claim?.userMirrorMode !== "mirror";
 }
+
+/**
+ * Sender-side persistence proves that a primary-profile bubble will never be
+ * sent twice, but it does not prove that the dedicated receiver has observed
+ * it yet. Keep the rollout record nonterminal until the receiver watch writes
+ * its exact GUID/body/root-bound receipt; later task output then cannot
+ * overtake the user bubble after a slow iMessage delivery or daemon restart.
+ */
+export function orderedUserMirrorDelivery(result) {
+  if (result?.sent !== true || result?.receiverObserved === true) return result;
+  return {
+    ...result,
+    sent: false,
+    terminal: false,
+    status: "AWAITING_RECEIVER",
+    retryable: true,
+    fallbackSafe: false,
+  };
+}

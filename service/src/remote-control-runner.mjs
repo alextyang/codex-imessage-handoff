@@ -13,9 +13,11 @@ function defaultCodexHome() {
  * Production composition root for independent Codex Remote Control access.
  *
  * The controller and physical relay connection are created on first use and
- * shared for the lifetime of the service. Each runner owns a separate
+ * shared for the lifetime of the service. Each runner receives a separate
  * AppServerRpcClient and logical Remote Control stream so unrelated tasks can
  * progress concurrently without creating another physical relay connection.
+ * Ordinary runners release that client after use; persistent clients remain
+ * owned by this runtime until shutdown.
  */
 export class RemoteControlCodexRuntime {
   constructor(options = {}) {
@@ -48,6 +50,27 @@ export class RemoteControlCodexRuntime {
         client,
         ownsClient: true,
         onClientClose: () => this.rpcClients.delete(client),
+      });
+    } catch (error) {
+      this.rpcClients.delete(client);
+      try { client.close?.(); } catch {}
+      throw error;
+    }
+  }
+
+  /**
+   * Create a runner whose logical app-server client remains attached until the
+   * shared runtime closes. This is intended for an ephemeral conversation that
+   * must survive across multiple create/run operations without creating a
+   * second physical Remote Control connection.
+   */
+  createPersistentRunner() {
+    if (this.closed) throw new Error("Codex Remote Control runtime is closed.");
+    const client = this.#ownedRpcClient();
+    try {
+      return this.runnerFactory({
+        client,
+        ownsClient: false,
       });
     } catch (error) {
       this.rpcClients.delete(client);

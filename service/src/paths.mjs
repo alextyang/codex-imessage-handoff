@@ -26,6 +26,8 @@ export function servicePaths() {
     multiLiveMirrorState: path.join(home, "live-mirrors"),
     imsgState: path.join(home, "imsg-state.json"),
     localUserMirrorState: path.join(home, "local-user-mirror.json"),
+    hiddenControllerState: path.join(home, "hidden-controller.json"),
+    hiddenControllerWorkspace: path.join(home, "controller-workspace"),
     remoteControlClient: path.join(home, "remote-control-client.json"),
     remoteControlStatus: path.join(home, "remote-control-status.json"),
     remoteControlKeyHelper: path.join(home, "bin", "remote-control-key-helper"),

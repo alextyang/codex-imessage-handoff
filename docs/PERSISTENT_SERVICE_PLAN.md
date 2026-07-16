@@ -16,7 +16,8 @@ Exactly one topology is supported:
    nonextractable device key.
 4. That service creates one independent Remote Control controller and one
    physical controller WebSocket to OpenAI's relay, lazily on first Codex use,
-   then multiplexes one owned logical app-server client per active task.
+   then multiplexes one owned logical app-server client per active task plus a
+   long-lived logical client for the private top-level conversation.
 5. The relay routes logical app-server JSON-RPC to the normal private
    app-server already created and owned by Codex Desktop.
 
@@ -129,6 +130,10 @@ rotation.
 - `RemoteControlController` and `RemoteControlConnection` are each created
   lazily once per service process. Each runner gets one owned app-server RPC
   client and logical stream on that shared physical connection.
+- The top-level Messages controller keeps one logical RPC client for its
+  ephemeral conversation and closes it with the service. It shares the same
+  physical relay and global run limit; it must not create another Codex or
+  app-server process.
 - Every physical WebSocket open/reopen obtains a freshly refreshed controller
   session and re-verifies the same pinned Desktop environment.
 - The physical WebSocket uses protocol v3 and completes a validated signed
@@ -187,10 +192,18 @@ account mismatch or pinned RPC failure remains immediately fatal.
 
 - Each Codex task maps to its own durable native Messages reply thread.
 - An explicit native reply always wins over every inferred context.
-- Unthreaded text uses the most recent task addressed by the user. Outbound
-  notifications never change that cursor.
+- Ordinary unthreaded text enters the private top-level controller FIFO.
+  Replies to controller output return to that controller. Controller output,
+  questions, and approval polls remain top-level.
+- An outbound task notification never changes controller or task input
+  routing. A native task reply always bypasses the controller.
 - Task commands may use the recent default context for five minutes before
-  opening a picker; ordinary prompts retain the user-selected default.
+  opening a picker. That shortcut never applies to ordinary natural-language
+  prompts.
+- A short explicit task-selection or `/new` prompt lease wins for genuinely
+  top-level input until its bounded expiry. Slash commands, votes, reactions,
+  and exact Reply context remain deterministic and do not ask the language
+  model to infer their target.
 - Polls and awaiting-prompt state are scoped and bounded. They cannot pause
   unrelated task mirrors or completions.
 - Unknown and expired votes are visible failures followed by fresh navigation.
@@ -199,6 +212,49 @@ account mismatch or pinned RPC failure remains immediately fatal.
   authority, and are aborted when the turn, stream, or service ends. Poll
   tokens correlate a choice with one live request; stale tokens cannot answer a
   later request.
+
+## Private controller contract
+
+- The controller starts an ephemeral, non-materialized app-server thread using
+  `gpt-5.6-terra` with medium reasoning. It is hidden by the app-server's
+  ephemeral-thread contract, not by modifying Codex Desktop state or files.
+- Developer instructions explain top-level versus native Reply routing,
+  concise phone-oriented responses, approval behavior, untrusted context, and
+  the exact available control tools.
+- The `codex_control` namespace exposes bounded list/status operations plus
+  exact-ID task inspection, messaging, creation, configuration, and confirmed
+  stopping. A stop call presents a service-issued native confirmation poll
+  bound to the exact task; a model-provided Boolean cannot grant authority.
+  Unknown tools fail closed. Standard Codex computer tools continue through
+  normal app-server permissions and approvals.
+- The ephemeral thread's workspace is a fresh service-owned `0700` session
+  directory, never the user's home directory or a Codex project. It starts in
+  a read-only filesystem sandbox; broader operations retain normal approval
+  boundaries.
+- Every turn receives at most 8 KiB of trusted service state and 8 KiB of
+  separately labelled untrusted task/message state. Recovery context contains
+  only a small number of byte-truncated exchanges and is supplied only when a
+  replacement ephemeral thread begins.
+- App-server memory is disabled. A session rotates after eight turns, 64 KiB,
+  or 45 minutes idle. Each turn is limited to 16 control calls, 48 KiB of
+  cumulative control responses, and ten minutes. Rotation retains every prior
+  ephemeral thread as a durable cleanup obligation until deletion is confirmed
+  and must never create maintenance turns while idle. An ambiguous
+  `thread/start` is reconciled by its unique source and private workspace before
+  any replacement is created.
+- Input jobs, accepted message keys, compact recovery exchanges, and a bounded
+  tool journal are private durable state. Mutating tools deduplicate by durable
+  input job, tool name, and exact argument digest, even if a regenerated call
+  has a different protocol call id. Controller-stop receipts durably bind a
+  retry to the exact jobs visible when the user asked to stop, so it cannot
+  cancel later work.
+- A running job found after process restart becomes uncertain and is never
+  submitted again. A post-submission connection loss follows the same rule.
+  Messages delivery failure retries only the stable controller delivery id;
+  it must never rerun the completed Codex turn or any tool action.
+- The controller consumes one slot from the same global three-turn scheduler
+  as task work. It cannot bypass task serialization or create hidden parallel
+  capacity.
 
 ## Delivery contract
 
@@ -215,6 +271,10 @@ Every semantic outbound operation uses a stable delivery identity. Completed
 text is checkpointed independently from generated images; images are accepted
 and checkpointed one at a time. A crash may delay a result but must not replay
 an already checkpointed component.
+
+Controller input uses the same durable-before-execution rule. Its final text or
+failure notice is stored before delivery, and the accepted inbound key remains
+remembered after delivery so a cursor crash cannot replay the controller turn.
 
 Rollout reconciliation is path-aware and bounded. A known changed JSONL path
 queues only its catalog task at foreground priority; an unknown path, missing
@@ -260,6 +320,16 @@ thread metadata. The path never mutates the chat's shared
 inline-reply controller or current-thread map. A reply fails before dispatch
 unless the selected GUID, derived thread identifier, parent message, and
 parent item are all available and the stamped metadata reads back exactly.
+The sender is also identity-pinned at every layer available to the service:
+the primary handle is mandatory and owned by the active account, that account
+must match the durable positive fingerprint stored with the bound chat, and its
+fingerprint must differ from the dedicated helper account. Identity or binding
+mismatches preserve the complete delivery journal and fail closed. The exact
+bound chat must still use the pinned sender on every revalidation, and the
+accepted outgoing row must retain the same destination caller plus exact
+`chat_id` and `chat_guid`. The dedicated helper rejects
+`thread.live-message` user events before header or RPC construction. There is
+no cross-identity mirror fallback.
 
 The patched `imsg` 0.13.0 build has one canonical patch order:
 `imsg-0.13.0-daemon-contacts.patch`,
@@ -286,11 +356,19 @@ limited to eight plain-text candidates of at most 96 KiB each. Capacity
 exhaustion fails before cursor advancement so watch recovery cannot evict user
 input. While the bridge supplies no authoritative identity, the unavoidable
 ambiguity still prefers preventing a duplicate Codex action. The bridge-returned
-GUID is registered immediately, and acceptance requires either the matching
-body-bound receiver receipt or an exact normal-profile sender-row proof for
-GUID, body, chat, and `thread_originator_guid`. Echo suppression then applies
-only to that GUID on that native Reply root, and a reused delivery ID cannot
-settle different content.
+GUID is registered immediately. Exact normal-profile sender-row proof for GUID,
+body, destination caller, chat, and `thread_originator_guid` closes the native
+no-resend boundary. It does not advance the rollout cursor: terminal mirror
+delivery additionally requires the matching body/root-bound receiver receipt
+for every native part. This receiver-observation barrier is durable across
+restart, so commentary and completion cannot overtake their user message.
+An accepted legacy journal whose row is already behind the watch cursor uses a
+narrow authenticated receiver proof: the helper validates the exact inbound
+GUID, pinned chat and sender, Reply root, and body digest, returns no message
+content, and atomically reconstructs the same receipt without sending.
+Per-task reconciliation keeps an affected task held without blocking unrelated
+tasks. Echo suppression applies only to the exact GUID on the native Reply
+root, and a reused delivery ID cannot settle different content.
 
 The daemon owns one exclusive lease inside the handoff service's private home.
 Each normal-profile mirror send also takes a short-lived lease and reloads the
@@ -399,12 +477,15 @@ A release also requires:
 - controller disconnect/reconnect with unacknowledged replay and cursor resume;
 - Desktop quit/offline and normal reopen recovery without another app-server;
 - concurrent normal Codex Desktop use while iMessage work runs;
-- directory poll, task selection, native reply routing, unthreaded routing,
+- directory poll, task selection, native reply routing, top-level controller
+  routing, controller-response replies, controller interaction polls, bounded
+  context/session rotation, controller tool idempotence, ambiguous-turn
+  recovery, delivery-only retries,
   task-scoped command picker, rich text, poll vote, attachment, cancellation,
   restart recovery, helper reconnect from the dedicated Messages identity,
   transcript-visible normal-profile outgoing user mirrors, echo-before-result
   suppression, exact sender-row verification, same-body collision resistance,
-  historical caller-GUID no-resend reconciliation, and bridge-loss fallback
-  behavior;
+  historical caller-GUID no-resend reconciliation, receiver-observed ordering,
+  primary-account enforcement, and bridge-loss fail-closed behavior;
 - deauthorization proving the controller is removed while Codex Desktop and its
   normal private app-server remain unaffected.

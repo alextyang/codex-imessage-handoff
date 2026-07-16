@@ -57,6 +57,10 @@ class FakeClient {
 
   async start() { this.calls.push(["start"]); }
   async helperStatus() { this.helperStatusCount += 1; return helperReport(); }
+  async verifyUserMirrorReceipt(params) {
+    this.calls.push(["verify-user-mirror", params]);
+    return { classification: "accepted", accepted: true, observed: true, terminal: true, guid: params.message_guid };
+  }
   async resetConnection() { this.calls.push(["reset-connection"]); }
   async latestMessage() { return this.latestMessageValue; }
   async stop() { this.calls.push(["stop"]); }
@@ -343,7 +347,8 @@ test("starts an exact-chat watch and filters echoes, other chats, and other send
   emit({ id: 4, guid: "accepted-guid" });
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(actions.length, 3);
-  assert.ok(actions.every((action) => action.threadId === THREAD.id));
+  assert.equal(actions.filter((action) => action.kind === "prompt" && action.threadId === THREAD.id).length, 1);
+  assert.equal(actions.filter((action) => action.kind === "controller-prompt" && action.threadId === undefined).length, 2);
   assert.equal(transport.router.lastRowId, 5);
   assert.equal(client.calls[1][0], "watch");
 });
@@ -447,7 +452,7 @@ test("startup retries the read receipt once for a durable pending inbox", async 
     text: "Resume this durable prompt.",
     created_at: "2026-07-12T12:00:00.000Z",
   });
-  assert.equal(pending.kind, "prompt");
+  assert.equal(pending.kind, "controller-prompt");
   await transport.stop();
   client.calls.length = 0;
 
@@ -1553,6 +1558,52 @@ test("two consecutive advanced outputs both send and the second remains in the n
   assert.equal(typeof client.send, "undefined");
 });
 
+test("receiver proof verification is delegated only to the pinned helper chat", async () => {
+  const { transport, client } = fixture();
+  const bodyHash = "a".repeat(64);
+  const result = await transport.verifyUserMirrorReceipt({
+    guid: "PRIMARY-MIRROR-GUID",
+    rootGuid: "THREAD-ROOT-GUID",
+    bodyHash,
+  });
+  assert.equal(result.observed, true);
+  assert.deepEqual(client.calls.find(([kind]) => kind === "verify-user-mirror"), [
+    "verify-user-mirror",
+    {
+      chat_id: 42,
+      message_guid: "PRIMARY-MIRROR-GUID",
+      root_guid: "THREAD-ROOT-GUID",
+      body_hash: bodyHash,
+    },
+  ]);
+  assert.equal(client.helperStatusCount, 1);
+});
+
+test("the dedicated Codex transport can never send a primary-profile user mirror", async () => {
+  const { transport, client } = fixture();
+  await transport.probe();
+  const before = client.calls.length;
+  const result = await transport.outbound({
+    kind: "thread.live-message",
+    messageId: "forbidden-service-user-mirror",
+    thread: THREAD,
+    role: "user",
+    phase: "user_message",
+    body: "This must come from the primary Messages profile.",
+  });
+  assert.deepEqual(result, {
+    sent: false,
+    status: "PRIMARY_USER_MIRROR_REQUIRED",
+    terminal: false,
+    attempted: false,
+    parts: 0,
+    guids: [],
+  });
+  assert.equal(client.calls.length, before);
+  assert.equal(transport.router.nativeThread(THREAD.id), null,
+    "rejecting the wrong identity path must not even create a task header");
+});
+
 test("every task-scoped bubble, poll, and attachment stays on one native reply root and remains reply-addressable", async () => {
   const { transport, client } = fixture();
   await transport.probe();
@@ -1565,13 +1616,8 @@ test("every task-scoped bubble, poll, and attachment stays on one native reply r
   };
   const results = [];
   results.push(await transport.outbound({ kind: "thread.header", deliveryId: "header-root", thread }));
-  results.push(await transport.outbound({
-    kind: "thread.live-message",
-    messageId: "mirror-user",
-    thread,
-    role: "user",
-    body: "Run the continuity matrix.",
-  }));
+  const primaryMirrorGuid = "primary-profile-mirror-user";
+  transport.router.routeOutboundGuid(primaryMirrorGuid, thread.id);
   results.push(await transport.outbound({
     kind: "thread.live-message",
     messageId: "mirror-commentary",
@@ -1644,7 +1690,10 @@ test("every task-scoped bubble, poll, and attachment stays on one native reply r
   assert.equal(taskCalls.filter(([, params]) => /codex:\/\/threads\/thread-a/u.test(params.text || "")).length, 1);
 
   transport.router.setThreadRoot("thread-b", "root-b");
-  const routedGuids = [...new Set(results.flatMap((result) => result.guids || []))];
+  const routedGuids = [...new Set([
+    primaryMirrorGuid,
+    ...results.flatMap((result) => result.guids || []),
+  ])];
   for (const [index, guid] of routedGuids.entries()) {
     const action = transport.router.ingest({
       id: 2_000 + index,
@@ -1682,12 +1731,12 @@ test("interleaved task output never crosses native roots or lets background acti
   assert.equal(selectAlpha.threadId, alpha.id);
   transport.router.acknowledge(selectAlpha.messageKey);
 
-  await transport.outbound({ kind: "thread.live-message", messageId: "alpha-user", thread: alpha, role: "user", body: "Alpha two." });
+  transport.router.routeOutboundGuid("alpha-primary-user", alpha.id);
   await transport.outbound({ kind: "thread.completed", completionId: "beta-complete", thread: beta, body: "Beta done." });
   await transport.outbound({ kind: "service.notice", deliveryId: "beta-notice", code: "updated", thread: beta, body: "Beta updated." });
 
   const rich = client.calls.filter(([kind]) => kind === "rich").map(([, params]) => params);
-  const alphaBodies = rich.filter((params) => ["Alpha one.", "👤 Alpha two."].includes(params.text));
+  const alphaBodies = rich.filter((params) => params.text === "Alpha one.");
   const betaBodies = rich.filter((params) => ["Beta one.", "Beta done.", "Beta updated."].includes(params.text));
   assert.ok(alphaBodies.every((params) => params.reply_to === alphaRoot));
   assert.ok(betaBodies.every((params) => params.reply_to === betaRoot));
@@ -1700,8 +1749,8 @@ test("interleaved task output never crosses native roots or lets background acti
     reply_to_guid: betaFirst.guids.at(-1),
     created_at: "2026-07-12T12:00:02.000Z",
   });
-  assert.equal(unthreaded.kind, "prompt");
-  assert.equal(unthreaded.threadId, alpha.id);
+  assert.equal(unthreaded.kind, "controller-prompt");
+  assert.equal(unthreaded.threadId, undefined);
 });
 
 test("manual header resends are separate replies under the existing root and uniquely idempotent", async () => {
@@ -2756,7 +2805,7 @@ test("a failed unmute poll does not poison the serialized outbound queue", async
   assert.equal(client.calls.find(([kind]) => kind === "rich")[1].text, "The next action still works.");
 });
 
-test("a top-level poll vote keeps later unthreaded input on the last user-selected task", async () => {
+test("a top-level poll vote leaves later top-level input with the hidden controller", async () => {
   const { transport } = fixture();
   await transport.probe();
   await transport.sendThreadPicker("mute", [
@@ -2779,7 +2828,8 @@ test("a top-level poll vote keeps later unthreaded input on the last user-select
     text: "This should use the latest task, not the poll's choice.",
     created_at: "2026-07-12T12:02:00.000Z",
   });
-  assert.equal(reply.threadId, "thread-a");
+  assert.equal(reply.kind, "controller-prompt");
+  assert.equal(reply.threadId, undefined);
 });
 
 test("awaiting-prompt pauses only proactive delivery with a retryable result", async () => {
@@ -2829,6 +2879,117 @@ test("typing follows only the current default task across interleaved work", asy
   assert.deepEqual(client.calls.filter(([kind]) => kind === "typing").map((call) => call[2]), [true, false, true]);
   await transport.outbound({ kind: "thread.output", thread: other, body: "B done." });
   assert.deepEqual(client.calls.filter(([kind]) => kind === "typing").map((call) => call[2]), [true, false, true, false]);
+});
+
+test("controller output stays top-level, persists reply routing, and exposes controller typing", async () => {
+  const { transport, client, stateFile } = fixture();
+  await transport.probe();
+  const sent = await transport.outbound({
+    kind: "service.notice",
+    deliveryId: "controller-response-1",
+    code: "updated",
+    body: "Private controller response",
+  }, { controllerRoute: true });
+  assert.equal(sent.sent, true);
+  const richCall = client.calls.find(([kind, params]) => kind === "rich" && params.text === "Private controller response");
+  assert.equal(richCall[1].reply_to, undefined);
+
+  const resumed = new ImsgTransport({
+    profile: transport.profile,
+    stateFile,
+    client: new FakeClient(),
+  });
+  const reply = resumed.router.ingest({
+    id: 9_900,
+    guid: "controller-user-reply",
+    text: "Continue our top-level conversation.",
+    thread_originator_guid: sent.guids[0],
+    created_at: "2026-07-12T12:00:01.000Z",
+  });
+  assert.equal(reply.kind, "controller-prompt");
+  assert.equal(reply.threadId, undefined);
+
+  await transport.setControllerTyping(true);
+  await transport.setControllerTyping(false);
+  assert.deepEqual(client.calls.filter(([kind]) => kind === "typing").map((call) => call[2]), [true, false]);
+});
+
+test("every top-level text, poll, and attachment GUID becomes durable controller Reply context", async () => {
+  const { transport, client, stateFile } = fixture();
+  await transport.probe();
+  const text = await transport.outbound({
+    kind: "service.notice",
+    deliveryId: "ordinary-top-level-text",
+    code: "updated",
+    body: "A global service response",
+  });
+  const poll = await transport.outbound({
+    kind: "service.directory",
+    deliveryId: "ordinary-top-level-poll",
+    directory: {
+      groups: [{
+        projectKey: "project",
+        projectLabel: "Project",
+        threads: [
+          { id: "thread-a", title: "Alpha", status: "idle" },
+          { id: "thread-b", title: "Beta", status: "pending" },
+        ],
+      }],
+    },
+  });
+  const attachment = await transport.publishImages(null, ["/tmp/controller-preview.png"], {
+    deliveryId: "ordinary-top-level-attachment",
+  });
+  assert.equal(text.sent, true);
+  assert.equal(poll.sent, true);
+  assert.equal(attachment.sent, true);
+  assert.equal(client.calls.find(([kind, params]) => kind === "rich"
+    && params.text === "A global service response")[1].reply_to, undefined);
+  assert.equal(client.calls.find(([kind]) => kind === "poll")[1].reply_to, undefined);
+  assert.equal(client.calls.find(([kind]) => kind === "attachment")[1].reply_to, undefined);
+
+  const controllerGuids = [...text.guids, ...poll.guids, ...attachment.guids];
+  assert.equal(controllerGuids.length, 3);
+  const resumed = new ImsgTransport({
+    profile: transport.profile,
+    stateFile,
+    client: new FakeClient(),
+  });
+  for (const [index, guid] of controllerGuids.entries()) {
+    const reply = resumed.router.ingest({
+      id: 9_940 + index,
+      guid: `reply-to-controller-output-${index}`,
+      text: `Natural-language follow-up ${index}`,
+      thread_originator_guid: guid,
+      reply_to_guid: index === 0 ? "incidental-parent" : controllerGuids[index - 1],
+      created_at: new Date(Date.parse("2026-07-12T12:00:03.000Z") + index * 1_000).toISOString(),
+    });
+    assert.equal(reply.kind, "controller-prompt", guid);
+    assert.equal(reply.threadId, undefined, guid);
+    assert.equal(resumed.router.acknowledge(reply.messageKey), true);
+  }
+});
+
+test("controller interaction polls remain top-level and return controller-response actions", async () => {
+  const { transport, client } = fixture();
+  await transport.probe();
+  const result = await transport.sendActionPicker("Permission", [
+    { label: "Allow", action: { kind: "controller-response", argument: "token-allow" } },
+    { label: "Deny", action: { kind: "controller-response", argument: "token-deny" } },
+  ], { controllerRoute: true, allowAddedChoiceSearch: false, operationScope: "controller-permission" });
+  assert.equal(result.sent, true);
+  const pollCall = client.calls.find(([kind]) => kind === "poll");
+  assert.equal(pollCall[1].reply_to, undefined);
+  const vote = transport.router.ingest({
+    id: 9_901,
+    guid: "controller-poll-vote",
+    text: "",
+    poll: { kind: "vote", original_guid: result.guids[0], vote: { option_id: "option-0" } },
+    created_at: "2026-07-12T12:00:02.000Z",
+  });
+  assert.equal(vote.kind, "controller-response");
+  assert.equal(vote.argument, "token-allow");
+  assert.equal(vote.threadId, undefined);
 });
 
 test("typing clears on the injected command-context deadline without another message", async () => {

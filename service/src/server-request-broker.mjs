@@ -166,6 +166,13 @@ function choiceToken(entry, value) {
   return token;
 }
 
+function presentationGuids(result) {
+  return [...new Set([
+    clean(result?.guid, 256),
+    ...(Array.isArray(result?.guids) ? result.guids.map((guid) => clean(guid, 256)) : []),
+  ].filter(Boolean))];
+}
+
 /**
  * Serializes app-server interaction requests per Codex task while allowing
  * independent tasks to wait concurrently. It intentionally keeps no durable
@@ -173,13 +180,14 @@ function choiceToken(entry, value) {
  * client fail closed instead of replaying authority later.
  */
 export class ServerRequestBroker {
-  constructor({ sendText, sendChoices, logger = null } = {}) {
+  constructor({ sendText, sendChoices, logger = null, requireReplyMatch = false } = {}) {
     if (typeof sendText !== "function" || typeof sendChoices !== "function") {
       throw new TypeError("ServerRequestBroker requires sendText and sendChoices callbacks.");
     }
     this.sendText = sendText;
     this.sendChoices = sendChoices;
     this.logger = logger;
+    this.requireReplyMatch = requireReplyMatch === true;
     this.queues = new Map();
     this.activeByThread = new Map();
     this.tokenEntries = new Map();
@@ -228,6 +236,7 @@ export class ServerRequestBroker {
       descriptor,
       threadId,
       tokens: new Map(),
+      presentationGuids: new Set(),
       questionIndex: 0,
       answers: {},
       settled: false,
@@ -255,7 +264,17 @@ export class ServerRequestBroker {
     return promise;
   }
 
-  async handleAction(action) {
+  canHandleAction(action) {
+    const threadId = clean(action?.threadId, 256);
+    const entry = threadId ? this.activeByThread.get(threadId) : null;
+    if (!entry) return false;
+    if (action?.kind === "control" && action?.command === "respond") return true;
+    if (action?.kind !== "prompt") return false;
+    const originator = clean(action?.threadOriginatorGuid, 256);
+    return !this.requireReplyMatch || Boolean(originator && entry.presentationGuids.has(originator));
+  }
+
+  async handleAction(action, { beforeConsume = null } = {}) {
     const threadId = clean(action?.threadId, 256);
     const entry = threadId ? this.activeByThread.get(threadId) : null;
     const isTokenAction = action?.kind === "control" && action?.command === "respond";
@@ -277,11 +296,22 @@ export class ServerRequestBroker {
         value = entry.tokens.get(token);
       }
     } else if (action?.kind === "prompt") {
+      const originator = clean(action?.threadOriginatorGuid, 256);
+      if (this.requireReplyMatch && (!originator || !entry.presentationGuids.has(originator))) {
+        return { handled: false, mismatch: true };
+      }
       value = clean(action?.body, MAX_ANSWER_TEXT);
     } else {
       return { handled: false };
     }
 
+    if (typeof beforeConsume === "function") {
+      try {
+        await beforeConsume(entry);
+      } catch {
+        return { handled: true, accepted: false, stale: false, persistenceFailed: true };
+      }
+    }
     try {
       const accepted = await this.#consume(entry, value);
       return { handled: true, accepted, stale: false };
@@ -325,6 +355,7 @@ export class ServerRequestBroker {
   async #present(entry) {
     if (entry.settled || this.closed) return;
     entry.tokens.clear();
+    entry.presentationGuids.clear();
     for (const [token, owner] of this.tokenEntries) {
       if (owner === entry) this.tokenEntries.delete(token);
     }
@@ -365,12 +396,13 @@ export class ServerRequestBroker {
       throw codedError("CODEX_INTERACTION_UNSUPPORTED", "This interaction request is not supported remotely.");
     }
 
-    await this.sendText({
+    const textResult = await this.sendText({
       threadId: entry.threadId,
       deliveryId: `server-request:${entry.key}:step:${entry.questionIndex}:text`,
       body,
       descriptor,
     });
+    this.#recordPresentation(entry, textResult);
     if (entry.settled || this.closed || this.activeByThread.get(entry.threadId) !== entry) return;
     if (choices.length >= 2) {
       const prepared = choices.map((choice) => {
@@ -380,7 +412,7 @@ export class ServerRequestBroker {
       });
       const otherToken = allowOther ? choiceToken(entry, "") : null;
       if (otherToken) this.tokenEntries.set(otherToken, entry);
-      await this.sendChoices({
+      const choiceResult = await this.sendChoices({
         threadId: entry.threadId,
         deliveryId: `server-request:${entry.key}:step:${entry.questionIndex}:choices`,
         question: descriptor.kind === "approval"
@@ -393,6 +425,7 @@ export class ServerRequestBroker {
         otherToken,
         descriptor,
       });
+      this.#recordPresentation(entry, choiceResult);
       if (entry.settled || this.closed || this.activeByThread.get(entry.threadId) !== entry) return;
     }
   }
@@ -469,12 +502,22 @@ export class ServerRequestBroker {
   }
 
   async #guidance(entry, body) {
-    await this.sendText({
+    const result = await this.sendText({
       threadId: entry.threadId,
       deliveryId: `server-request:${entry.key}:guidance:${randomUUID()}`,
       body,
       descriptor: entry.descriptor,
     });
+    entry.presentationGuids.clear();
+    this.#recordPresentation(entry, result);
+  }
+
+  #recordPresentation(entry, result) {
+    const guids = presentationGuids(result);
+    if (this.requireReplyMatch && guids.length === 0) {
+      throw codedError("CODEX_INTERACTION_GUID_MISSING", "The interaction message has no safe native Reply identity.");
+    }
+    for (const guid of guids) entry.presentationGuids.add(guid);
   }
 
   #resolve(entry, result) {

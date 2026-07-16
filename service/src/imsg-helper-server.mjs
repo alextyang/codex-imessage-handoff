@@ -85,6 +85,7 @@ class SupervisedImsgClient extends ImsgClient {
 const TARGET_METHODS = new Set([
   "latestMessage",
   "message.authorize",
+  "message.verify-user-mirror",
   "sendRich",
   "sendPoll",
   "sendPollVote",
@@ -891,6 +892,7 @@ export class ImsgHelperServer {
         return message;
       }
       case "message.authorize": return this.#authorizeMessageGuid(state, params);
+      case "message.verify-user-mirror": return this.#verifyUserMirrorReceipt(params);
       case "client.start": return this.#startClient();
       case "client.stop": return this.#stopClient(state);
       case "watch.subscribe": return this.#subscribeWatch(state, params);
@@ -959,6 +961,54 @@ export class ImsgHelperServer {
     }
     this.#registerMessageGuid(state, inspected);
     return { classification: "accepted", accepted: true, authorized: true, terminal: false };
+  }
+
+  async #verifyUserMirrorReceipt(params) {
+    const guid = referencedGuid("tapback", params);
+    const rootGuid = clean(params?.root_guid ?? params?.rootGuid);
+    const bodyHash = clean(params?.body_hash ?? params?.bodyHash).toLowerCase();
+    if (!guid || Buffer.byteLength(guid, "utf8") > 4096
+      || !rootGuid || Buffer.byteLength(rootGuid, "utf8") > 4096
+      || !/^[a-f0-9]{64}$/.test(bodyHash)) {
+      throw codedError("IMSG_MIRROR_PROOF_INVALID", "A complete user-mirror receipt proof is required.");
+    }
+    const inspected = await this.inspectMessage(this.profile, guid);
+    if (!inspected) {
+      return {
+        classification: "terminal",
+        accepted: false,
+        observed: false,
+        terminal: true,
+        retrySafe: false,
+        reason: "message-not-found",
+      };
+    }
+    // The recovery read is useful only for the primary user's inbound copy in
+    // the one pinned chat. Never let an outgoing helper message or another
+    // participant satisfy a mirror receipt, even if its GUID is known.
+    if (messageGuid(inspected) !== guid || inspected.is_from_me !== false
+      || !validateWatchMessage(inspected, this.profile)) {
+      throw codedError("IMSG_MESSAGE_NOT_ALLOWED", "The message is not known to be an inbound item in the configured chat.");
+    }
+    const exact = clean(inspected.thread_originator_guid ?? inspected.threadOriginatorGuid) === rootGuid
+      && clean(inspected.body_hash ?? inspected.bodyHash).toLowerCase() === bodyHash;
+    if (!exact) {
+      return {
+        classification: "terminal",
+        accepted: false,
+        observed: false,
+        terminal: true,
+        retrySafe: false,
+        reason: "mirror-proof-mismatch",
+      };
+    }
+    return {
+      classification: "accepted",
+      accepted: true,
+      observed: true,
+      terminal: true,
+      guid,
+    };
   }
 
   async #subscribeWatch(state, params) {

@@ -471,6 +471,7 @@ export class ImsgTransport {
     this.typingExpiryTimer = null;
     this.confirmationFlushPromise = null;
     this.typingThreads = new Set();
+    this.controllerTyping = false;
     this.readObservation = null;
     this.sendQueue = Promise.resolve();
     this.inboundQueue = Promise.resolve();
@@ -560,6 +561,16 @@ export class ImsgTransport {
   async importInboundAttachments(attachments, options = {}) {
     await this.helperStatus();
     return this.client.importAttachments(attachments, options);
+  }
+
+  async verifyUserMirrorReceipt({ guid, rootGuid, bodyHash } = {}) {
+    await this.helperStatus();
+    return this.client.verifyUserMirrorReceipt({
+      ...target(this.profile),
+      message_guid: clean(guid),
+      root_guid: clean(rootGuid),
+      body_hash: clean(bodyHash).toLowerCase(),
+    });
   }
 
   async probe({ refresh = false } = {}) {
@@ -870,6 +881,7 @@ export class ImsgTransport {
     if (this.watchRetryTimer) clearTimeout(this.watchRetryTimer);
     this.watchRetryTimer = null;
     this.typingThreads.clear();
+    this.controllerTyping = false;
     if (this.typingExpiryTimer) clearTimeout(this.typingExpiryTimer);
     this.typingExpiryTimer = null;
     try { await this.typingCleanupPromise; } catch {}
@@ -1114,6 +1126,11 @@ export class ImsgTransport {
     return this._syncDefaultTyping();
   }
 
+  async setControllerTyping(typing = true) {
+    this.controllerTyping = typing === true;
+    return this._syncDefaultTyping();
+  }
+
   async syncWorkingThreads(threadIds = []) {
     this.typingThreads = new Set((threadIds || []).map(clean).filter(Boolean));
     return this._syncDefaultTyping();
@@ -1121,7 +1138,7 @@ export class ImsgTransport {
 
   _syncDefaultTyping() {
     const defaultThreadId = clean(this.router.recentDefaultThreadId);
-    const shouldType = Boolean(defaultThreadId && this.typingThreads.has(defaultThreadId));
+    const shouldType = this.controllerTyping || Boolean(defaultThreadId && this.typingThreads.has(defaultThreadId));
     if (this.typingExpiryTimer) clearTimeout(this.typingExpiryTimer);
     this.typingExpiryTimer = null;
     if (shouldType) {
@@ -1250,6 +1267,7 @@ export class ImsgTransport {
       }
       guids.push(normalized.guid);
       if (threadId) this.router.routeOutboundGuid(normalized.guid, threadId);
+      else this.router.routeControllerOutboundGuid(normalized.guid);
       this.router.registerPoll(normalized.guid, mapping, {
         allowAddedChoiceSearch: options.allowAddedChoiceSearch !== false,
         addChoiceCommand: clean(options.addChoiceCommand),
@@ -1306,6 +1324,7 @@ export class ImsgTransport {
       operationScope: clean(options.operationScope),
       threadId: clean(options.threadId),
       replyToGuid: clean(options.replyToGuid),
+      controllerRoute: options.controllerRoute === true,
     }));
   }
 
@@ -1315,6 +1334,19 @@ export class ImsgTransport {
 
   async _outbound(event, options = {}) {
     const threadId = clean(event?.thread?.id);
+    if (event?.kind === "thread.live-message" && event?.role === "user") {
+      // User mirrors belong exclusively to the active primary Messages
+      // profile. This authenticated helper is the dedicated Codex identity;
+      // fail before creating a header or crossing any native send boundary.
+      return {
+        sent: false,
+        status: "PRIMARY_USER_MIRROR_REQUIRED",
+        terminal: false,
+        attempted: false,
+        parts: 0,
+        guids: [],
+      };
+    }
     if (options.proactive === true && this.router.shouldPauseIncoming?.(threadId)) {
       return { sent: false, status: "AWAITING_PROMPT", terminal: false, parts: 0, guids: [] };
     }
@@ -1325,7 +1357,7 @@ export class ImsgTransport {
     const id = eventId(event);
     const prior = id ? this.router.outboundReceipt(id) : null;
     if (prior?.classification === "accepted") {
-      return { sent: true, status: "DUPLICATE", terminal: true, parts: prior.guids.length };
+      return { sent: true, status: "DUPLICATE", terminal: true, parts: prior.guids.length, guids: prior.guids };
     }
     if (!threadId && (event?.kind === "service.directory"
       || (event?.kind === "service.menu" && event.label !== "COMMANDS"))) {
@@ -1412,6 +1444,7 @@ export class ImsgTransport {
       if (normalized.guid) {
         guids.push(normalized.guid);
         if (threadId) this.router.routeOutboundGuid(normalized.guid, threadId);
+        else this.router.routeControllerOutboundGuid(normalized.guid);
       }
       if (!normalized.sent) {
         if (id) {
@@ -1522,6 +1555,7 @@ export class ImsgTransport {
       if (normalized.guid) {
         guids.push(normalized.guid);
         if (threadId) this.router.routeOutboundGuid(normalized.guid, threadId);
+        else this.router.routeControllerOutboundGuid(normalized.guid);
       }
     }
     return { sent: true, status: "SENT", terminal: true, guids };

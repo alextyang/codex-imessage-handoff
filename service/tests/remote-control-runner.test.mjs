@@ -121,6 +121,99 @@ test("runtime shares one controller and connection but owns one RPC client per r
   assert.equal(fx.calls.logicalStreams, 2);
 });
 
+test("persistent runner reuses one logical client across operations until runtime close", async () => {
+  const calls = {
+    connections: 0,
+    clients: 0,
+    logicalStreams: 0,
+    clientCloses: 0,
+    terminate: 0,
+  };
+  class PersistentTestClient {
+    constructor(options) {
+      this.options = options;
+      this.stream = null;
+      calls.clients += 1;
+    }
+
+    #stream() {
+      if (!this.stream) this.stream = this.options.webSocketFactory();
+      return this.stream;
+    }
+
+    isRunning() {
+      return false;
+    }
+
+    async startThread({ cwd }) {
+      this.#stream();
+      return {
+        thread: { id: "controller-thread", cwd },
+        cwd,
+        model: "gpt-5.6-terra",
+        reasoningEffort: "medium",
+        modelProvider: "openai",
+      };
+    }
+
+    async runTurn() {
+      this.#stream();
+      return { status: "completed", body: "ready" };
+    }
+
+    close() {
+      calls.clientCloses += 1;
+    }
+  }
+
+  const runtime = new RemoteControlCodexRuntime({
+    codexHome: "/Users/test/.codex",
+    controllerFactory: () => ({
+      websocketUrl: "wss://chatgpt.com/backend-api/codex/remote/control/client",
+      refreshSession: async () => ({}),
+      authorizeDeviceChallenge: async () => ({}),
+    }),
+    connectionFactory: () => {
+      calls.connections += 1;
+      return {
+        createStream() {
+          calls.logicalStreams += 1;
+          return { kind: `logical-${calls.logicalStreams}` };
+        },
+        terminate() { calls.terminate += 1; },
+      };
+    },
+    rpcClientFactory: (options) => new PersistentTestClient(options),
+  });
+
+  const runner = runtime.createPersistentRunner();
+  assert.ok(runner instanceof AppServerCodexRunner);
+  assert.equal(runner.ownsClient, false);
+  assert.equal(calls.connections, 1);
+  assert.equal(calls.clients, 1);
+  assert.equal(calls.logicalStreams, 0, "the logical stream remains lazy until the first operation");
+
+  const cwd = process.cwd();
+  const thread = await runner.createThread({ cwd, threadSource: "imessage-handoff:controller" });
+  assert.equal(thread.id, "controller-thread");
+  assert.equal(calls.logicalStreams, 1);
+  assert.equal(calls.clientCloses, 0);
+
+  const result = await runner.run({ thread, prompt: "status" });
+  assert.deepEqual(result, { status: "completed", body: "ready" });
+  assert.equal(calls.logicalStreams, 1, "later operations reuse the persistent client's logical stream");
+  assert.equal(calls.connections, 1, "all operations share one physical Remote Control manager");
+  assert.equal(calls.clients, 1);
+  assert.equal(calls.clientCloses, 0);
+  assert.equal(runner.close(), false, "the runner cannot detach its runtime-owned persistent client");
+
+  runtime.close();
+  runtime.close();
+  assert.equal(calls.clientCloses, 1);
+  assert.equal(calls.terminate, 1);
+  assert.throws(() => runtime.createPersistentRunner(), /closed/i);
+});
+
 test("default RPC composition can only obtain a logical Remote Control stream", () => {
   let connectionOptions = null;
   let terminated = 0;
